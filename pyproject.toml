@@ -1,0 +1,49 @@
+[project]
+name = "exectunnel"
+version = "0.2.0"
+description = "SOCKS5 proxy tunnel over WebSocket into Kubernetes pods"
+requires-python = ">=3.13"
+authors = [{ name = "khodaparastan", email = "mohammad@khodaparastan.com" }]
+dependencies = ["websockets (>=16.0)", "colorama (>=0.4.6,<0.5.0)", "structlog (>=25.5.0,<26.0.0)", "pyrefly (>=0.57.1,<0.58.0)"]
+
+[project.scripts]
+exectunnel = "exectunnel.cli:main"
+
+[project.optional-dependencies]
+observability = ["colorama (>=0.4.6,<1.0.0)", "structlog (>=25.0.0)"]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unused_configs = true
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+check_untyped_defs = true
+
+[tool.poetry.group.dev.dependencies]
+mypy = "^1.19.1"
+ruff = "^0.15.6"
+pytest = "^9.0.2"
+pytest-asyncio = ">=0.24"
+
+[tool.poetry.scripts]
+exectunnel = "exectunnel.cli:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+log_cli = true
+log_cli_level = "WARNING"
+
+[tool.ruff]
+target-version = "py313"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "SIM"]
+ignore = ["B904", "E501"]
