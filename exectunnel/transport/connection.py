@@ -1,6 +1,9 @@
 """
-``_ConnHandler`` bridges one local TCP stream to one agent-side TCP
+``_TcpConnectionHandler`` bridges one local TCP stream to one agent-side TCP
 connection via the WebSocket frame protocol.
+
+Renamed from ``_ConnHandler`` (abbreviated) to ``_TcpConnectionHandler``
+(fully spelled out) per the naming-convention report.
 
 Data flow
 ---------
@@ -38,14 +41,14 @@ import logging
 from collections.abc import Callable, Coroutine
 from typing import Any
 
-from exectunnel.core.consts import PIPE_CHUNK_SIZE, PRE_ACK_BUFFER_CAP_BYTES, QUEUE_CAP
-from exectunnel.helpers import encode_frame
+from exectunnel.config.defaults import PRE_ACK_BUFFER_CAP_BYTES, TCP_INBOUND_QUEUE_CAP
 from exectunnel.observability import metrics_inc, metrics_observe, span
+from exectunnel.protocol.frames import PIPE_READ_CHUNK_BYTES, encode_frame
 
-logger = logging.getLogger("exectunnel.connection")
+logger = logging.getLogger("exectunnel.transport.connection")
 
 
-class _ConnHandler:
+class _TcpConnectionHandler:
     """Bridges one local TCP connection to one agent-side TCP connection."""
 
     def __init__(
@@ -54,7 +57,7 @@ class _ConnHandler:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         ws_send: Callable[..., Coroutine[Any, Any, None]],
-        registry: dict[str, _ConnHandler],
+        registry: dict[str, _TcpConnectionHandler],
         *,
         pre_ack_buffer_cap_bytes: int = PRE_ACK_BUFFER_CAP_BYTES,
     ) -> None:
@@ -63,7 +66,7 @@ class _ConnHandler:
         self._writer = writer
         self._ws_send = ws_send
         self._registry = registry
-        self._inbound: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=QUEUE_CAP)
+        self._inbound: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=TCP_INBOUND_QUEUE_CAP)
         self._tasks: list[asyncio.Task[None]] = []
         self._cleanup_task: asyncio.Task[None] | None = None
         self._closed = asyncio.Event()
@@ -84,7 +87,8 @@ class _ConnHandler:
         """Spawn the upstream and downstream copy tasks."""
         if self._started:
             logger.debug(
-                "conn %s: start called more than once; ignoring", self._id,
+                "conn %s: start called more than once; ignoring",
+                self._id,
                 extra={"conn_id": self._id},
             )
             return
@@ -115,7 +119,7 @@ class _ConnHandler:
     def feed(self, data: bytes) -> bool:
         """Enqueue data received from the agent for the downstream task (pre-ACK only).
 
-        After ACK, use ``async_feed`` to apply proper backpressure.
+        After ACK, use ``feed_async`` to apply proper backpressure.
         """
         if self._closed.is_set():
             return False
@@ -127,7 +131,7 @@ class _ConnHandler:
             self._pre_ack_buffer.append(data)
             self._pre_ack_buffer_bytes = pending
             return True
-        # Post-ACK: caller should use async_feed for backpressure.
+        # Post-ACK: caller should use feed_async for backpressure.
         # Fall back to put_nowait only if queue has space (e.g. replay path).
         try:
             self._inbound.put_nowait(data)
@@ -135,7 +139,7 @@ class _ConnHandler:
         except asyncio.QueueFull:
             return False
 
-    async def async_feed(self, data: bytes) -> bool:
+    async def feed_async(self, data: bytes) -> bool:
         """Await space in the inbound queue, applying backpressure to the WS reader.
 
         Returns False if the connection was closed before data could be enqueued.
@@ -170,7 +174,7 @@ class _ConnHandler:
             metrics_inc("connection.upstream.started")
             try:
                 while True:
-                    chunk = await self._reader.read(PIPE_CHUNK_SIZE)
+                    chunk = await self._reader.read(PIPE_READ_CHUNK_BYTES)
                     if not chunk:
                         break
                     self._bytes_upstream += len(chunk)
@@ -186,31 +190,53 @@ class _ConnHandler:
             except TimeoutError as exc:
                 metrics_inc("connection.upstream.error", error="TimeoutError")
                 logger.warning(
-                    "conn %s: upstream send timed out (backpressure): %s", self._id, exc,
-                    extra={"conn_id": self._id, "direction": "upstream", "bytes_sent": self._bytes_upstream},
+                    "conn %s: upstream send timed out (backpressure): %s",
+                    self._id,
+                    exc,
+                    extra={
+                        "conn_id": self._id,
+                        "direction": "upstream",
+                        "bytes_sent": self._bytes_upstream,
+                    },
                 )
             except OSError as exc:
                 metrics_inc("connection.upstream.error", error="OSError")
                 logger.debug(
-                    "conn %s: upstream socket error: %s", self._id, exc, exc_info=True,
-                    extra={"conn_id": self._id, "direction": "upstream", "bytes_sent": self._bytes_upstream},
+                    "conn %s: upstream socket error: %s",
+                    self._id,
+                    exc,
+                    exc_info=True,
+                    extra={
+                        "conn_id": self._id,
+                        "direction": "upstream",
+                        "bytes_sent": self._bytes_upstream,
+                    },
                 )
             except Exception as exc:
                 metrics_inc("connection.upstream.error", error=exc.__class__.__name__)
                 logger.warning(
-                    "conn %s: upstream failure: %s", self._id, exc,
-                    extra={"conn_id": self._id, "direction": "upstream", "bytes_sent": self._bytes_upstream},
+                    "conn %s: upstream failure: %s",
+                    self._id,
+                    exc,
+                    extra={
+                        "conn_id": self._id,
+                        "direction": "upstream",
+                        "bytes_sent": self._bytes_upstream,
+                    },
                 )
-                logger.debug("conn %s: upstream traceback", self._id, exc_info=True, extra={"conn_id": self._id})
+                logger.debug(
+                    "conn %s: upstream traceback",
+                    self._id,
+                    exc_info=True,
+                    extra={"conn_id": self._id},
+                )
             finally:
                 metrics_observe(
                     "connection.upstream.duration_sec",
                     asyncio.get_running_loop().time() - start,
                 )
-                metrics_observe(
-                    "connection.upstream.bytes", float(self._bytes_upstream)
-                )
-                await self._send_conn_close_once()
+                metrics_observe("connection.upstream.bytes", float(self._bytes_upstream))
+                await self._send_close_frame_once()
 
     async def _downstream(self) -> None:
         """Inbound queue → local TCP."""
@@ -236,26 +262,43 @@ class _ConnHandler:
             except OSError as exc:
                 metrics_inc("connection.downstream.error", error="OSError")
                 logger.debug(
-                    "conn %s: downstream socket error: %s", self._id, exc, exc_info=True,
-                    extra={"conn_id": self._id, "direction": "downstream", "bytes_recv": self._bytes_downstream},
+                    "conn %s: downstream socket error: %s",
+                    self._id,
+                    exc,
+                    exc_info=True,
+                    extra={
+                        "conn_id": self._id,
+                        "direction": "downstream",
+                        "bytes_recv": self._bytes_downstream,
+                    },
                 )
             except Exception as exc:
                 metrics_inc("connection.downstream.error", error=exc.__class__.__name__)
                 logger.warning(
-                    "conn %s: downstream failure: %s", self._id, exc,
-                    extra={"conn_id": self._id, "direction": "downstream", "bytes_recv": self._bytes_downstream},
+                    "conn %s: downstream failure: %s",
+                    self._id,
+                    exc,
+                    extra={
+                        "conn_id": self._id,
+                        "direction": "downstream",
+                        "bytes_recv": self._bytes_downstream,
+                    },
                 )
-                logger.debug("conn %s: downstream traceback", self._id, exc_info=True, extra={"conn_id": self._id})
+                logger.debug(
+                    "conn %s: downstream traceback",
+                    self._id,
+                    exc_info=True,
+                    extra={"conn_id": self._id},
+                )
             finally:
                 metrics_observe(
                     "connection.downstream.duration_sec",
                     asyncio.get_running_loop().time() - start,
                 )
-                metrics_observe(
-                    "connection.downstream.bytes", float(self._bytes_downstream)
-                )
+                metrics_observe("connection.downstream.bytes", float(self._bytes_downstream))
 
-    async def _send_conn_close_once(self) -> None:
+    async def _send_close_frame_once(self) -> None:
+        """Send CONN_CLOSE exactly once. Renamed from ``_send_conn_close_once``."""
         if self._conn_close_sent:
             return
         self._conn_close_sent = True
@@ -263,7 +306,10 @@ class _ConnHandler:
             await self._ws_send(encode_frame("CONN_CLOSE", self._id), control=True)
         except Exception as exc:
             logger.debug(
-                "conn %s: failed to send CONN_CLOSE: %s", self._id, exc, exc_info=True,
+                "conn %s: failed to send CONN_CLOSE: %s",
+                self._id,
+                exc,
+                exc_info=True,
                 extra={"conn_id": self._id},
             )
 
@@ -329,22 +375,15 @@ class _ConnHandler:
         so we don't keep sending DATA frames to a connection the agent has already
         torn down.
         """
-        if self._upstream_task is not None and not self._upstream_task.done():
+        if self._upstream_task and not self._upstream_task.done():
             self._upstream_task.cancel()
 
-    async def abort(self, *, close_writer: bool = True) -> None:
-        """Force-close agent state, optionally keeping local writer open for SOCKS reply."""
-        if self._closed.is_set():
-            return
-        self._closed.set()
-        for task in self._tasks:
-            if not task.done():
-                task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, OSError):
-                await task
-        await self._send_conn_close_once()
-        self._registry.pop(self._id, None)
-        if close_writer:
-            with contextlib.suppress(OSError):
-                self._writer.close()
-                await self._writer.wait_closed()
+    @property
+    def closed(self) -> asyncio.Event:
+        return self._closed
+
+    @property
+    def conn_id(self) -> str:
+        return self._id
+
+
