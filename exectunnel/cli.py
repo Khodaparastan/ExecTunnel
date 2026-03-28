@@ -9,8 +9,8 @@ tunnel
 
 Environment variables
 ---------------------
-WSS_URL
-    WebSocket endpoint (required).
+EXECTUNNEL_WSS_URL
+    WebSocket endpoint (required).  Legacy alias: ``WSS_URL``.
 WSS_INSECURE
     Set to ``1`` to skip TLS verification.
 WSS_PING_INTERVAL
@@ -31,15 +31,11 @@ import os
 import sys
 
 from exectunnel._version import __version__
-from exectunnel.core.config import (
-    TUNNEL_CONFIG,
-    AppConfig,
-    TunnelConfig,
-    get_config,
-    get_tunnel_config,
-)
-from exectunnel.core.consts import DEFAULT_EXCLUDE_CIDRS, METRICS_REPORT_INTERVAL_SECS
-from exectunnel.exceptions import BootstrapError, ConfigError
+from exectunnel.config import AppConfig, TunnelConfig
+from exectunnel.config.defaults import METRICS_REPORT_INTERVAL_SECS
+from exectunnel.config.exclusions import DEFAULT_EXCLUDE_CIDRS
+from exectunnel.config.settings import TUNNEL_CONFIG, get_app_config, get_tunnel_config
+from exectunnel.exceptions import BootstrapError, ConfigurationError
 from exectunnel.observability import (
     configure_logging,
     metrics_inc,
@@ -79,7 +75,7 @@ def _dns_ip(value: str) -> str:
     return value
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="exectunnel",
         description="SOCKS5 proxy tunnel over WebSocket into Kubernetes pods.",
@@ -91,8 +87,8 @@ examples:
   exectunnel tunnel --socks-port 1080 --exclude 10.10.0.0/16
 
 environment:
-  WSS_URL            WebSocket endpoint (required)
-  WSS_INSECURE       set to 1 to skip TLS verification
+  EXECTUNNEL_WSS_URL  WebSocket endpoint (required; legacy alias: WSS_URL)
+  WSS_INSECURE        set to 1 to skip TLS verification
   WSS_PING_INTERVAL  ping interval in seconds (default: 30)
   WSS_PING_TIMEOUT   ping timeout in seconds (default: 10)
   WSS_SEND_TIMEOUT   send timeout in seconds (default: 30)
@@ -206,9 +202,9 @@ def _parse_tunnel_excludes(
 ) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
     nets: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
     if not args.no_default_exclude:
-        from exectunnel.core.consts import default_exclusion_networks
+        from exectunnel.config.exclusions import get_default_exclusion_networks
 
-        nets.extend(default_exclusion_networks())
+        nets.extend(get_default_exclusion_networks())
     for cidr in args.exclude:
         try:
             nets.append(ipaddress.ip_network(cidr, strict=False))
@@ -217,11 +213,11 @@ def _parse_tunnel_excludes(
     return nets
 
 
-async def cmd_tunnel(cfg: AppConfig, tun_cfg: TunnelConfig) -> None:
-    from exectunnel.tunnel import TunnelSession
+async def run_tunnel_command(cfg: AppConfig, tun_cfg: TunnelConfig) -> None:
+    from exectunnel.transport.session import TunnelSession
 
     trace_seed = os.getenv("EXECTUNNEL_TRACE_ID")
-    with start_trace(trace_seed), span("cli.cmd_tunnel"):
+    with start_trace(trace_seed), span("cli.run_tunnel_command"):
         metrics_inc("cli.commands.started", command="tunnel")
         logger.info(
             "starting tunnel socks=%s:%d dns=%s excludes=%d",
@@ -276,15 +272,15 @@ async def cmd_tunnel(cfg: AppConfig, tun_cfg: TunnelConfig) -> None:
 
 
 def main() -> None:
-    parser = build_parser()
+    parser = build_arg_parser()
     args = parser.parse_args()
 
     # Configure logging before anything else so early errors are visible.
     configure_logging(args.log_level)
 
     try:
-        cfg = get_config()
-    except ConfigError as exc:
+        cfg = get_app_config()
+    except ConfigurationError as exc:
         parser.error(str(exc))
 
     if args.command == "tunnel":
@@ -302,7 +298,7 @@ def main() -> None:
         except ValueError as exc:
             parser.error(str(exc))
         try:
-            asyncio.run(cmd_tunnel(cfg, tun_cfg))
+            asyncio.run(run_tunnel_command(cfg, tun_cfg))
         except KeyboardInterrupt:
             logger.info("interrupted")
 
