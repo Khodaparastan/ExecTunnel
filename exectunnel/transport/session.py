@@ -686,9 +686,9 @@ class TunnelSession:
                 # triggered via _on_task_done, so close the writer here.
                 with contextlib.suppress(OSError):
                     handler._writer.close()
+                    await handler._writer.wait_closed()
                 await req.send_reply_error(reply)
                 return
-
             metrics_inc("tunnel.conn_ack.ok")
             metrics_inc("socks_reply_code", code=int(Reply.SUCCESS))
             await req.send_reply_success()
@@ -709,6 +709,7 @@ class TunnelSession:
             # start() was never called — close the writer explicitly.
             with contextlib.suppress(OSError):
                 handler._writer.close()
+                await handler._writer.wait_closed()
             await req.send_reply_error(reply)
         finally:
             if not ack_future.done():
@@ -871,8 +872,10 @@ class TunnelSession:
             # task is reading from either side's underlying transport.
             with contextlib.suppress(OSError):
                 remote_writer.close()
+                await remote_writer.wait_closed()
             with contextlib.suppress(OSError):
                 client_writer.close()
+                await client_writer.wait_closed()
 
     # ── Recv loop ─────────────────────────────────────────────────────────────
 
