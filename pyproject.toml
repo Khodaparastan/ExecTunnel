@@ -8,6 +8,7 @@ dependencies = [
     "websockets (>=16.0)",
     "structlog (>=25.5.0,<26.0.0)",
     "colorama (>=0.4.6,<1.0.0)",
+    "contextvars (>=2.4,<3.0)",
 ]
 
 [project.scripts]
@@ -21,14 +22,13 @@ build-backend = "poetry.core.masonry.api"
 [tool.poetry]
 version = "1.1.0a0"
 
-[tool.poetry.requires-plugins]
-poetry-dynamic-versioning = ">=1.0.0"
-
-[tool.poetry-dynamic-versioning]
-enable = true
-vcs = "none"
-format = "{base}"
-pattern = "default-unprefixed"
+#[tool.poetry.requires-plugins]
+#poetry-dynamic-versioning = ">=1.0.0"
+#
+#[tool.poetry-dynamic-versioning]
+#enable = false
+#format = "{base}"
+#pattern = "default-unprefixed"
 
 [tool.poetry-dynamic-versioning.substitution]
 files = ["exectunnel/_version.py"]
