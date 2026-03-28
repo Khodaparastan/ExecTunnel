@@ -7,14 +7,11 @@ import struct
 
 import pytest
 
-from exectunnel.core.consts import AddrType, AuthMethod, Cmd, Reply
-from exectunnel.socks5 import (
-    Socks5Request,
-    Socks5Server,
-    UdpRelay,
-    _build_reply,
-    _read_addr,
-)
+from exectunnel.protocol.enums import AddrType, AuthMethod, Cmd, Reply
+from exectunnel.proxy._codec import _build_reply, _read_addr
+from exectunnel.proxy.relay import UdpRelay
+from exectunnel.proxy.request import Socks5Request
+from exectunnel.proxy.server import Socks5Server
 
 # ── _build_reply ──────────────────────────────────────────────────────────────
 
@@ -44,6 +41,10 @@ class TestBuildReply:
     def test_invalid_bind_port_raises(self) -> None:
         with pytest.raises(ValueError, match="invalid bind_port"):
             _build_reply(Reply.SUCCESS, "127.0.0.1", -1)
+
+    def test_domain_bind_host_raises(self) -> None:
+        with pytest.raises(ValueError, match="RFC 1928"):
+            _build_reply(Reply.SUCCESS, "example.com", 0)
 
 
 # ── _read_addr ────────────────────────────────────────────────────────────────
@@ -136,6 +137,20 @@ class TestUdpRelay:
         assert item == (b"abc", "8.8.8.8", 53)
         with pytest.raises(asyncio.QueueEmpty):
             relay._queue.get_nowait()  # type: ignore[attr-defined]
+
+    async def test_close_unblocks_recv(self) -> None:
+        """close() must enqueue a sentinel so recv() returns None instead of hanging."""
+        relay = UdpRelay()
+        recv_task = asyncio.create_task(relay.recv())
+        await asyncio.sleep(0)  # let task start awaiting
+        relay.close()
+        result = await asyncio.wait_for(recv_task, timeout=1.0)
+        assert result is None
+
+    def test_close_is_idempotent(self) -> None:
+        relay = UdpRelay()
+        relay.close()
+        relay.close()  # must not raise or enqueue a second sentinel
 
 
 # ── Socks5Server negotiation ──────────────────────────────────────────────────

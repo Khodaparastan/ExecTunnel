@@ -52,10 +52,12 @@ class Socks5Request:
         await self.writer.drain()
 
     async def send_reply_error(self, reply: Reply = Reply.GENERAL_FAILURE) -> None:
-        """Write and flush an error reply, then close the writer."""
+        """Write and flush an error reply, then close the writer (and udp_relay if any)."""
         self.reply_error(reply)
         with contextlib.suppress(OSError):
             await self.writer.drain()
         with contextlib.suppress(OSError):
             self.writer.close()
             await self.writer.wait_closed()
+        if self.udp_relay is not None:
+            self.udp_relay.close()

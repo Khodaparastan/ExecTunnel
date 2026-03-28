@@ -57,24 +57,26 @@ class Socks5Server:
     async def stop(self) -> None:
         self._stopped = True
         metrics_inc("socks5.server.stopped")
-        # Unblock any task waiting on _queue.get() so it can observe _stopped.
-        await self._queue.put(None)
+        # Close the server socket first so no new connections are accepted
+        # before we enqueue the sentinel — prevents late _handle_client
+        # completions from enqueuing requests after the sentinel.
         if self._server:
             self._server.close()
             await self._server.wait_closed()
+        # Unblock any task waiting on _queue.get() so it can observe _stopped.
+        await self._queue.put(None)
         # Drain any requests that were queued but never consumed.
         while not self._queue.empty():
             try:
                 req = self._queue.get_nowait()
-                if req is None:
+                if not isinstance(req, Socks5Request):
                     continue
-                writer = getattr(req, "writer", None)
-                if writer is None:
-                    continue
-                with contextlib.suppress(OSError, AttributeError):
-                    writer.close()
-                with contextlib.suppress(OSError, AttributeError):
-                    await writer.wait_closed()
+                if req.udp_relay is not None:
+                    req.udp_relay.close()
+                with contextlib.suppress(OSError):
+                    req.writer.close()
+                with contextlib.suppress(OSError):
+                    await req.writer.wait_closed()
             except asyncio.QueueEmpty:
                 break
 
@@ -176,6 +178,7 @@ class Socks5Server:
             writer.write(_build_reply(Reply.GENERAL_FAILURE))
             with contextlib.suppress(OSError):
                 await writer.drain()
+            with contextlib.suppress(OSError):
                 writer.close()
                 await writer.wait_closed()
             return None
@@ -187,7 +190,9 @@ class Socks5Server:
             writer.write(reply)
             with contextlib.suppress(OSError):
                 await writer.drain()
-            writer.close()
+            with contextlib.suppress(OSError):
+                writer.close()
+                await writer.wait_closed()
             return None
 
         host, port = await _read_addr(reader)
@@ -195,6 +200,7 @@ class Socks5Server:
             writer.write(_build_reply(Reply.GENERAL_FAILURE))
             with contextlib.suppress(OSError):
                 await writer.drain()
+            with contextlib.suppress(OSError):
                 writer.close()
                 await writer.wait_closed()
             return None
@@ -220,5 +226,7 @@ class Socks5Server:
         writer.write(_build_reply(Reply.CMD_NOT_SUPPORTED))
         with contextlib.suppress(OSError):
             await writer.drain()
-        writer.close()
+        with contextlib.suppress(OSError):
+            writer.close()
+            await writer.wait_closed()
         return None

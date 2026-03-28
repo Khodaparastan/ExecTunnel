@@ -51,11 +51,12 @@ def _build_reply(reply: Reply, bind_host: str = "0.0.0.0", bind_port: int = 0) -
             atyp = AddrType.IPV6
             addr_bytes = addr.packed
     except ValueError:
-        atyp = AddrType.DOMAIN
-        enc = bind_host.encode()
-        if len(enc) > 255:
-            raise ValueError("domain reply host exceeds 255 bytes")
-        addr_bytes = bytes([len(enc)]) + enc
+        # RFC 1928 §6: BND.ADDR in a reply MUST be an IP address.
+        # DOMAIN address type is only valid in requests, not replies.
+        raise ValueError(
+            f"bind_host {bind_host!r} is not a valid IP address; "
+            "SOCKS5 replies must use an IP address for BND.ADDR (RFC 1928 §6)"
+        )
 
     return (
         bytes([0x05, int(reply), 0x00, int(atyp)])

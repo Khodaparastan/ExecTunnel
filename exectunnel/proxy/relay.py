@@ -129,9 +129,13 @@ class UdpRelay:
                     self._drop_count,
                 )
 
-    async def recv(self) -> tuple[bytes, str, int]:
-        """Return the next ``(payload, host, port)`` from the SOCKS5 client."""
-        return await self._queue.get()
+    async def recv(self) -> tuple[bytes, str, int] | None:
+        """Return the next ``(payload, host, port)`` from the SOCKS5 client.
+
+        Returns ``None`` when the relay has been closed.
+        """
+        item = await self._queue.get()
+        return item  # None sentinel is returned as-is to signal closure
 
     def send_to_client(self, payload: bytes, src_host: str, src_port: int) -> None:
         """Wrap *payload* in a SOCKS5 UDP header and send it back to the client."""
@@ -160,10 +164,15 @@ class UdpRelay:
             self._transport.sendto(header + payload, self._client_addr)
 
     def close(self) -> None:
+        if self._closed:
+            return
         self._closed = True
         metrics_inc("socks5.udp_relay.closed")
         if self._transport:
             self._transport.close()
+        # Unblock any coroutine awaiting recv().
+        with contextlib.suppress(asyncio.QueueFull):
+            self._queue.put_nowait(None)  # type: ignore[arg-type]
 
     @property
     def local_port(self) -> int:
