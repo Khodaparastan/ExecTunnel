@@ -97,11 +97,16 @@ class TunnelSession:
         self._ws_closed: asyncio.Event = asyncio.Event()
         # Control frames and data frames use separate queues so control
         # messages are never dropped under data-plane pressure.
-        self._send_ctrl_queue: asyncio.Queue[str | None] | None = None
-        self._send_data_queue: asyncio.Queue[str | None] | None = None
+        # Each queue item is a (frame_str, is_data) tuple; None is the poison pill.
+        self._send_ctrl_queue: asyncio.Queue[tuple[str, bool] | None] | None = None
+        self._send_data_queue: asyncio.Queue[tuple[str, bool] | None] | None = None
         self._request_tasks: set[asyncio.Task[None]] = set()
         # Internal queue used to hand frames from _bootstrap to _recv_loop.
         self._pre_ready_buf: list[str] = []
+        # Partial (unterminated) line left in _wait_ready's buffer after
+        # AGENT_READY was found mid-message.  _recv_loop prepends this to its
+        # own buf so the fragment is completed by the next WebSocket message.
+        self._pre_ready_carry: str = ""
         self._bootstrap_diag: list[str] = []
         self._send_drop_count = 0
         self._ack_timeout_count = 0
@@ -216,8 +221,8 @@ class TunnelSession:
         metrics_inc("tunnel.connect.ok")
         self._ws = ws
         self._ws_closed.clear()
-        self._send_ctrl_queue = asyncio.Queue()
-        self._send_data_queue = asyncio.Queue(
+        self._send_ctrl_queue: asyncio.Queue[tuple[str, bool] | None] = asyncio.Queue()
+        self._send_data_queue: asyncio.Queue[tuple[str, bool] | None] = asyncio.Queue(
             maxsize=self._app.bridge.send_queue_cap
         )
         self._bootstrap_diag.clear()
@@ -262,9 +267,14 @@ class TunnelSession:
         await asyncio.sleep(BOOTSTRAP_RM_DELAY_SECS)
 
         # Upload in chunks — safe under all POSIX shell input-buffer limits.
+        # Use printf with a format-string argument separate from the data so
+        # that no character in the base64 alphabet (A-Za-z0-9+/=) can be
+        # misinterpreted as a shell metacharacter.  Passing the chunk as a
+        # separate argument (rather than embedding it inside a quoted string)
+        # eliminates the latent single-quote injection surface entirely.
         for i in range(0, len(agent_b64), BOOTSTRAP_CHUNK_SIZE):
             chunk = agent_b64[i : i + BOOTSTRAP_CHUNK_SIZE]
-            await send_cmd(f"printf '%s' '{chunk}' >> /tmp/exectunnel_agent.b64")
+            await send_cmd(f"printf '%s' {chunk} >> /tmp/exectunnel_agent.b64")
 
         await send_cmd("base64 -d /tmp/exectunnel_agent.b64 > /tmp/exectunnel_agent.py")
         # Brief pause to let the shell finish the decode before we check syntax.
@@ -314,6 +324,14 @@ class TunnelSession:
         buffered into ``_pre_ready_buf`` and will be replayed by ``_recv_loop``
         before it starts consuming the live WebSocket iterator.  This prevents
         losing ``CONN_ACK`` frames that could race during a fast agent startup.
+
+        Partial-line handling: when ``AGENT_READY`` is found mid-message, any
+        remaining bytes in ``buf`` that have not yet been terminated by ``\\n``
+        are stored in ``_pre_ready_buf`` *as-is* (with a sentinel empty string
+        as the first entry so ``_recv_loop`` prepends them to its own buffer
+        rather than dispatching them as a standalone frame).  This prevents
+        ``parse_frame`` from receiving a truncated frame string and silently
+        dropping it as invalid.
         """
         buf = ""
         ready = False
@@ -334,13 +352,15 @@ class TunnelSession:
                     if stripped.startswith(("SyntaxError:", "Traceback (most recent")):
                         raise AgentSyntaxError(f"agent script error: {stripped}")
                 else:
-                    # Buffer post-READY frames for _recv_loop.
+                    # Buffer post-READY complete lines for _recv_loop.
                     self._pre_ready_buf.append(stripped)
             if ready:
-                # Remaining partial line stays in buf; it will be handled by
-                # _recv_loop's own buf when it takes over.
-                if buf.strip():
-                    self._pre_ready_buf.append(buf.strip())
+                # Any bytes remaining in buf are a partial (unterminated) frame.
+                # Store them so _recv_loop can prepend them to its own buffer
+                # and complete the frame when the next WebSocket message arrives.
+                # We use a leading empty-string sentinel to distinguish "partial
+                # carry-over" from "complete frame" entries in _pre_ready_buf.
+                self._pre_ready_carry = buf  # handed to _recv_loop below
                 return
         detail = f": {self._bootstrap_diag[-1]}" if self._bootstrap_diag else ""
         raise BootstrapError(f"websocket closed before AGENT_READY{detail}")
@@ -656,8 +676,16 @@ class TunnelSession:
             if failure_reason is not None:
                 self._track_ack_failure(conn_id, failure_reason)
                 self._record_connect_failure(host, failure_reason, reply)
-                handler.close_remote()
+                # Pop before close_remote() so that any racing DATA /
+                # CONN_CLOSED_ACK frames that arrive between close_remote()
+                # and the pop cannot re-enter a handler whose start() was
+                # never called (which would leave the StreamWriter open).
                 self._conn_handlers.pop(conn_id, None)
+                handler.close_remote()
+                # start() was never called — _cleanup() will never be
+                # triggered via _on_task_done, so close the writer here.
+                with contextlib.suppress(OSError):
+                    handler._writer.close()
                 await req.send_reply_error(reply)
                 return
 
@@ -674,8 +702,13 @@ class TunnelSession:
                 extra={"conn_id": conn_id, "host": host, "port": port},
             )
             logger.debug("conn %s ACK wait traceback", conn_id, exc_info=True, extra={"conn_id": conn_id})
-            handler.close_remote()
+            # Pop before close_remote() for the same race-safety reason as the
+            # failure_reason path above.
             self._conn_handlers.pop(conn_id, None)
+            handler.close_remote()
+            # start() was never called — close the writer explicitly.
+            with contextlib.suppress(OSError):
+                handler._writer.close()
             await req.send_reply_error(reply)
         finally:
             if not ack_future.done():
@@ -785,7 +818,7 @@ class TunnelSession:
                 # flow — agent-initiated closes pop the entry from _udp_registry
                 # via _dispatch_frame_async, so sending UDP_CLOSE again would be
                 # spurious.
-                if handler._id in self._udp_registry:
+                if handler.flow_id in self._udp_registry:
                     await handler.close()
             for task in drain_tasks:
                 task.cancel()
@@ -853,11 +886,15 @@ class TunnelSession:
         """
         assert self._ws is not None
         ws = self._ws
-        buf = ""
+        # Seed buf with any partial line that _wait_ready left unfinished so
+        # the fragment is completed by the first live WebSocket message rather
+        # than being silently dropped as an invalid frame.
+        buf = self._pre_ready_carry
+        self._pre_ready_carry = ""
 
-        # Replay frames buffered during bootstrap through the same async
-        # dispatcher used for live frames so post-ACK DATA frames get proper
-        # backpressure via feed_async.
+        # Replay complete frames buffered during bootstrap through the same
+        # async dispatcher used for live frames so post-ACK DATA frames get
+        # proper backpressure via feed_async.
         for line in self._pre_ready_buf:
             await self._dispatch_frame_async(line)
         self._pre_ready_buf.clear()
@@ -985,8 +1022,10 @@ class TunnelSession:
         """
         Enqueue a frame for the send loop.
 
-        Control frames are never dropped. Data frames are dropped when the
-        bounded data queue is full.
+        Each item placed on the queue is a ``(frame_str, is_data)`` tuple so
+        ``_send_loop`` knows whether to apply a send timeout without having to
+        inspect the frame content.  Control frames are never dropped.  Data
+        frames are dropped when the bounded data queue is full.
         """
         if self._send_ctrl_queue is None or self._send_data_queue is None:
             return
@@ -995,7 +1034,7 @@ class TunnelSession:
             # send loop has already exited and the queue would grow unboundedly
             # (e.g. during a reconnect storm with many pending CONN_OPEN frames).
             if not self._ws_closed.is_set():
-                self._send_ctrl_queue.put_nowait(frame)
+                self._send_ctrl_queue.put_nowait((frame, False))
             return
         if must_queue:
             # Block indefinitely until there is space in the send queue.
@@ -1003,10 +1042,10 @@ class TunnelSession:
             # will stop ACK-ing new data once the asyncio reader stalls here,
             # so the remote TCP stack slows down naturally instead of the
             # connection being torn down by a timeout.
-            await self._send_data_queue.put(frame)
+            await self._send_data_queue.put((frame, True))
             return
         try:
-            self._send_data_queue.put_nowait(frame)
+            self._send_data_queue.put_nowait((frame, True))
         except asyncio.QueueFull:
             self._send_drop_count += 1
             metrics_inc("tunnel.frames.send_drop")
@@ -1027,7 +1066,7 @@ class TunnelSession:
         (closing the connection) when the send queue is busy.
         """
         interval = float(self._app.bridge.ping_interval)
-        keepalive_frame = f"{FRAME_PREFIX}KEEPALIVE{FRAME_SUFFIX}"
+        keepalive_frame = f"{FRAME_PREFIX}KEEPALIVE{FRAME_SUFFIX}"  # control=True → is_data=False
         while not self._ws_closed.is_set():
             await asyncio.sleep(interval)
             await self._ws_send(keepalive_frame, control=True)
@@ -1036,6 +1075,9 @@ class TunnelSession:
         """
         Single writer to the WebSocket — serialises all outgoing frames.
 
+        Queue items are ``(frame_str, is_data)`` tuples.  ``is_data=True``
+        means the frame is a DATA/UDP_DATA payload frame (no send timeout);
+        ``is_data=False`` means it is a control frame (bounded send timeout).
         Exits cleanly when it dequeues the ``None`` sentinel (sent by
         ``_serve``'s finally block) or when the WebSocket reports closed.
         """
@@ -1045,24 +1087,23 @@ class TunnelSession:
         ws = self._ws
         ctrl_q = self._send_ctrl_queue
         data_q = self._send_data_queue
-        deferred_data_frame: str | None = None
+        deferred_data_item: tuple[str, bool] | None = None
         try:
             while True:
-                frame: str | None
+                item: tuple[str, bool] | None
                 try:
-                    frame = ctrl_q.get_nowait()
+                    item = ctrl_q.get_nowait()
                 except asyncio.QueueEmpty:
-                    if deferred_data_frame is not None:
+                    if deferred_data_item is not None:
                         # Before sending the deferred data frame, check whether a
                         # control frame has arrived in the meantime so it is not
                         # delayed by one extra iteration.
                         try:
-                            frame = ctrl_q.get_nowait()
-                            # Re-defer: put the data frame back for next round.
-                            # (deferred_data_frame is unchanged)
+                            item = ctrl_q.get_nowait()
+                            # Re-defer: deferred_data_item is unchanged.
                         except asyncio.QueueEmpty:
-                            frame = deferred_data_frame
-                            deferred_data_frame = None
+                            item = deferred_data_item
+                            deferred_data_item = None
                     else:
                         ctrl_wait = asyncio.create_task(ctrl_q.get())
                         data_wait = asyncio.create_task(data_q.get())
@@ -1075,20 +1116,18 @@ class TunnelSession:
                             with contextlib.suppress(asyncio.CancelledError):
                                 await pending_task
                         if ctrl_wait in done:
-                            frame = ctrl_wait.result()
+                            item = ctrl_wait.result()
                             # Preserve already-ready data for next iteration
                             # without re-enqueueing into a potentially full queue.
                             if data_wait in done:
-                                data_frame = data_wait.result()
-                                if data_frame is not None:
-                                    deferred_data_frame = data_frame
+                                data_item = data_wait.result()
+                                if data_item is not None:
+                                    deferred_data_item = data_item
                         else:
-                            frame = data_wait.result()
-                if frame is None:
+                            item = data_wait.result()
+                if item is None:
                     return
-                is_data_frame = (
-                    f"{FRAME_PREFIX}DATA:" in frame or f"{FRAME_PREFIX}UDP_DATA:" in frame
-                )
+                frame, is_data_frame = item
                 try:
                     metrics_inc("tunnel.frames.sent")
                     if is_data_frame:

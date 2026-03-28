@@ -82,6 +82,9 @@ class _TcpConnectionHandler:
         self._pre_ack_buffer_cap_bytes = max(1, pre_ack_buffer_cap_bytes)
         self._pre_ack_buffer: list[bytes] = []
         self._pre_ack_buffer_bytes = 0
+        # Set by close_remote() to signal downstream EOF without evicting data.
+        self._close_remote_requested = False
+        self._close_event: asyncio.Event = asyncio.Event()
 
     def start(self) -> None:
         """Spawn the upstream and downstream copy tasks."""
@@ -98,9 +101,19 @@ class _TcpConnectionHandler:
                 try:
                     self._inbound.put_nowait(chunk)
                 except asyncio.QueueFull:
+                    # Queue is full — write directly to the transport instead
+                    # of dropping.  _downstream has not started yet so there is
+                    # no concurrent reader; this is safe.
                     self._drop_count += 1
                     metrics_inc("connection.inbound_queue.drop")
-                    break
+                    logger.debug(
+                        "conn %s: pre-ACK queue full during flush, writing %d bytes directly",
+                        self._id,
+                        len(chunk),
+                        extra={"conn_id": self._id},
+                    )
+                    with contextlib.suppress(OSError):
+                        self._writer.write(chunk)
             self._pre_ack_buffer.clear()
             self._pre_ack_buffer_bytes = 0
 
@@ -143,27 +156,36 @@ class _TcpConnectionHandler:
         """Await space in the inbound queue, applying backpressure to the WS reader.
 
         Returns False if the connection was closed before data could be enqueued.
+        Re-checks ``_closed`` after the await so that data is never enqueued
+        *after* the ``None`` sentinel that ``close_remote()`` delivers — which
+        would cause ``_downstream`` to exit before reading the trailing chunk.
         Byte accounting is done in ``_downstream`` when each item is dequeued.
         """
         if self._closed.is_set():
             return False
         await self._inbound.put(data)
+        # If close_remote() fired while we were suspended on put(), the sentinel
+        # flag is already set.  Roll back the enqueue so no data sits after the
+        # sentinel in the queue.
+        if self._close_remote_requested:
+            with contextlib.suppress(asyncio.QueueEmpty):
+                self._inbound.get_nowait()
+            return False
         return True
 
     def close_remote(self) -> None:
         """
         Signal that the agent has closed its side.
 
-        Delivers a ``None`` sentinel to the inbound queue.  If the queue is
-        full, one buffered item is discarded to guarantee delivery.
+        Sets ``_close_remote_requested`` and wakes ``_downstream`` via
+        ``_close_event`` instead of evicting a real data chunk to make room
+        for a ``None`` sentinel.  ``_downstream`` drains all queued data first,
+        then honours the flag — preserving every byte the agent sent.
         """
         if self._closed.is_set():
             return
-        if self._inbound.full():
-            with contextlib.suppress(asyncio.QueueEmpty):
-                self._inbound.get_nowait()
-        with contextlib.suppress(asyncio.QueueFull):
-            self._inbound.put_nowait(None)
+        self._close_remote_requested = True
+        self._close_event.set()
 
     # ── Copy tasks ────────────────────────────────────────────────────────────
 
@@ -245,8 +267,41 @@ class _TcpConnectionHandler:
             metrics_inc("connection.downstream.started")
             try:
                 while True:
-                    item = await self._inbound.get()
-                    if item is None:  # sentinel — agent closed its side
+                    # Wait for either a queued data chunk or the close signal.
+                    if self._inbound.empty():
+                        if self._close_remote_requested:
+                            # Queue is empty and remote has closed — we are done.
+                            if self._writer.can_write_eof():
+                                with contextlib.suppress(OSError):
+                                    self._writer.write_eof()
+                                    await self._writer.drain()
+                                self._downstream_ended_cleanly = True
+                            break
+                        # Block until data arrives OR close_remote() fires.
+                        data_task: asyncio.Task[bytes | None] = asyncio.create_task(
+                            self._inbound.get()
+                        )
+                        close_task: asyncio.Task[None] = asyncio.create_task(
+                            self._close_event.wait()
+                        )
+                        done, pending = await asyncio.wait(
+                            {data_task, close_task},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for t in pending:
+                            t.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await t
+                        if data_task in done:
+                            item = data_task.result()
+                        else:
+                            # close_event fired; loop back to drain any remaining
+                            # items that arrived before the flag was set.
+                            continue
+                    else:
+                        item = self._inbound.get_nowait()
+
+                    if item is None:  # legacy sentinel path (pre-flag callers)
                         if self._writer.can_write_eof():
                             with contextlib.suppress(OSError):
                                 self._writer.write_eof()

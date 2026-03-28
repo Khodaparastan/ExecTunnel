@@ -37,6 +37,9 @@ class _UdpFlowHandler:
         self._registry = registry
         self._inbound: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=TCP_INBOUND_QUEUE_CAP)
         self._drop_count = 0
+        # Set by close_remote() to signal EOF without evicting queued datagrams.
+        self._close_remote_requested = False
+        self._close_event: asyncio.Event = asyncio.Event()
 
     async def open(self) -> None:
         await self._ws_send(
@@ -57,12 +60,14 @@ class _UdpFlowHandler:
                 )
 
     def close_remote(self) -> None:
-        """Deliver a ``None`` sentinel even if the queue is full."""
-        if self._inbound.full():
-            with contextlib.suppress(asyncio.QueueEmpty):
-                self._inbound.get_nowait()
-        with contextlib.suppress(asyncio.QueueFull):
-            self._inbound.put_nowait(None)
+        """Signal remote closure without evicting queued datagrams.
+
+        Sets ``_close_remote_requested`` and fires ``_close_event`` so that
+        ``recv_datagram()`` can wake up and return ``None`` after draining any
+        already-queued datagrams — no data is ever discarded.
+        """
+        self._close_remote_requested = True
+        self._close_event.set()
 
     async def send_datagram(self, data: bytes) -> None:
         """Encode *data* as a UDP_DATA frame and enqueue it for sending.
@@ -76,7 +81,40 @@ class _UdpFlowHandler:
         await self._ws_send(encode_udp_data_frame(self._id, b64))
 
     async def recv_datagram(self) -> bytes | None:
-        return await self._inbound.get()
+        """Return the next inbound datagram, or ``None`` when the flow is closed.
+
+        Drains any already-queued datagrams before honouring the close flag so
+        that no data is lost when ``close_remote()`` races with a queued item.
+        """
+        if not self._inbound.empty():
+            return self._inbound.get_nowait()
+        if self._close_remote_requested:
+            return None
+        # Block until a datagram arrives OR the flow is closed.
+        data_task: asyncio.Task[bytes | None] = asyncio.create_task(
+            self._inbound.get()
+        )
+        close_task: asyncio.Task[None] = asyncio.create_task(
+            self._close_event.wait()
+        )
+        done, pending = await asyncio.wait(
+            {data_task, close_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await t
+        if data_task in done:
+            return data_task.result()
+        # close_event fired — drain one last time before returning None.
+        if not self._inbound.empty():
+            return self._inbound.get_nowait()
+        return None
+
+    @property
+    def flow_id(self) -> str:
+        return self._id
 
     async def close(self) -> None:
         self._registry.pop(self._id, None)
