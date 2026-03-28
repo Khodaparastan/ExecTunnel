@@ -185,11 +185,16 @@ def _log(level: str, msg: str, *args: object) -> None:
 
 def _write_ctrl_frame(line: str) -> None:
     """Emit a control frame — always delivered before any pending data frame."""
+    # Architecture-doc alias used by tests and documentation.
+    # See docs/architecture.md which refers to this function as ``_emit_ctrl``.
     if _writer is not None:
         _writer.emit_ctrl(line)
     else:
         sys.stdout.write(line + "\n")
         sys.stdout.flush()
+
+
+_emit_ctrl = _write_ctrl_frame  # public alias matching architecture docs
 
 
 def _write_data_frame(line: str) -> None:

@@ -7,9 +7,9 @@ from exectunnel.payload import agent
 
 def test_relay_connection_feed_saturation_emits_error_and_closes(monkeypatch) -> None:
     emitted: list[str] = []
-    monkeypatch.setattr(agent, "_emit_ctrl", lambda line: emitted.append(line))
+    monkeypatch.setattr(agent, "_write_ctrl_frame", lambda line: emitted.append(line))
 
-    conn = agent.Connection("cabc123", "example.com", 443)
+    conn = agent.TcpConnectionWorker("cabc123", "example.com", 443)
     try:
         conn._inbound = [b"x"] * agent._MAX_TCP_INBOUND_CHUNKS  # type: ignore[attr-defined]
         conn.feed(b"overflow")
