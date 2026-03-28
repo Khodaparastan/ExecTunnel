@@ -3,7 +3,6 @@
 Bootstraps ``agent.py`` into the pod and runs a local SOCKS5 proxy that routes
 all connections through the WebSocket tunnel.
 """
-
 from __future__ import annotations
 
 import asyncio
@@ -32,7 +31,15 @@ from exectunnel.config.settings import AppConfig, TunnelConfig
 from exectunnel.exceptions import (
     AgentReadyTimeoutError,
     AgentSyntaxError,
+    AgentVersionMismatchError,
     BootstrapError,
+    ConnectionClosedError,
+    ExecTunnelError,
+    FrameDecodingError,
+    ProtocolError,
+    ReconnectExhaustedError,
+    TransportError,
+    WebSocketSendTimeoutError,
 )
 from exectunnel.helpers import (
     is_host_excluded,
@@ -63,10 +70,8 @@ from exectunnel.transport.dns_forwarder import _DnsForwarder
 from exectunnel.transport.models import PendingConnectState
 from exectunnel.transport.udp_flow import _UdpFlowHandler
 
-# Legacy alias for bootstrap
-AgentTimeoutError = AgentReadyTimeoutError
-
 logger = logging.getLogger("exectunnel.transport.session")
+
 
 # ── Tunnel session ────────────────────────────────────────────────────────────
 
@@ -78,12 +83,16 @@ class TunnelSession:
 
     Raises
     ------
-    AgentTimeoutError
+    AgentReadyTimeoutError
         If the agent does not emit ``AGENT_READY`` within ``ready_timeout``.
     AgentSyntaxError
         If the agent script fails to parse on the remote end.
+    AgentVersionMismatchError
+        If the remote agent reports an incompatible version.
     BootstrapError
         For any other bootstrap failure.
+    ReconnectExhaustedError
+        If all reconnect attempts are exhausted after a healthy session ends.
     """
 
     def __init__(self, app_cfg: AppConfig, tun_cfg: TunnelConfig) -> None:
@@ -135,12 +144,21 @@ class TunnelSession:
             self._connect_pace_cf_ms,
         )
 
+    # ── Top-level run ─────────────────────────────────────────────────────────
+
     async def run(self) -> None:
-        """
-        Connect, bootstrap the agent, and serve.
+        """Connect, bootstrap the agent, and serve.
 
         Retries on transport/session interruptions using ``BridgeConfig``
-        reconnect settings. Bootstrap failures remain fatal.
+        reconnect settings.  Bootstrap failures remain fatal and are never
+        retried.
+
+        Raises
+        ------
+        BootstrapError
+            (and subclasses) — propagated immediately; never retried.
+        ReconnectExhaustedError
+            When all reconnect attempts have been consumed.
         """
         ssl_ctx = self._app.ssl_context()
         retries = self._app.bridge.reconnect_max_retries
@@ -159,9 +177,9 @@ class TunnelSession:
                         ssl=ssl_ctx,
                         # Disable the websockets built-in ping: its background
                         # task competes for the internal write lock with
-                        # ws.send() in _send_loop. Under sustained data load the
-                        # ping can't acquire the lock within ping_timeout and
-                        # websockets closes the connection from the inside.
+                        # ws.send() in _send_loop.  Under sustained data load
+                        # the ping can't acquire the lock within ping_timeout
+                        # and websockets closes the connection from the inside.
                         # We implement our own keepalive via _keepalive_loop
                         # which sends a control frame through _send_ctrl_queue
                         # so it is serialised safely by _send_loop.
@@ -171,12 +189,56 @@ class TunnelSession:
                         bootstrapped = True
                         await self._run_session(ws)
                         reconnect_reason = "session ended"
+
                 except BootstrapError:
+                    # Bootstrap failures (AgentReadyTimeoutError, AgentSyntaxError,
+                    # AgentVersionMismatchError, …) are always fatal — re-raise
+                    # immediately without consuming a retry slot.
                     metrics_inc("tunnel.bootstrap.error")
                     raise
+
+                except WebSocketSendTimeoutError as exc:
+                    metrics_inc("tunnel.connect.error", error="ws_send_timeout")
+                    reconnect_reason = f"ws_send_timeout: {exc.message} (error_id={exc.error_id})"
+                    logger.warning(
+                        "WebSocket send timed out [%s] (error_id=%s) — will reconnect",
+                        exc.error_code,
+                        exc.error_id,
+                    )
+
+                except ConnectionClosedError as exc:
+                    metrics_inc("tunnel.connect.error", error="connection_closed")
+                    reconnect_reason = (
+                        f"connection_closed: {exc.details.get('close_reason', '')} "
+                        f"(error_id={exc.error_id})"
+                    )
+                    logger.warning(
+                        "WebSocket connection closed [%s] close_code=%s (error_id=%s) "
+                        "— will reconnect",
+                        exc.error_code,
+                        exc.details.get("close_code"),
+                        exc.error_id,
+                    )
+
+                except TransportError as exc:
+                    metrics_inc(
+                        "tunnel.connect.error",
+                        error=exc.error_code.replace(".", "_"),
+                    )
+                    reconnect_reason = f"{exc.error_code}: {exc.message} (error_id={exc.error_id})"
+                    logger.warning(
+                        "Transport error [%s]: %s (error_id=%s) — will reconnect",
+                        exc.error_code,
+                        exc.message,
+                        exc.error_id,
+                    )
+
                 except (OSError, ConnectionClosed, TimeoutError) as exc:
+                    # Third-party / stdlib transport errors that have not yet
+                    # been wrapped by our exception hierarchy.
                     metrics_inc("tunnel.connect.error", error=exc.__class__.__name__)
                     reconnect_reason = str(exc) or exc.__class__.__name__
+
                 finally:
                     self._ws = None
 
@@ -185,17 +247,23 @@ class TunnelSession:
 
                 # Reset the backoff counter after each healthy session so the
                 # retry budget is per-consecutive-failure-run, not lifetime.
-                # Without this reset a process that reconnects 5 times over its
-                # entire lifetime (regardless of healthy uptime between events)
-                # would exhaust retries and crash on the 6th disconnect.
                 if bootstrapped:
                     attempt = 0
 
                 if attempt >= retries:
                     metrics_inc("tunnel.reconnect.exhausted")
-                    raise RuntimeError(
-                        f"WebSocket session terminated after {retries} reconnect attempts: "
-                        f"{reconnect_reason}"
+                    raise ReconnectExhaustedError(
+                        f"WebSocket session terminated after {retries} reconnect attempts.",
+                        error_code="transport.reconnect_exhausted",
+                        details={
+                            "attempts": retries,
+                            "last_error": reconnect_reason,
+                        },
+                        hint=(
+                            "Check network connectivity to the tunnel endpoint and "
+                            "increase EXECTUNNEL_RECONNECT_MAX_RETRIES if transient "
+                            "disruptions are expected."
+                        ),
                     )
 
                 delay = min(base_delay * (2**attempt), max_delay)
@@ -214,9 +282,9 @@ class TunnelSession:
     async def _run_session(self, ws: ClientConnection) -> None:
         """Initialise per-session state, bootstrap the agent, and serve.
 
-        Extracted from ``run()`` so integration tests can inject a pre-connected
-        ``ClientConnection`` (e.g. from a local ``websockets.serve()`` fake agent)
-        without going through the real ``connect()`` call.
+        Extracted from ``run()`` so integration tests can inject a
+        pre-connected ``ClientConnection`` without going through the real
+        ``connect()`` call.
         """
         metrics_inc("tunnel.connect.ok")
         self._ws = ws
@@ -227,7 +295,7 @@ class TunnelSession:
         )
         self._bootstrap_diag.clear()
         await self._bootstrap()
-        # A successful bootstrap resets reconnect backoff.
+        # A successful bootstrap resets reconnect backoff state.
         self._ack_reconnect_requested = False
         self._ack_timeout_window_start = None
         self._ack_timeout_window_count = 0
@@ -236,8 +304,7 @@ class TunnelSession:
     # ── Bootstrap ─────────────────────────────────────────────────────────────
 
     async def _bootstrap(self) -> None:
-        """
-        Upload and start the agent script on the remote end.
+        """Upload and start the agent script on the remote end.
 
         The agent script is base64-encoded, sent in chunks via ``printf``,
         decoded on the remote, syntax-checked, then ``exec``'d (replacing the
@@ -247,6 +314,17 @@ class TunnelSession:
         messages.  Any frames that arrive *after* ``AGENT_READY`` but *before*
         ``_recv_loop`` starts are buffered in ``_pre_ready_buf`` and replayed
         by ``_recv_loop`` on startup.
+
+        Raises
+        ------
+        AgentReadyTimeoutError
+            ``AGENT_READY`` not received within ``ready_timeout``.
+        AgentSyntaxError
+            Remote Python raised ``SyntaxError`` while loading the agent.
+        AgentVersionMismatchError
+            Remote agent reports an incompatible version string.
+        BootstrapError
+            WebSocket closed before ``AGENT_READY`` or any other startup failure.
         """
         assert self._ws is not None
         ws = self._ws
@@ -254,10 +332,18 @@ class TunnelSession:
         metrics_inc("tunnel.bootstrap.started")
 
         async def send_cmd(cmd: str) -> None:
-            await ws.send((cmd + "\n").encode())
+            try:
+                await ws.send((cmd + "\n").encode())
+            except ConnectionClosed as exc:
+                raise BootstrapError(
+                    "WebSocket closed while sending bootstrap command.",
+                    error_code="bootstrap.cmd_send_failed",
+                    details={"command": cmd[:80]},
+                    hint="Check that the remote shell is still alive.",
+                ) from exc
 
         # Suppress terminal echo so shell output doesn't pollute the channel.
-        await send_cmd("stty -echo")
+        await send_cmd("stty raw -echo")
         await asyncio.sleep(BOOTSTRAP_STTY_DELAY_SECS)
 
         agent_b64 = load_agent_b64()
@@ -267,17 +353,11 @@ class TunnelSession:
         await asyncio.sleep(BOOTSTRAP_RM_DELAY_SECS)
 
         # Upload in chunks — safe under all POSIX shell input-buffer limits.
-        # Use printf with a format-string argument separate from the data so
-        # that no character in the base64 alphabet (A-Za-z0-9+/=) can be
-        # misinterpreted as a shell metacharacter.  Passing the chunk as a
-        # separate argument (rather than embedding it inside a quoted string)
-        # eliminates the latent single-quote injection surface entirely.
         for i in range(0, len(agent_b64), BOOTSTRAP_CHUNK_SIZE):
             chunk = agent_b64[i : i + BOOTSTRAP_CHUNK_SIZE]
             await send_cmd(f"printf '%s' {chunk} >> /tmp/exectunnel_agent.b64")
 
         await send_cmd("base64 -d /tmp/exectunnel_agent.b64 > /tmp/exectunnel_agent.py")
-        # Brief pause to let the shell finish the decode before we check syntax.
         await asyncio.sleep(BOOTSTRAP_DECODE_DELAY_SECS)
 
         # Syntax-check before exec so a decode corruption is caught cleanly.
@@ -302,8 +382,17 @@ class TunnelSession:
                 else ""
             )
             metrics_inc("tunnel.bootstrap.timeout")
-            raise AgentTimeoutError(
-                f"agent did not signal AGENT_READY within {self._tun.ready_timeout}s{detail}"
+            raise AgentReadyTimeoutError(
+                f"Agent did not signal AGENT_READY within {self._tun.ready_timeout}s{detail}",
+                error_code="bootstrap.agent_ready_timeout",
+                details={
+                    "timeout_s": self._tun.ready_timeout,
+                    "last_output": self._bootstrap_diag[-1] if self._bootstrap_diag else None,
+                },
+                hint=(
+                    "Increase EXECTUNNEL_AGENT_TIMEOUT or check the remote Python "
+                    "version and available memory."
+                ),
             )
 
         logger.info(
@@ -313,25 +402,25 @@ class TunnelSession:
         )
         metrics_inc("tunnel.bootstrap.ok")
         metrics_observe(
-            "tunnel.bootstrap.duration_sec", asyncio.get_running_loop().time() - start
+            "tunnel.bootstrap.duration_sec",
+            asyncio.get_running_loop().time() - start,
         )
 
     async def _wait_ready(self, ws: ClientConnection) -> None:
-        """
-        Read raw WebSocket messages until ``AGENT_READY`` is seen.
+        """Read raw WebSocket messages until ``AGENT_READY`` is seen.
 
         Any frames arriving *after* ``AGENT_READY`` in the same read loop are
         buffered into ``_pre_ready_buf`` and will be replayed by ``_recv_loop``
-        before it starts consuming the live WebSocket iterator.  This prevents
-        losing ``CONN_ACK`` frames that could race during a fast agent startup.
+        before it starts consuming the live WebSocket iterator.
 
-        Partial-line handling: when ``AGENT_READY`` is found mid-message, any
-        remaining bytes in ``buf`` that have not yet been terminated by ``\\n``
-        are stored in ``_pre_ready_buf`` *as-is* (with a sentinel empty string
-        as the first entry so ``_recv_loop`` prepends them to its own buffer
-        rather than dispatching them as a standalone frame).  This prevents
-        ``parse_frame`` from receiving a truncated frame string and silently
-        dropping it as invalid.
+        Raises
+        ------
+        AgentSyntaxError
+            Remote Python reported a ``SyntaxError`` while loading the agent.
+        AgentVersionMismatchError
+            Remote agent reported an incompatible version string.
+        BootstrapError
+            WebSocket closed before ``AGENT_READY`` was received.
         """
         buf = ""
         ready = False
@@ -350,7 +439,36 @@ class TunnelSession:
                         if len(self._bootstrap_diag) > BOOTSTRAP_DIAG_MAX_LINES:
                             self._bootstrap_diag.pop(0)
                     if stripped.startswith(("SyntaxError:", "Traceback (most recent")):
-                        raise AgentSyntaxError(f"agent script error: {stripped}")
+                        raise AgentSyntaxError(
+                            f"Agent script error: {stripped}",
+                            error_code="bootstrap.agent_syntax_error",
+                            details={
+                                "text": stripped,
+                                "filename": "/tmp/exectunnel_agent.py",
+                            },
+                            hint=(
+                                "The uploaded agent.py failed to parse. "
+                                "Check for base64 decode corruption or "
+                                "an incompatible remote Python version."
+                            ),
+                        )
+                    if stripped.startswith("VERSION_MISMATCH:"):
+                        # Agent emits VERSION_MISMATCH:<remote_version> when it
+                        # detects an incompatible client protocol version.
+                        remote_version = stripped.split(":", 1)[-1].strip()
+                        raise AgentVersionMismatchError(
+                            f"Remote agent version {remote_version!r} is incompatible "
+                            f"with this client.",
+                            error_code="bootstrap.version_mismatch",
+                            details={
+                                "remote_version": remote_version,
+                                "local_version": self._app.version,
+                            },
+                            hint=(
+                                "Upgrade the exectunnel client or redeploy the agent "
+                                "to match the client version."
+                            ),
+                        )
                 else:
                     # Buffer post-READY complete lines for _recv_loop.
                     self._pre_ready_buf.append(stripped)
@@ -358,12 +476,18 @@ class TunnelSession:
                 # Any bytes remaining in buf are a partial (unterminated) frame.
                 # Store them so _recv_loop can prepend them to its own buffer
                 # and complete the frame when the next WebSocket message arrives.
-                # We use a leading empty-string sentinel to distinguish "partial
-                # carry-over" from "complete frame" entries in _pre_ready_buf.
-                self._pre_ready_carry = buf  # handed to _recv_loop below
+                self._pre_ready_carry = buf
                 return
+
         detail = f": {self._bootstrap_diag[-1]}" if self._bootstrap_diag else ""
-        raise BootstrapError(f"websocket closed before AGENT_READY{detail}")
+        raise BootstrapError(
+            f"WebSocket closed before AGENT_READY was received{detail}",
+            error_code="bootstrap.ws_closed_before_ready",
+            details={
+                "last_output": self._bootstrap_diag[-1] if self._bootstrap_diag else None,
+            },
+            hint="Check that the remote shell executed the agent script successfully.",
+        )
 
     # ── Serve ─────────────────────────────────────────────────────────────────
 
@@ -393,23 +517,30 @@ class TunnelSession:
                 {recv_task, send_task, socks_task, keepalive_task},
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            # Log unexpected task failures.
             for task in done:
-                exc = task.exception() if not task.cancelled() else None
-                if exc is not None:
-                    metrics_inc("tunnel.tasks.error", task=task.get_name())
+                if task.cancelled():
+                    continue
+                exc = task.exception()
+                if exc is None:
+                    continue
+                metrics_inc("tunnel.tasks.error", task=task.get_name())
+                # Emit structured fields when the exception is a library error.
+                if isinstance(exc, ExecTunnelError):
                     logger.error(
-                        "task %s failed: %s",
+                        "task %s failed [%s]: %s (error_id=%s)",
                         task.get_name(),
-                        exc,
+                        exc.error_code,
+                        exc.message,
+                        exc.error_id,
                     )
-                    logger.debug(
-                        "task %s traceback",
-                        task.get_name(),
-                        exc_info=(type(exc), exc, exc.__traceback__),
-                    )
+                else:
+                    logger.error("task %s failed: %s", task.get_name(), exc)
+                logger.debug(
+                    "task %s traceback",
+                    task.get_name(),
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
         finally:
-            # Gracefully stop: cancel remaining tasks and wait for them.
             for task in (recv_task, send_task, socks_task, keepalive_task):
                 if not task.done():
                     task.cancel()
@@ -420,7 +551,8 @@ class TunnelSession:
                 with contextlib.suppress(asyncio.QueueFull):
                     self._send_data_queue.put_nowait(None)
             await asyncio.gather(
-                recv_task, send_task, socks_task, keepalive_task, return_exceptions=True
+                recv_task, send_task, socks_task, keepalive_task,
+                return_exceptions=True,
             )
             for task in list(self._request_tasks):
                 task.cancel()
@@ -446,18 +578,24 @@ class TunnelSession:
         if task.cancelled():
             return
         exc = task.exception()
-        if exc is not None:
-            metrics_inc("tunnel.request.error", error=exc.__class__.__name__)
+        if exc is None:
+            return
+        metrics_inc("tunnel.request.error", error=exc.__class__.__name__)
+        if isinstance(exc, ExecTunnelError):
             logger.error(
-                "request task %s failed: %s",
+                "request task %s failed [%s]: %s (error_id=%s)",
                 task.get_name(),
-                exc,
+                exc.error_code,
+                exc.message,
+                exc.error_id,
             )
-            logger.debug(
-                "request task %s traceback",
-                task.get_name(),
-                exc_info=(type(exc), exc, exc.__traceback__),
-            )
+        else:
+            logger.error("request task %s failed: %s", task.get_name(), exc)
+        logger.debug(
+            "request task %s traceback",
+            task.get_name(),
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
 
     # ── Request handlers ──────────────────────────────────────────────────────
 
@@ -519,7 +657,9 @@ class TunnelSession:
         )
         ws = self._ws
         if ws is not None:
-            task = asyncio.create_task(ws.close(code=WS_CLOSE_CODE_UNHEALTHY, reason="conn ack timeout surge"))
+            task = asyncio.create_task(
+                ws.close(code=WS_CLOSE_CODE_UNHEALTHY, reason="conn ack timeout surge")
+            )
             self._request_tasks.add(task)
             task.add_done_callback(self._request_tasks.discard)
 
@@ -559,9 +699,11 @@ class TunnelSession:
             if last is not None:
                 wait_for = interval - (now - last)
                 if wait_for > 0:
-                    # Small jitter reduces synchronized retries from many clients.
                     await asyncio.sleep(
-                        wait_for + random.uniform(0.0, min(CONNECT_PACE_JITTER_CAP_SECS, interval / 2.0))
+                        wait_for
+                        + random.uniform(
+                            0.0, min(CONNECT_PACE_JITTER_CAP_SECS, interval / 2.0)
+                        )
                     )
             self._host_connect_last_open_at[host_key] = (
                 asyncio.get_running_loop().time()
@@ -576,7 +718,7 @@ class TunnelSession:
         total = self._connect_failures_by_host[host_key]
         metrics_inc("connect_fail_by_host", host=host_key, reason=reason)
         if host_key == "challenges.cloudflare.com" and (
-                total == 1 or total % CONNECT_FAILURE_WARN_EVERY == 0
+            total == 1 or total % CONNECT_FAILURE_WARN_EVERY == 0
         ):
             logger.warning(
                 "connect failures for %s: count=%d reason=%s pending=%d",
@@ -604,12 +746,8 @@ class TunnelSession:
             await self._pipe(req.reader, req.writer, rem_reader, rem_writer)
             return
 
-        # ── Route through tunnel ───────────────────────────────────────────────
+        # ── Route through tunnel ──────────────────────────────────────────────
         host_gate = self._connect_host_gate(host)
-        # Semaphores guard only the connection-open phase (pacing + ACK wait).
-        # They are released as soon as the ACK is resolved so that subsequent
-        # connections to the same host are not blocked by already-established
-        # data-flowing sessions.
         conn_id = new_conn_id()
         loop = asyncio.get_running_loop()
         ack_future: asyncio.Future[str] = loop.create_future()
@@ -621,10 +759,7 @@ class TunnelSession:
             self._conn_handlers,
             pre_ack_buffer_cap_bytes=self._pre_ack_buffer_cap_bytes,
         )
-        pending = PendingConnectState(
-            host=host,
-            ack_future=ack_future,
-        )
+        pending = PendingConnectState(host=host, ack_future=ack_future)
         self._conn_handlers[conn_id] = handler
         self._pending_connects[conn_id] = pending
         self._report_pending_connects_metric()
@@ -633,84 +768,148 @@ class TunnelSession:
         ack_status = "ok"
         reply = Reply.HOST_UNREACHABLE
         failure_reason: str | None = None
+
         try:
             async with self._connect_gate, host_gate:
                 host_key = self._connect_host_key(host)
                 await self._apply_connect_pacing(host_key)
-                await self._ws_send(
-                    encode_conn_open_frame(conn_id, host, port), control=True
-                )
-                logger.debug(
-                    "tunnel CONNECT %s:%d conn=%s", host, port, conn_id,
-                    extra={"conn_id": conn_id, "host": host, "port": port},
-                )
 
-                # Wait for agent ACK; abort immediately if the WebSocket closes.
-                ws_future = asyncio.create_task(self._ws_closed.wait())
-                ack_task: asyncio.Task[str] = asyncio.ensure_future(ack_future)
-                done, pending_wait = await asyncio.wait(
-                    {ack_task, ws_future},
-                    timeout=self._tun.conn_ack_timeout,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                for fut in pending_wait:
-                    fut.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await fut
-                if ws_future in done:
+                try:
+                    await self._ws_send(
+                        encode_conn_open_frame(conn_id, host, port), control=True
+                    )
+                except WebSocketSendTimeoutError as exc:
+                    # Tunnel stalled before we could even open the connection.
+                    ack_status = "ws_send_timeout"
+                    failure_reason = "ws_send_timeout"
+                    metrics_inc("tunnel.conn_open.error", error="ws_send_timeout")
+                    logger.warning(
+                        "conn %s: CONN_OPEN send timed out [%s] (error_id=%s)",
+                        conn_id,
+                        exc.error_code,
+                        exc.error_id,
+                        extra={"conn_id": conn_id, "error_id": exc.error_id},
+                    )
+                except ConnectionClosedError as exc:
                     ack_status = "ws_closed"
                     failure_reason = "ws_closed"
-                elif ack_task in done:
-                    ack_result = ack_future.result()
-                    if ack_result != "ack":
-                        ack_status = ack_result
-                        failure_reason = ack_result
-                else:
-                    ack_status = "timeout"
-                    failure_reason = "timeout"
-                    metrics_inc(
-                        "connect_ack_timeout", host=self._connect_host_key(host)
+                    metrics_inc("tunnel.conn_open.error", error="connection_closed")
+                    logger.warning(
+                        "conn %s: CONN_OPEN failed — connection closed [%s] (error_id=%s)",
+                        conn_id,
+                        exc.error_code,
+                        exc.error_id,
+                        extra={"conn_id": conn_id, "error_id": exc.error_id},
                     )
+
+                if failure_reason is None:
+                    logger.debug(
+                        "tunnel CONNECT %s:%d conn=%s",
+                        host,
+                        port,
+                        conn_id,
+                        extra={"conn_id": conn_id, "host": host, "port": port},
+                    )
+
+                    # Wait for agent ACK; abort immediately if the WS closes.
+                    ws_future = asyncio.create_task(self._ws_closed.wait())
+                    ack_task: asyncio.Task[str] = asyncio.ensure_future(ack_future)
+                    done, pending_wait = await asyncio.wait(
+                        {ack_task, ws_future},
+                        timeout=self._tun.conn_ack_timeout,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for fut in pending_wait:
+                        fut.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await fut
+
+                    if ws_future in done:
+                        ack_status = "ws_closed"
+                        failure_reason = "ws_closed"
+                    elif ack_task in done:
+                        ack_result = ack_future.result()
+                        if ack_result != "ack":
+                            ack_status = ack_result
+                            failure_reason = ack_result
+                    else:
+                        ack_status = "timeout"
+                        failure_reason = "timeout"
+                        metrics_inc(
+                            "connect_ack_timeout",
+                            host=self._connect_host_key(host),
+                        )
             # Semaphores released here — before starting data flow.
 
             if failure_reason is not None:
                 self._track_ack_failure(conn_id, failure_reason)
                 self._record_connect_failure(host, failure_reason, reply)
                 # Pop before close_remote() so that any racing DATA /
-                # CONN_CLOSED_ACK frames that arrive between close_remote()
-                # and the pop cannot re-enter a handler whose start() was
-                # never called (which would leave the StreamWriter open).
+                # CONN_CLOSED_ACK frames cannot re-enter a handler whose
+                # start() was never called.
                 self._conn_handlers.pop(conn_id, None)
                 handler.close_remote()
-                # start() was never called — _cleanup() will never be
-                # triggered via _on_task_done, so close the writer here.
                 with contextlib.suppress(OSError):
                     handler._writer.close()
                     await handler._writer.wait_closed()
                 await req.send_reply_error(reply)
                 return
+
             metrics_inc("tunnel.conn_ack.ok")
             metrics_inc("socks_reply_code", code=int(Reply.SUCCESS))
             await req.send_reply_success()
             handler.start()
-        except Exception as exc:
+
+        except ExecTunnelError as exc:
+            # Structured library error during ACK wait — log with full context.
             ack_status = "error"
             self._track_ack_failure(conn_id, "error")
             self._record_connect_failure(host, "error", reply)
             logger.warning(
-                "conn %s: ACK wait error: %s", conn_id, exc,
-                extra={"conn_id": conn_id, "host": host, "port": port},
+                "conn %s: ACK wait library error [%s]: %s (error_id=%s)",
+                conn_id,
+                exc.error_code,
+                exc.message,
+                exc.error_id,
+                extra={
+                    "conn_id": conn_id,
+                    "host": host,
+                    "port": port,
+                    "error_code": exc.error_code,
+                    "error_id": exc.error_id,
+                },
             )
-            logger.debug("conn %s ACK wait traceback", conn_id, exc_info=True, extra={"conn_id": conn_id})
-            # Pop before close_remote() for the same race-safety reason as the
-            # failure_reason path above.
             self._conn_handlers.pop(conn_id, None)
             handler.close_remote()
-            # start() was never called — close the writer explicitly.
             with contextlib.suppress(OSError):
                 handler._writer.close()
                 await handler._writer.wait_closed()
             await req.send_reply_error(reply)
+
+        except Exception as exc:
+            # Non-library error — unexpected; log with traceback.
+            ack_status = "error"
+            self._track_ack_failure(conn_id, "error")
+            self._record_connect_failure(host, "error", reply)
+            logger.warning(
+                "conn %s: ACK wait unexpected error: %s",
+                conn_id,
+                exc,
+                extra={"conn_id": conn_id, "host": host, "port": port},
+            )
+            logger.debug(
+                "conn %s ACK wait traceback",
+                conn_id,
+                exc_info=True,
+                extra={"conn_id": conn_id},
+            )
+            self._conn_handlers.pop(conn_id, None)
+            handler.close_remote()
+            with contextlib.suppress(OSError):
+                handler._writer.close()
+                await handler._writer.wait_closed()
+            await req.send_reply_error(reply)
+
         finally:
             if not ack_future.done():
                 ack_future.cancel()
@@ -723,8 +922,7 @@ class TunnelSession:
             )
 
     async def _handle_udp_associate(self, req: Socks5Request) -> None:
-        """
-        UDP ASSOCIATE handler.
+        """UDP ASSOCIATE handler.
 
         Opens a local UDP socket and relays each datagram through the tunnel.
         Flows are keyed by ``(dst_host, dst_port)`` and reused for the
@@ -753,6 +951,18 @@ class TunnelSession:
                     if data is None:
                         break
                     relay.send_to_client(data, dst_host, dst_port)
+            except TransportError as exc:
+                metrics_inc(
+                    "udp.drain.error",
+                    error=exc.error_code.replace(".", "_"),
+                )
+                logger.debug(
+                    "udp drain flow=%s [%s]: %s (error_id=%s)",
+                    handler.flow_id,
+                    exc.error_code,
+                    exc.message,
+                    exc.error_id,
+                )
             except asyncio.CancelledError:
                 pass
             finally:
@@ -765,7 +975,6 @@ class TunnelSession:
                         relay.recv(), timeout=UDP_PUMP_POLL_TIMEOUT_SECS
                     )
                 except TimeoutError:
-                    # Check whether the SOCKS5 control connection is still alive.
                     if req.reader.at_eof():
                         break
                     continue
@@ -779,7 +988,8 @@ class TunnelSession:
                         await loop.sock_connect(sock, (dst_host, dst_port))
                         await loop.sock_sendall(sock, payload)
                         response = await asyncio.wait_for(
-                            loop.sock_recv(sock, 65535), timeout=UDP_DIRECT_RECV_TIMEOUT_SECS
+                            loop.sock_recv(sock, 65535),
+                            timeout=UDP_DIRECT_RECV_TIMEOUT_SECS,
                         )
                         relay.send_to_client(response, dst_host, dst_port)
                     except (TimeoutError, OSError):
@@ -800,7 +1010,44 @@ class TunnelSession:
                         self._udp_registry,
                     )
                     self._udp_registry[flow_id] = handler
-                    await handler.open()
+                    try:
+                        await handler.open()
+                    except WebSocketSendTimeoutError as exc:
+                        metrics_inc("udp.flow.open.error", error="ws_send_timeout")
+                        logger.warning(
+                            "udp flow %s open timed out [%s] (error_id=%s) — dropping datagram",
+                            flow_id,
+                            exc.error_code,
+                            exc.error_id,
+                        )
+                        self._udp_registry.pop(flow_id, None)
+                        continue
+                    except ConnectionClosedError as exc:
+                        metrics_inc("udp.flow.open.error", error="connection_closed")
+                        logger.warning(
+                            "udp flow %s open failed — connection closed [%s] "
+                            "(error_id=%s) — dropping datagram",
+                            flow_id,
+                            exc.error_code,
+                            exc.error_id,
+                        )
+                        self._udp_registry.pop(flow_id, None)
+                        continue
+                    except TransportError as exc:
+                        metrics_inc(
+                            "udp.flow.open.error",
+                            error=exc.error_code.replace(".", "_"),
+                        )
+                        logger.debug(
+                            "udp flow %s open error [%s]: %s (error_id=%s)",
+                            flow_id,
+                            exc.error_code,
+                            exc.message,
+                            exc.error_id,
+                        )
+                        self._udp_registry.pop(flow_id, None)
+                        continue
+
                     active_flows[key] = handler
                     task = asyncio.create_task(
                         drain_flow(handler, dst_host, dst_port),
@@ -808,17 +1055,42 @@ class TunnelSession:
                     )
                     drain_tasks.append(task)
 
-                await handler.send_datagram(payload)
+                try:
+                    await handler.send_datagram(payload)
+                except WebSocketSendTimeoutError as exc:
+                    metrics_inc("udp.datagram.send.error", error="ws_send_timeout")
+                    logger.warning(
+                        "udp flow %s send timed out [%s] (error_id=%s) — datagram dropped",
+                        handler.flow_id,
+                        exc.error_code,
+                        exc.error_id,
+                    )
+                except ConnectionClosedError as exc:
+                    metrics_inc("udp.datagram.send.error", error="connection_closed")
+                    logger.warning(
+                        "udp flow %s send failed — connection closed [%s] (error_id=%s)",
+                        handler.flow_id,
+                        exc.error_code,
+                        exc.error_id,
+                    )
+                except TransportError as exc:
+                    metrics_inc(
+                        "udp.datagram.send.error",
+                        error=exc.error_code.replace(".", "_"),
+                    )
+                    logger.debug(
+                        "udp flow %s send error [%s]: %s (error_id=%s)",
+                        handler.flow_id,
+                        exc.error_code,
+                        exc.message,
+                        exc.error_id,
+                    )
 
         try:
             await pump()
         finally:
             for handler in list(active_flows.values()):
                 handler.close_remote()
-                # Only send UDP_CLOSE if the agent hasn't already closed this
-                # flow — agent-initiated closes pop the entry from _udp_registry
-                # via _dispatch_frame_async, so sending UDP_CLOSE again would be
-                # spurious.
                 if handler.flow_id in self._udp_registry:
                     await handler.close()
             for task in drain_tasks:
@@ -847,12 +1119,6 @@ class TunnelSession:
                 while True:
                     chunk = await src.read(PIPE_CHUNK_SIZE)
                     if not chunk:
-                        # Half-close: signal EOF to dst so the other direction
-                        # can still drain its in-flight data before closing.
-                        # Do NOT close dst here — the peer copy() task is still
-                        # running and closing dst's underlying transport would
-                        # abort the peer's src.read(), silently dropping any
-                        # in-flight data that the remote had already sent.
                         if dst.can_write_eof():
                             with contextlib.suppress(OSError):
                                 dst.write_eof()
@@ -868,8 +1134,6 @@ class TunnelSession:
                 tg.create_task(copy(client_reader, remote_writer))
                 tg.create_task(copy(remote_reader, client_writer))
         finally:
-            # Both copy tasks have finished — close both writers now that no
-            # task is reading from either side's underlying transport.
             with contextlib.suppress(OSError):
                 remote_writer.close()
                 await remote_writer.wait_closed()
@@ -880,8 +1144,7 @@ class TunnelSession:
     # ── Recv loop ─────────────────────────────────────────────────────────────
 
     async def _recv_loop(self) -> None:
-        """
-        Read WebSocket messages and dispatch frames to registered handlers.
+        """Read WebSocket messages and dispatch frames to registered handlers.
 
         Starts by replaying any frames buffered during ``_wait_ready``
         (frames that arrived after ``AGENT_READY`` but before this task
@@ -889,15 +1152,9 @@ class TunnelSession:
         """
         assert self._ws is not None
         ws = self._ws
-        # Seed buf with any partial line that _wait_ready left unfinished so
-        # the fragment is completed by the first live WebSocket message rather
-        # than being silently dropped as an invalid frame.
         buf = self._pre_ready_carry
         self._pre_ready_carry = ""
 
-        # Replay complete frames buffered during bootstrap through the same
-        # async dispatcher used for live frames so post-ACK DATA frames get
-        # proper backpressure via feed_async.
         for line in self._pre_ready_buf:
             await self._dispatch_frame_async(line)
         self._pre_ready_buf.clear()
@@ -912,12 +1169,6 @@ class TunnelSession:
         except ConnectionClosed:
             pass
         finally:
-            # Signal all open connections that the relay is gone.
-            # close_remote() wakes _downstream so it drains buffered data and
-            # exits cleanly.  cancel_upstream() is also required: without it,
-            # _upstream stays blocked on await _send_data_queue.put() forever
-            # (the send loop has already exited), preventing _cleanup() from
-            # running and leaving the local SSH/SCP writer open indefinitely.
             for handler in list(self._conn_handlers.values()):
                 handler.cancel_upstream()
                 handler.close_remote()
@@ -926,13 +1177,21 @@ class TunnelSession:
             self._ws_closed.set()
 
     async def _dispatch_frame_async(self, line: str) -> None:
-        """Parse and dispatch one frame line — the sole dispatcher for all incoming frames.
+        """Parse and dispatch one frame line.
 
-        Used by ``_recv_loop`` for both the pre-ready-buffer replay and the
-        live WebSocket iterator.  DATA frames use ``feed_async`` to block the
-        WS reader when the inbound queue is full, propagating backpressure all
-        the way to the agent's TCP receive buffer instead of dropping or
-        aborting the connection.
+        The sole dispatcher for all incoming frames — used by ``_recv_loop``
+        for both the pre-ready-buffer replay and the live WebSocket iterator.
+        DATA frames use ``feed_async`` to block the WS reader when the inbound
+        queue is full, propagating backpressure all the way to the agent's TCP
+        receive buffer.
+
+        Raises
+        ------
+        FrameDecodingError
+            Logged and suppressed internally — a single bad frame must never
+            tear down the recv loop.
+        ProtocolError
+            Logged and suppressed internally — same rationale.
         """
         parsed = parse_frame(line)
         if parsed is None:
@@ -957,24 +1216,22 @@ class TunnelSession:
                 return
             try:
                 data = base64.b64decode(payload)
-            except ValueError:
-                logger.debug("conn %s: invalid base64 in DATA frame", conn_id)
-                return
+            except Exception as exc:
+                raise FrameDecodingError(
+                    f"conn {conn_id!r}: invalid base64 in DATA frame.",
+                    error_code="protocol.data_frame_bad_base64",
+                    details={"conn_id": conn_id, "codec": "base64"},
+                    hint="Check for frame corruption or an agent encoding bug.",
+                ) from exc
             pending = self._pending_connects.get(conn_id)
             if pending is not None and not pending.ack_future.done():
-                # Pre-ACK: buffer data until CONN_ACK arrives.
-                # Skip silently if the handler is already being torn down — feed()
-                # would return False for _closed too, which would incorrectly
-                # trigger the overflow path and fire spurious failure metrics.
                 if handler._closed.is_set():
                     return
                 accepted = handler.feed(data)
                 if not accepted:
-                    # feed() returned False with _closed not set → buffer cap exceeded.
                     pending.ack_future.set_result("pre_ack_overflow")
                     metrics_inc("tunnel.pre_ack_buffer.overflow")
             else:
-                # Post-ACK: block until queue has space — true backpressure.
                 await handler.feed_async(data)
             return
 
@@ -985,13 +1242,19 @@ class TunnelSession:
             if msg_type == "ERROR":
                 try:
                     reason = base64.b64decode(payload).decode(errors="replace")
-                except ValueError:
-                    reason = payload
+                except Exception as exc:
+                    raise FrameDecodingError(
+                        f"conn {conn_id!r}: invalid base64 in ERROR frame.",
+                        error_code="protocol.error_frame_bad_base64",
+                        details={"conn_id": conn_id, "codec": "base64"},
+                        hint="Check for frame corruption or an agent encoding bug.",
+                    ) from exc
                 logger.warning(
-                    "conn %s agent error: %s", conn_id, reason,
+                    "conn %s agent error: %s",
+                    conn_id,
+                    reason,
                     extra={"conn_id": conn_id, "error_reason": reason},
                 )
-                # Stop sending DATA frames to a connection the agent has torn down.
                 handler.cancel_upstream()
             pending = self._pending_connects.get(conn_id)
             if pending is not None and not pending.ack_future.done():
@@ -1007,9 +1270,13 @@ class TunnelSession:
                 return
             try:
                 data = base64.b64decode(payload)
-            except ValueError:
-                logger.debug("flow %s: invalid base64 in UDP_DATA frame", conn_id)
-                return
+            except Exception as exc:
+                raise FrameDecodingError(
+                    f"flow {conn_id!r}: invalid base64 in UDP_DATA frame.",
+                    error_code="protocol.udp_data_frame_bad_base64",
+                    details={"flow_id": conn_id, "codec": "base64"},
+                    hint="Check for frame corruption or an agent encoding bug.",
+                ) from exc
             flow.feed(data)
             return
 
@@ -1018,6 +1285,14 @@ class TunnelSession:
             if flow:
                 flow.close_remote()
             return
+
+        # Unknown frame type — raise ProtocolError so the caller can metric it.
+        raise ProtocolError(
+            f"Unexpected frame type {msg_type!r} received from agent.",
+            error_code="protocol.unexpected_frame",
+            details={"frame_type": msg_type, "conn_id": conn_id},
+            hint="This may indicate an agent/client version mismatch.",
+        )
 
     # ── Send loop ─────────────────────────────────────────────────────────────
 
@@ -1028,8 +1303,7 @@ class TunnelSession:
         control: bool = False,
         must_queue: bool = False,
     ) -> None:
-        """
-        Enqueue a frame for the send loop.
+        """Enqueue a frame for the send loop.
 
         Each item placed on the queue is a ``(frame_str, is_data)`` tuple so
         ``_send_loop`` knows whether to apply a send timeout without having to
@@ -1039,18 +1313,10 @@ class TunnelSession:
         if self._send_ctrl_queue is None or self._send_data_queue is None:
             return
         if control:
-            # Don't enqueue control frames once the WebSocket is closed — the
-            # send loop has already exited and the queue would grow unboundedly
-            # (e.g. during a reconnect storm with many pending CONN_OPEN frames).
             if not self._ws_closed.is_set():
                 self._send_ctrl_queue.put_nowait((frame, False))
             return
         if must_queue:
-            # Block indefinitely until there is space in the send queue.
-            # This propagates TCP backpressure to the local sender: the kernel
-            # will stop ACK-ing new data once the asyncio reader stalls here,
-            # so the remote TCP stack slows down naturally instead of the
-            # connection being torn down by a timeout.
             await self._send_data_queue.put((frame, True))
             return
         try:
@@ -1058,37 +1324,44 @@ class TunnelSession:
         except asyncio.QueueFull:
             self._send_drop_count += 1
             metrics_inc("tunnel.frames.send_drop")
-            if self._send_drop_count == 1 or self._send_drop_count % SEND_DROP_LOG_EVERY == 0:
+            if (
+                self._send_drop_count == 1
+                or self._send_drop_count % SEND_DROP_LOG_EVERY == 0
+            ):
                 logger.warning(
                     "send data queue full, dropping frame (drops=%d)",
                     self._send_drop_count,
                 )
 
     async def _keepalive_loop(self) -> None:
-        """
-        Sends a KEEPALIVE control frame through _send_ctrl_queue at
-        ``ping_interval`` seconds to keep the WebSocket alive under sustained
-        data load.
+        """Send a KEEPALIVE control frame at ``ping_interval`` seconds.
 
-        This replaces the websockets built-in ping, which contends for the
-        internal write lock with ws.send() in _send_loop and can time out
+        Replaces the websockets built-in ping, which contends for the internal
+        write lock with ``ws.send()`` in ``_send_loop`` and can time out
         (closing the connection) when the send queue is busy.
         """
         interval = float(self._app.bridge.ping_interval)
-        keepalive_frame = f"{FRAME_PREFIX}KEEPALIVE{FRAME_SUFFIX}"  # control=True → is_data=False
+        keepalive_frame = f"{FRAME_PREFIX}KEEPALIVE{FRAME_SUFFIX}"
         while not self._ws_closed.is_set():
             await asyncio.sleep(interval)
             await self._ws_send(keepalive_frame, control=True)
 
     async def _send_loop(self) -> None:
-        """
-        Single writer to the WebSocket — serialises all outgoing frames.
+        """Single writer to the WebSocket — serialises all outgoing frames.
 
         Queue items are ``(frame_str, is_data)`` tuples.  ``is_data=True``
         means the frame is a DATA/UDP_DATA payload frame (no send timeout);
         ``is_data=False`` means it is a control frame (bounded send timeout).
         Exits cleanly when it dequeues the ``None`` sentinel (sent by
         ``_serve``'s finally block) or when the WebSocket reports closed.
+
+        Raises
+        ------
+        WebSocketSendTimeoutError
+            Raised internally, logged, and causes the loop to exit so
+            ``_serve`` can trigger a reconnect.
+        ConnectionClosedError
+            Same — logged at DEBUG and causes a clean exit.
         """
         assert self._ws is not None
         assert self._send_ctrl_queue is not None
@@ -1104,12 +1377,8 @@ class TunnelSession:
                     item = ctrl_q.get_nowait()
                 except asyncio.QueueEmpty:
                     if deferred_data_item is not None:
-                        # Before sending the deferred data frame, check whether a
-                        # control frame has arrived in the meantime so it is not
-                        # delayed by one extra iteration.
                         try:
                             item = ctrl_q.get_nowait()
-                            # Re-defer: deferred_data_item is unchanged.
                         except asyncio.QueueEmpty:
                             item = deferred_data_item
                             deferred_data_item = None
@@ -1120,14 +1389,6 @@ class TunnelSession:
                             {ctrl_wait, data_wait},
                             return_when=asyncio.FIRST_COMPLETED,
                         )
-                        # Rescue any item that a pending task already dequeued
-                        # before cancellation took effect.  asyncio.Queue.get()
-                        # removes the item from the queue atomically — if the
-                        # task finished successfully despite the cancel request,
-                        # its result() holds the dequeued item and we must not
-                        # discard it.  Dropping a DATA frame corrupts TCP
-                        # streams (e.g. SCP); dropping a CONN_CLOSE control
-                        # frame leaves the agent connection half-open.
                         rescued_ctrl: tuple[str, bool] | None = None
                         for pending_task in pending:
                             pending_task.cancel()
@@ -1143,32 +1404,24 @@ class TunnelSession:
                                             rescued_ctrl = rescued
                         if ctrl_wait in done:
                             item = ctrl_wait.result()
-                            # Preserve already-ready data for next iteration
-                            # without re-enqueueing into a potentially full queue.
                             if data_wait in done:
                                 data_item = data_wait.result()
                                 if data_item is not None:
                                     deferred_data_item = data_item
                         else:
                             item = data_wait.result()
-                            # If ctrl_wait was cancelled but had already dequeued
-                            # a control frame, re-queue it so it is sent before
-                            # the next data frame (control frames take priority).
                             if rescued_ctrl is not None:
                                 await ctrl_q.put(rescued_ctrl)
+
                 if item is None:
                     return
+
                 frame, is_data_frame = item
                 try:
                     metrics_inc("tunnel.frames.sent")
                     if is_data_frame:
-                        # Data frames: no timeout — backpressure is handled by
-                        # _ws_send(must_queue=True) stalling the upstream reader,
-                        # which lets TCP flow-control slow the sender naturally.
                         await ws.send(frame.encode())
                     else:
-                        # Control frames: bounded timeout so a dead channel is
-                        # detected and triggers a reconnect.
                         send_timeout = self._app.bridge.send_timeout
                         await asyncio.wait_for(
                             ws.send(frame.encode()),
@@ -1176,14 +1429,28 @@ class TunnelSession:
                         )
                 except TimeoutError:
                     metrics_inc("tunnel.frames.send_timeout")
-                    logger.warning(
-                        "WebSocket send timed out (control timeout=%.1fs) — connection stalled",
-                        self._app.bridge.send_timeout,
+                    raise WebSocketSendTimeoutError(
+                        "WebSocket control-frame send timed out — connection stalled.",
+                        error_code="transport.ws_send_timeout",
+                        details={
+                            "timeout_s": self._app.bridge.send_timeout,
+                            "frame_prefix": frame[:40],
+                        },
+                        hint=(
+                            "Increase EXECTUNNEL_SEND_TIMEOUT or check network "
+                            "latency to the tunnel endpoint."
+                        ),
                     )
-                    return
-                except ConnectionClosed:
+                except ConnectionClosed as exc:
                     metrics_inc("tunnel.frames.send_closed")
-                    logger.debug("WebSocket closed while sending frame")
-                    return
+                    raise ConnectionClosedError(
+                        "WebSocket connection closed while sending frame.",
+                        error_code="transport.connection_closed",
+                        details={
+                            "close_code": getattr(exc.rcvd, "code", None),
+                            "close_reason": getattr(exc.rcvd, "reason", None),
+                        },
+                    ) from exc
+
         finally:
             self._ws_closed.set()

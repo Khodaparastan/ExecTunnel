@@ -31,7 +31,6 @@ never closes, both the agent thread and the local ``_downstream`` task leak
 for up to 30 s per connection — acceptable for normal traffic but can
 accumulate under high connection churn with misbehaving remote servers.
 """
-
 from __future__ import annotations
 
 import asyncio
@@ -42,6 +41,13 @@ from collections.abc import Callable, Coroutine
 from typing import Any
 
 from exectunnel.config.defaults import PRE_ACK_BUFFER_CAP_BYTES, TCP_INBOUND_QUEUE_CAP
+from exectunnel.exceptions import (
+    ConnectionClosedError,
+    ExecTunnelError,
+    FrameDecodingError,
+    TransportError,
+    WebSocketSendTimeoutError,
+)
 from exectunnel.observability import metrics_inc, metrics_observe, span
 from exectunnel.protocol.frames import PIPE_READ_CHUNK_BYTES, encode_frame
 
@@ -86,8 +92,18 @@ class _TcpConnectionHandler:
         self._close_remote_requested = False
         self._close_event: asyncio.Event = asyncio.Event()
 
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
     def start(self) -> None:
-        """Spawn the upstream and downstream copy tasks."""
+        """Spawn the upstream and downstream copy tasks.
+
+        Raises
+        ------
+        FrameDecodingError
+            If any pre-ACK buffered chunk is not a ``bytes`` instance —
+            indicates a protocol-layer bug where the frame decoder passed a
+            malformed payload before the connection was acknowledged.
+        """
         if self._started:
             logger.debug(
                 "conn %s: start called more than once; ignoring",
@@ -96,8 +112,20 @@ class _TcpConnectionHandler:
             )
             return
         self._started = True
+
         if self._pre_ack_buffer:
             for chunk in self._pre_ack_buffer:
+                if not isinstance(chunk, bytes):
+                    raise FrameDecodingError(
+                        f"conn {self._id!r}: pre-ACK buffer contains a non-bytes "
+                        f"chunk; frame decoder produced a malformed payload.",
+                        error_code="protocol.pre_ack_bad_type",
+                        details={
+                            "conn_id": self._id,
+                            "received_type": type(chunk).__name__,
+                        },
+                        hint="Ensure the frame decoder always passes raw bytes to feed().",
+                    )
                 try:
                     self._inbound.put_nowait(chunk)
                 except asyncio.QueueFull:
@@ -130,10 +158,25 @@ class _TcpConnectionHandler:
     # ── Called by recv_loop ───────────────────────────────────────────────────
 
     def feed(self, data: bytes) -> bool:
-        """Enqueue data received from the agent for the downstream task (pre-ACK only).
+        """Enqueue data received from the agent for the downstream task.
 
-        After ACK, use ``feed_async`` to apply proper backpressure.
+        After ACK, use :meth:`feed_async` to apply proper backpressure.
+
+        Raises
+        ------
+        FrameDecodingError
+            If *data* is not a ``bytes`` instance.
         """
+        if not isinstance(data, bytes):
+            raise FrameDecodingError(
+                f"conn {self._id!r}: feed() received a non-bytes payload.",
+                error_code="protocol.tcp_feed_bad_type",
+                details={
+                    "conn_id": self._id,
+                    "received_type": type(data).__name__,
+                },
+                hint="Ensure the frame decoder passes raw bytes to feed().",
+            )
         if self._closed.is_set():
             return False
         if not self._started:
@@ -155,9 +198,9 @@ class _TcpConnectionHandler:
     async def feed_async(self, data: bytes) -> bool:
         """Await space in the inbound queue, applying backpressure to the WS reader.
 
-        Returns False if the connection was closed before data could be enqueued.
-        Re-checks ``_closed`` after the await so that data is never enqueued
-        *after* cleanup has already run.  Byte accounting is done in
+        Returns ``False`` if the connection was closed before data could be
+        enqueued.  Re-checks ``_closed`` after the await so that data is never
+        enqueued *after* cleanup has already run.  Byte accounting is done in
         ``_downstream`` when each item is dequeued.
 
         We intentionally do NOT roll back the enqueued item when
@@ -169,19 +212,44 @@ class _TcpConnectionHandler:
         queue and let ``_downstream`` drain it before honouring the close flag
         — the drain-then-close ordering in ``_downstream`` guarantees every
         byte the agent sent is delivered before EOF is written.
+
+        Raises
+        ------
+        FrameDecodingError
+            If *data* is not a ``bytes`` instance.
+        TransportError
+            If an unexpected error occurs while awaiting queue space (e.g.
+            event-loop shutdown or task cancellation outside of normal flow).
         """
+        if not isinstance(data, bytes):
+            raise FrameDecodingError(
+                f"conn {self._id!r}: feed_async() received a non-bytes payload.",
+                error_code="protocol.tcp_feed_async_bad_type",
+                details={
+                    "conn_id": self._id,
+                    "received_type": type(data).__name__,
+                },
+                hint="Ensure the frame decoder passes raw bytes to feed_async().",
+            )
         if self._closed.is_set():
             return False
-        await self._inbound.put(data)
+        try:
+            await self._inbound.put(data)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise TransportError(
+                f"conn {self._id!r}: unexpected error while awaiting inbound queue space.",
+                error_code="transport.tcp_feed_async_failed",
+                details={"conn_id": self._id},
+                hint="This may indicate an event-loop shutdown or abnormal task cancellation.",
+            ) from exc
         # If _cleanup() already ran while we were suspended on put(), the
         # connection is fully torn down — signal the caller to stop feeding.
-        if self._closed.is_set():
-            return False
-        return True
+        return not self._closed.is_set()
 
     def close_remote(self) -> None:
-        """
-        Signal that the agent has closed its side.
+        """Signal that the agent has closed its side.
 
         Sets ``_close_remote_requested`` and wakes ``_downstream`` via
         ``_close_event`` instead of evicting a real data chunk to make room
@@ -196,7 +264,29 @@ class _TcpConnectionHandler:
     # ── Copy tasks ────────────────────────────────────────────────────────────
 
     async def _upstream(self) -> None:
-        """local TCP → WSS DATA frames."""
+        """local TCP → WSS DATA frames.
+
+        Exception handling strategy
+        ---------------------------
+        ``asyncio.CancelledError``
+            Re-raised immediately — cancellation is always intentional here.
+        ``WebSocketSendTimeoutError``
+            The tunnel send queue stalled; log at WARNING with ``error_id`` for
+            correlation, then let the task exit so ``_on_task_done`` triggers
+            cleanup.
+        ``ConnectionClosedError``
+            The WebSocket connection dropped mid-stream; log at WARNING.
+        ``TransportError``
+            Any other structured transport failure; log at WARNING with
+            ``error_code`` and ``error_id``.
+        ``OSError``
+            Local socket error (client disconnected, broken pipe, etc.);
+            log at DEBUG — these are routine.
+        ``ExecTunnelError``
+            Catch-all for any other library error; log at WARNING.
+        ``Exception``
+            Truly unexpected errors; log at WARNING with full traceback.
+        """
         with span("connection.upstream"):
             start = asyncio.get_running_loop().time()
             metrics_inc("connection.upstream.started")
@@ -212,21 +302,66 @@ class _TcpConnectionHandler:
                         must_queue=True,
                     )
                 self._upstream_ended_cleanly = True
+
             except asyncio.CancelledError:
                 metrics_inc("connection.upstream.cancelled")
                 raise
-            except TimeoutError as exc:
-                metrics_inc("connection.upstream.error", error="TimeoutError")
+
+            except WebSocketSendTimeoutError as exc:
+                metrics_inc("connection.upstream.error", error="ws_send_timeout")
                 logger.warning(
-                    "conn %s: upstream send timed out (backpressure): %s",
+                    "conn %s: upstream stalled — WebSocket send timed out "
+                    "[%s] (bytes_sent=%d, error_id=%s)",
                     self._id,
-                    exc,
+                    exc.error_code,
+                    self._bytes_upstream,
+                    exc.error_id,
                     extra={
                         "conn_id": self._id,
                         "direction": "upstream",
                         "bytes_sent": self._bytes_upstream,
+                        "error_code": exc.error_code,
+                        "error_id": exc.error_id,
                     },
                 )
+
+            except ConnectionClosedError as exc:
+                metrics_inc("connection.upstream.error", error="connection_closed")
+                logger.warning(
+                    "conn %s: upstream ended — tunnel connection closed "
+                    "[%s] (bytes_sent=%d, error_id=%s)",
+                    self._id,
+                    exc.error_code,
+                    self._bytes_upstream,
+                    exc.error_id,
+                    extra={
+                        "conn_id": self._id,
+                        "direction": "upstream",
+                        "bytes_sent": self._bytes_upstream,
+                        "error_code": exc.error_code,
+                        "error_id": exc.error_id,
+                    },
+                )
+
+            except TransportError as exc:
+                metrics_inc("connection.upstream.error", error=exc.error_code.replace(".", "_"))
+                logger.warning(
+                    "conn %s: upstream transport error [%s]: %s "
+                    "(bytes_sent=%d, error_id=%s)",
+                    self._id,
+                    exc.error_code,
+                    exc.message,
+                    self._bytes_upstream,
+                    exc.error_id,
+                    extra={
+                        "conn_id": self._id,
+                        "direction": "upstream",
+                        "bytes_sent": self._bytes_upstream,
+                        "error_code": exc.error_code,
+                        "error_id": exc.error_id,
+                    },
+                )
+
             except OSError as exc:
                 metrics_inc("connection.upstream.error", error="OSError")
                 logger.debug(
@@ -240,10 +375,28 @@ class _TcpConnectionHandler:
                         "bytes_sent": self._bytes_upstream,
                     },
                 )
+
+            except ExecTunnelError as exc:
+                metrics_inc("connection.upstream.error", error=exc.error_code.replace(".", "_"))
+                logger.warning(
+                    "conn %s: upstream library error [%s]: %s (error_id=%s)",
+                    self._id,
+                    exc.error_code,
+                    exc.message,
+                    exc.error_id,
+                    extra={
+                        "conn_id": self._id,
+                        "direction": "upstream",
+                        "bytes_sent": self._bytes_upstream,
+                        "error_code": exc.error_code,
+                        "error_id": exc.error_id,
+                    },
+                )
+
             except Exception as exc:
                 metrics_inc("connection.upstream.error", error=exc.__class__.__name__)
                 logger.warning(
-                    "conn %s: upstream failure: %s",
+                    "conn %s: upstream unexpected failure: %s",
                     self._id,
                     exc,
                     extra={
@@ -258,6 +411,7 @@ class _TcpConnectionHandler:
                     exc_info=True,
                     extra={"conn_id": self._id},
                 )
+
             finally:
                 metrics_observe(
                     "connection.upstream.duration_sec",
@@ -267,13 +421,31 @@ class _TcpConnectionHandler:
                 await self._send_close_frame_once()
 
     async def _downstream(self) -> None:
-        """Inbound queue → local TCP."""
+        """Inbound queue → local TCP.
+
+        Exception handling strategy
+        ---------------------------
+        ``asyncio.CancelledError``
+            Re-raised immediately — cancellation is always intentional here.
+        ``ConnectionClosedError``
+            The WebSocket connection dropped while waiting for data; the
+            downstream task exits so ``_on_task_done`` triggers cleanup.
+        ``TransportError``
+            Any other structured transport failure from ``recv``-path helpers.
+        ``OSError``
+            Local socket error (client disconnected, broken pipe, etc.);
+            log at DEBUG — these are routine.
+        ``ExecTunnelError``
+            Catch-all for any other library error; log at WARNING.
+        ``Exception``
+            Truly unexpected errors; log at WARNING with full traceback.
+        """
         with span("connection.downstream"):
             start = asyncio.get_running_loop().time()
             metrics_inc("connection.downstream.started")
             try:
                 while True:
-                    # Wait for either a queued data chunk or the close signal.
+                    # ── Wait for data or close signal ─────────────────────────
                     if self._inbound.empty():
                         if self._close_remote_requested:
                             # Queue is empty and remote has closed — we are done.
@@ -283,6 +455,7 @@ class _TcpConnectionHandler:
                                     await self._writer.drain()
                                 self._downstream_ended_cleanly = True
                             break
+
                         # Block until data arrives OR close_remote() fires.
                         data_task: asyncio.Task[bytes | None] = asyncio.create_task(
                             self._inbound.get()
@@ -298,13 +471,14 @@ class _TcpConnectionHandler:
                             t.cancel()
                             with contextlib.suppress(asyncio.CancelledError):
                                 await t
+
                         if data_task in done:
                             item = data_task.result()
                         else:
-                            # close_event fired; but data_task may have already
-                            # dequeued an item before being cancelled — rescue it
-                            # so it is not silently dropped (would truncate SSH
-                            # sessions or corrupt SCP transfers at close time).
+                            # close_event fired; rescue any item that data_task
+                            # may have already dequeued before being cancelled —
+                            # dropping it would truncate SSH sessions or corrupt
+                            # SCP transfers at close time.
                             if not data_task.cancelled():
                                 with contextlib.suppress(Exception):
                                     item = data_task.result()
@@ -318,19 +492,64 @@ class _TcpConnectionHandler:
                     else:
                         item = self._inbound.get_nowait()
 
-                    if item is None:  # legacy sentinel path (pre-flag callers)
+                    # ── Write item to local socket ────────────────────────────
+                    if item is None:
+                        # Legacy sentinel path (pre-flag callers).
                         if self._writer.can_write_eof():
                             with contextlib.suppress(OSError):
                                 self._writer.write_eof()
                                 await self._writer.drain()
                             self._downstream_ended_cleanly = True
                         break
+
                     self._bytes_downstream += len(item)
                     self._writer.write(item)
                     await self._writer.drain()
+
             except asyncio.CancelledError:
                 metrics_inc("connection.downstream.cancelled")
                 raise
+
+            except ConnectionClosedError as exc:
+                metrics_inc("connection.downstream.error", error="connection_closed")
+                logger.warning(
+                    "conn %s: downstream ended — tunnel connection closed "
+                    "[%s] (bytes_recv=%d, error_id=%s)",
+                    self._id,
+                    exc.error_code,
+                    self._bytes_downstream,
+                    exc.error_id,
+                    extra={
+                        "conn_id": self._id,
+                        "direction": "downstream",
+                        "bytes_recv": self._bytes_downstream,
+                        "error_code": exc.error_code,
+                        "error_id": exc.error_id,
+                    },
+                )
+
+            except TransportError as exc:
+                metrics_inc(
+                    "connection.downstream.error",
+                    error=exc.error_code.replace(".", "_"),
+                )
+                logger.warning(
+                    "conn %s: downstream transport error [%s]: %s "
+                    "(bytes_recv=%d, error_id=%s)",
+                    self._id,
+                    exc.error_code,
+                    exc.message,
+                    self._bytes_downstream,
+                    exc.error_id,
+                    extra={
+                        "conn_id": self._id,
+                        "direction": "downstream",
+                        "bytes_recv": self._bytes_downstream,
+                        "error_code": exc.error_code,
+                        "error_id": exc.error_id,
+                    },
+                )
+
             except OSError as exc:
                 metrics_inc("connection.downstream.error", error="OSError")
                 logger.debug(
@@ -344,10 +563,31 @@ class _TcpConnectionHandler:
                         "bytes_recv": self._bytes_downstream,
                     },
                 )
+
+            except ExecTunnelError as exc:
+                metrics_inc(
+                    "connection.downstream.error",
+                    error=exc.error_code.replace(".", "_"),
+                )
+                logger.warning(
+                    "conn %s: downstream library error [%s]: %s (error_id=%s)",
+                    self._id,
+                    exc.error_code,
+                    exc.message,
+                    exc.error_id,
+                    extra={
+                        "conn_id": self._id,
+                        "direction": "downstream",
+                        "bytes_recv": self._bytes_downstream,
+                        "error_code": exc.error_code,
+                        "error_id": exc.error_id,
+                    },
+                )
+
             except Exception as exc:
                 metrics_inc("connection.downstream.error", error=exc.__class__.__name__)
                 logger.warning(
-                    "conn %s: downstream failure: %s",
+                    "conn %s: downstream unexpected failure: %s",
                     self._id,
                     exc,
                     extra={
@@ -362,6 +602,7 @@ class _TcpConnectionHandler:
                     exc_info=True,
                     extra={"conn_id": self._id},
                 )
+
             finally:
                 metrics_observe(
                     "connection.downstream.duration_sec",
@@ -369,14 +610,67 @@ class _TcpConnectionHandler:
                 )
                 metrics_observe("connection.downstream.bytes", float(self._bytes_downstream))
 
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
     async def _send_close_frame_once(self) -> None:
-        """Send CONN_CLOSE exactly once. Renamed from ``_send_conn_close_once``."""
+        """Send ``CONN_CLOSE`` exactly once.
+
+        Raises
+        ------
+        WebSocketSendTimeoutError
+            Logged at WARNING and suppressed — the agent will time-out the
+            connection independently; we must not block cleanup.
+        ConnectionClosedError
+            Logged at DEBUG and suppressed — the connection is already gone.
+        TransportError
+            Logged at DEBUG and suppressed — teardown must always complete.
+        """
         if self._conn_close_sent:
             return
         self._conn_close_sent = True
         try:
             await self._ws_send(encode_frame("CONN_CLOSE", self._id), control=True)
+        except WebSocketSendTimeoutError as exc:
+            metrics_inc("connection.conn_close.error", error="ws_send_timeout")
+            logger.warning(
+                "conn %s: CONN_CLOSE send timed out — agent will time-out "
+                "the connection independently (error_id=%s)",
+                self._id,
+                exc.error_id,
+                extra={
+                    "conn_id": self._id,
+                    "error_code": exc.error_code,
+                    "error_id": exc.error_id,
+                },
+            )
+        except ConnectionClosedError as exc:
+            # Connection already gone — CONN_CLOSE is moot.
+            logger.debug(
+                "conn %s: CONN_CLOSE skipped — connection already closed (error_id=%s)",
+                self._id,
+                exc.error_id,
+                extra={"conn_id": self._id, "error_id": exc.error_id},
+            )
+        except TransportError as exc:
+            metrics_inc(
+                "connection.conn_close.error",
+                error=exc.error_code.replace(".", "_"),
+            )
+            logger.debug(
+                "conn %s: failed to send CONN_CLOSE [%s]: %s (error_id=%s)",
+                self._id,
+                exc.error_code,
+                exc.message,
+                exc.error_id,
+                exc_info=True,
+                extra={
+                    "conn_id": self._id,
+                    "error_code": exc.error_code,
+                    "error_id": exc.error_id,
+                },
+            )
         except Exception as exc:
+            # Non-library error — log and suppress so cleanup always completes.
             logger.debug(
                 "conn %s: failed to send CONN_CLOSE: %s",
                 self._id,
@@ -390,12 +684,23 @@ class _TcpConnectionHandler:
         if not task.cancelled():
             exc = task.exception()
             if exc is not None:
-                logger.debug(
-                    "conn %s task %s ended with error: %s",
-                    self._id,
-                    task.get_name(),
-                    exc,
-                )
+                # Emit error_code and error_id when available for log correlation.
+                if isinstance(exc, ExecTunnelError):
+                    logger.debug(
+                        "conn %s task %s ended with library error [%s] (error_id=%s): %s",
+                        self._id,
+                        task.get_name(),
+                        exc.error_code,
+                        exc.error_id,
+                        exc,
+                    )
+                else:
+                    logger.debug(
+                        "conn %s task %s ended with error: %s",
+                        self._id,
+                        task.get_name(),
+                        exc,
+                    )
 
         # Either direction ending cleanly is a valid half-close: keep the peer
         # alive to avoid truncating in-flight data (e.g. TLS responses or
@@ -439,23 +744,47 @@ class _TcpConnectionHandler:
             self._writer.close()
             await self._writer.wait_closed()
 
+    # ── Public control ────────────────────────────────────────────────────────
+
     def cancel_upstream(self) -> None:
         """Cancel the upstream task so no more DATA frames are sent to the agent.
 
         Used when the agent signals an ERROR — the downstream (agent→local) path
-        is closed via ``close_remote()``, and this stops the local→agent direction
-        so we don't keep sending DATA frames to a connection the agent has already
-        torn down.
+        is closed via :meth:`close_remote`, and this stops the local→agent
+        direction so we don't keep sending DATA frames to a connection the agent
+        has already torn down.
         """
         if self._upstream_task and not self._upstream_task.done():
             self._upstream_task.cancel()
 
+    # ── Properties ────────────────────────────────────────────────────────────
+
     @property
     def closed(self) -> asyncio.Event:
+        """Event that is set once :meth:`_cleanup` has completed."""
         return self._closed
 
     @property
     def conn_id(self) -> str:
+        """The stable identifier for this TCP connection."""
         return self._id
 
+    @property
+    def bytes_upstream(self) -> int:
+        """Total bytes forwarded from local TCP to the tunnel (upstream direction)."""
+        return self._bytes_upstream
 
+    @property
+    def bytes_downstream(self) -> int:
+        """Total bytes forwarded from the tunnel to local TCP (downstream direction)."""
+        return self._bytes_downstream
+
+    @property
+    def drop_count(self) -> int:
+        """Total inbound chunks dropped due to queue saturation or buffer overflow."""
+        return self._drop_count
+
+    @property
+    def is_started(self) -> bool:
+        """``True`` once :meth:`start` has been called successfully."""
+        return self._started
