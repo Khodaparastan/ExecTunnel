@@ -150,9 +150,13 @@ class UdpRelay:
                 atyp = AddrType.IPV6
                 addr_bytes = addr.packed
         except ValueError:
-            atyp = AddrType.DOMAIN
-            enc = src_host.encode()
-            addr_bytes = bytes([len(enc)]) + enc
+            # RFC 1928 §7 requires BND.ADDR in UDP replies to be an IP address.
+            # Domain names are not valid here — drop the reply silently.
+            logger.debug(
+                "udp relay: dropping reply with non-IP src_host %r (RFC 1928 §7)",
+                src_host,
+            )
+            return
 
         header = (
             b"\x00\x00\x00"  # RSV + FRAG

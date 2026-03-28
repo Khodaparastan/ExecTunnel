@@ -164,7 +164,9 @@ class Socks5Server:
             writer.write(bytes([0x05, AuthMethod.NO_ACCEPT]))
             with contextlib.suppress(OSError):
                 await writer.drain()
-            writer.close()
+            with contextlib.suppress(OSError):
+                writer.close()
+                await writer.wait_closed()
             raise ValueError("client does not support NO_AUTH")
 
         writer.write(bytes([0x05, AuthMethod.NO_AUTH]))
