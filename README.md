@@ -1,5 +1,7 @@
 # ExecTunnel
 
+> **Alpha / Proof-of-Concept** — not production-ready. APIs and behaviour may change without notice.
+
 SOCKS5 tunnel over Kubernetes exec/WebSocket channels for restricted environments.
 
 `ExecTunnel` exists for the real-world case where you do **not** get normal Kubernetes access (no kubeconfig, no namespace, no port-forward), but you **do** get a web terminal that internally uses an exec WebSocket stream.
@@ -43,9 +45,17 @@ Route traffic:
 export ALL_PROXY='socks5://127.0.0.1:1080'
 ```
 
+> **Note:** Because this is an alpha release, pip will not install it by default.
+> Use `pip install --pre exectunnel` to install pre-release versions.
+
 ## Development
 ```bash
+poetry install
 poetry run pytest -q
 poetry run ruff check .
 poetry run mypy exectunnel
 ```
+
+### Versioning
+The single source of truth for the version is `exectunnel/_version.py`.
+`pyproject.toml` reads it via `poetry-dynamic-versioning` — do not edit the version in `pyproject.toml` directly.
