@@ -20,7 +20,6 @@ WSS_PING_TIMEOUT
 WSS_SEND_TIMEOUT
     Maximum time in seconds to wait for a WebSocket send (default: 30).
 """
-
 from __future__ import annotations
 
 import argparse
@@ -35,7 +34,14 @@ from exectunnel.config import AppConfig, TunnelConfig
 from exectunnel.config.defaults import METRICS_REPORT_INTERVAL_SECS
 from exectunnel.config.exclusions import DEFAULT_EXCLUDE_CIDRS
 from exectunnel.config.settings import TUNNEL_CONFIG, get_app_config, get_tunnel_config
-from exectunnel.exceptions import BootstrapError, ConfigurationError
+from exectunnel.exceptions import (
+    AgentSyntaxError,
+    AgentVersionMismatchError,
+    BootstrapError,
+    ConfigurationError,
+    ExecTunnelError,
+    ReconnectExhaustedError,
+)
 from exectunnel.observability import (
     configure_logging,
     metrics_inc,
@@ -45,6 +51,9 @@ from exectunnel.observability import (
 )
 
 logger = logging.getLogger("exectunnel.cli")
+
+
+# ── Argument type validators ──────────────────────────────────────────────────
 
 
 def _port(value: str) -> int:
@@ -73,6 +82,9 @@ def _dns_ip(value: str) -> str:
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"invalid DNS IP {value!r}") from exc
     return value
+
+
+# ── Argument parser ───────────────────────────────────────────────────────────
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -191,10 +203,14 @@ environment:
         type=_positive_float,
         default=TUNNEL_CONFIG.conn_ack_timeout,
         metavar="SECS",
-        help=f"seconds to wait for agent CONN_ACK per connection (default: {TUNNEL_CONFIG.conn_ack_timeout:.0f})",
+        help=f"seconds to wait for agent CONN_ACK per connection "
+             f"(default: {TUNNEL_CONFIG.conn_ack_timeout:.0f})",
     )
 
     return parser
+
+
+# ── CLI helpers ───────────────────────────────────────────────────────────────
 
 
 def _parse_tunnel_excludes(
@@ -203,7 +219,6 @@ def _parse_tunnel_excludes(
     nets: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
     if not args.no_default_exclude:
         from exectunnel.config.exclusions import get_default_exclusion_networks
-
         nets.extend(get_default_exclusion_networks())
     for cidr in args.exclude:
         try:
@@ -213,7 +228,56 @@ def _parse_tunnel_excludes(
     return nets
 
 
+def _parse_metrics_interval(raw: str) -> float:
+    """Parse and validate ``EXECTUNNEL_METRICS_REPORT_INTERVAL``.
+
+    Returns a non-negative float.  Invalid or negative values fall back to
+    sensible defaults with a WARNING log so the operator knows the env var
+    was ignored.
+    """
+    try:
+        interval = float(raw)
+    except ValueError:
+        logger.warning(
+            "invalid EXECTUNNEL_METRICS_REPORT_INTERVAL=%r — "
+            "expected a number; using %.0fs",
+            raw,
+            METRICS_REPORT_INTERVAL_SECS,
+        )
+        return METRICS_REPORT_INTERVAL_SECS
+    if interval < 0:
+        logger.warning(
+            "negative EXECTUNNEL_METRICS_REPORT_INTERVAL=%s — "
+            "using 0 (reporter disabled)",
+            raw,
+        )
+        return 0.0
+    return interval
+
+
+# ── Async command runner ──────────────────────────────────────────────────────
+
+
 async def run_tunnel_command(cfg: AppConfig, tun_cfg: TunnelConfig) -> None:
+    """Bootstrap the agent and run the tunnel session.
+
+    Exit codes
+    ----------
+    0   Clean exit (``KeyboardInterrupt`` or normal session end).
+    1   Fatal error — bootstrap failure, reconnect exhaustion, or any other
+        unrecoverable :class:`ExecTunnelError`.
+    2   Unexpected non-library error (bug or environment issue).
+
+    Exception handling strategy
+    ---------------------------
+    * :class:`AgentSyntaxError`        – fatal; agent payload corrupt/incompatible.
+    * :class:`AgentVersionMismatchError`– fatal; operator must upgrade.
+    * :class:`BootstrapError`          – fatal; agent failed to start.
+    * :class:`ReconnectExhaustedError` – fatal; all retries consumed.
+    * :class:`ExecTunnelError`         – catch-all for any other library error.
+    * ``KeyboardInterrupt``            – clean shutdown; exit 0.
+    * ``Exception``                    – unexpected; exit 2.
+    """
     from exectunnel.transport.session import TunnelSession
 
     trace_seed = os.getenv("EXECTUNNEL_TRACE_ID")
@@ -228,23 +292,15 @@ async def run_tunnel_command(cfg: AppConfig, tun_cfg: TunnelConfig) -> None:
             else "disabled",
             len(tun_cfg.exclude),
         )
+
         session = TunnelSession(cfg, tun_cfg)
-        metrics_interval_raw = os.getenv("EXECTUNNEL_METRICS_REPORT_INTERVAL", str(METRICS_REPORT_INTERVAL_SECS))
-        try:
-            metrics_interval = float(metrics_interval_raw)
-        except ValueError:
-            logger.warning(
-                "invalid EXECTUNNEL_METRICS_REPORT_INTERVAL=%r; using %.0f",
-                metrics_interval_raw,
-                METRICS_REPORT_INTERVAL_SECS,
+
+        metrics_interval = _parse_metrics_interval(
+            os.getenv(
+                "EXECTUNNEL_METRICS_REPORT_INTERVAL",
+                str(METRICS_REPORT_INTERVAL_SECS),
             )
-            metrics_interval = METRICS_REPORT_INTERVAL_SECS
-        if metrics_interval < 0:
-            logger.warning(
-                "negative EXECTUNNEL_METRICS_REPORT_INTERVAL=%s; using 0 (disabled)",
-                metrics_interval_raw,
-            )
-            metrics_interval = 0.0
+        )
         stop_event = asyncio.Event()
         reporter_task: asyncio.Task[None] | None = None
         if metrics_interval > 0:
@@ -252,23 +308,143 @@ async def run_tunnel_command(cfg: AppConfig, tun_cfg: TunnelConfig) -> None:
                 run_metrics_reporter(metrics_interval, stop_event),
                 name="metrics-reporter",
             )
+
         try:
             await session.run()
             metrics_inc("cli.commands.ok", command="tunnel")
-        except (BootstrapError, RuntimeError) as exc:
+
+        # ── Bootstrap failures — always fatal, never retried ──────────────────
+        except AgentSyntaxError as exc:
             metrics_inc(
-                "cli.commands.error", command="tunnel", error=exc.__class__.__name__
+                "cli.commands.error",
+                command="tunnel",
+                error=exc.error_code.replace(".", "_"),
             )
-            logger.error("tunnel failed: %s", exc)
-            logger.debug("tunnel failure traceback", exc_info=True)
+            logger.error(
+                "fatal: agent script syntax error [%s]: %s\n"
+                "  file   : %s\n"
+                "  hint   : %s\n"
+                "  error_id: %s",
+                exc.error_code,
+                exc.message,
+                exc.details.get("filename", "unknown"),
+                exc.hint or "—",
+                exc.error_id,
+            )
+            logger.debug("bootstrap traceback", exc_info=True)
             sys.exit(1)
+
+        except AgentVersionMismatchError as exc:
+            metrics_inc(
+                "cli.commands.error",
+                command="tunnel",
+                error=exc.error_code.replace(".", "_"),
+            )
+            logger.error(
+                "fatal: agent version mismatch [%s]: %s\n"
+                "  local  : %s\n"
+                "  remote : %s\n"
+                "  hint   : %s\n"
+                "  error_id: %s",
+                exc.error_code,
+                exc.message,
+                exc.details.get("local_version", "unknown"),
+                exc.details.get("remote_version", "unknown"),
+                exc.hint or "—",
+                exc.error_id,
+            )
+            logger.debug("bootstrap traceback", exc_info=True)
+            sys.exit(1)
+
+        except BootstrapError as exc:
+            # Catches AgentReadyTimeoutError and any other BootstrapError
+            # subclass not handled above.
+            metrics_inc(
+                "cli.commands.error",
+                command="tunnel",
+                error=exc.error_code.replace(".", "_"),
+            )
+            logger.error(
+                "fatal: bootstrap failed [%s]: %s\n"
+                "  hint   : %s\n"
+                "  error_id: %s",
+                exc.error_code,
+                exc.message,
+                exc.hint or "—",
+                exc.error_id,
+            )
+            logger.debug("bootstrap traceback", exc_info=True)
+            sys.exit(1)
+
+        # ── Reconnect exhaustion ──────────────────────────────────────────────
+        except ReconnectExhaustedError as exc:
+            metrics_inc(
+                "cli.commands.error",
+                command="tunnel",
+                error=exc.error_code.replace(".", "_"),
+            )
+            logger.error(
+                "fatal: reconnect exhausted [%s]: %s\n"
+                "  attempts: %s\n"
+                "  last    : %s\n"
+                "  hint    : %s\n"
+                "  error_id: %s",
+                exc.error_code,
+                exc.message,
+                exc.details.get("attempts", "?"),
+                exc.details.get("last_error", "—"),
+                exc.hint or "—",
+                exc.error_id,
+            )
+            logger.debug("reconnect traceback", exc_info=True)
+            sys.exit(1)
+
+        # ── Catch-all for any other library error ─────────────────────────────
+        except ExecTunnelError as exc:
+            metrics_inc(
+                "cli.commands.error",
+                command="tunnel",
+                error=exc.error_code.replace(".", "_"),
+            )
+            logger.error(
+                "fatal: tunnel error [%s]: %s\n"
+                "  hint   : %s\n"
+                "  error_id: %s",
+                exc.error_code,
+                exc.message,
+                exc.hint or "—",
+                exc.error_id,
+            )
+            logger.debug("tunnel traceback", exc_info=True)
+            sys.exit(1)
+
+        # ── Clean shutdown ────────────────────────────────────────────────────
         except KeyboardInterrupt:
             metrics_inc("cli.commands.interrupted", command="tunnel")
             logger.info("interrupted")
+
+        # ── Unexpected non-library error (bug / environment) ──────────────────
+        except Exception as exc:
+            metrics_inc(
+                "cli.commands.error",
+                command="tunnel",
+                error=exc.__class__.__name__,
+            )
+            logger.error(
+                "fatal: unexpected error (%s): %s",
+                exc.__class__.__name__,
+                exc,
+            )
+            logger.debug("unexpected traceback", exc_info=True)
+            sys.exit(2)
+
         finally:
             stop_event.set()
             if reporter_task is not None:
                 await reporter_task
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 
 def main() -> None:
@@ -281,7 +457,17 @@ def main() -> None:
     try:
         cfg = get_app_config()
     except ConfigurationError as exc:
-        parser.error(str(exc))
+        # Emit structured fields before falling back to argparse's error format.
+        logger.debug(
+            "configuration error [%s]: %s (error_id=%s)",
+            exc.error_code,
+            exc.message,
+            exc.error_id,
+        )
+        parser.error(
+            f"[{exc.error_code}] {exc.message}"
+            + (f"\n  hint: {exc.hint}" if exc.hint else "")
+        )
 
     if args.command == "tunnel":
         try:
@@ -295,8 +481,21 @@ def main() -> None:
                 conn_ack_timeout=args.conn_ack_timeout,
                 exclude=_parse_tunnel_excludes(args),
             )
+        except ConfigurationError as exc:
+            logger.debug(
+                "tunnel config error [%s]: %s (error_id=%s)",
+                exc.error_code,
+                exc.message,
+                exc.error_id,
+            )
+            parser.error(
+                f"[{exc.error_code}] {exc.message}"
+                + (f"\n  hint: {exc.hint}" if exc.hint else "")
+            )
         except ValueError as exc:
+            # Legacy: get_tunnel_config may still raise ValueError in some paths.
             parser.error(str(exc))
+
         try:
             asyncio.run(run_tunnel_command(cfg, tun_cfg))
         except KeyboardInterrupt:
