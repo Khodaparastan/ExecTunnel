@@ -157,19 +157,25 @@ class _TcpConnectionHandler:
 
         Returns False if the connection was closed before data could be enqueued.
         Re-checks ``_closed`` after the await so that data is never enqueued
-        *after* the ``None`` sentinel that ``close_remote()`` delivers — which
-        would cause ``_downstream`` to exit before reading the trailing chunk.
-        Byte accounting is done in ``_downstream`` when each item is dequeued.
+        *after* cleanup has already run.  Byte accounting is done in
+        ``_downstream`` when each item is dequeued.
+
+        We intentionally do NOT roll back the enqueued item when
+        ``_close_remote_requested`` is set after the put().  The previous
+        rollback via ``get_nowait()`` had a TOCTOU race: if ``_downstream``
+        had already exited its drain loop by the time the rollback ran, the
+        item was removed from the queue but never written to the local socket,
+        silently truncating the stream.  Instead we leave the item in the
+        queue and let ``_downstream`` drain it before honouring the close flag
+        — the drain-then-close ordering in ``_downstream`` guarantees every
+        byte the agent sent is delivered before EOF is written.
         """
         if self._closed.is_set():
             return False
         await self._inbound.put(data)
-        # If close_remote() fired while we were suspended on put(), the sentinel
-        # flag is already set.  Roll back the enqueue so no data sits after the
-        # sentinel in the queue.
-        if self._close_remote_requested:
-            with contextlib.suppress(asyncio.QueueEmpty):
-                self._inbound.get_nowait()
+        # If _cleanup() already ran while we were suspended on put(), the
+        # connection is fully torn down — signal the caller to stop feeding.
+        if self._closed.is_set():
             return False
         return True
 

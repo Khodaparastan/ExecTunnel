@@ -1118,6 +1118,18 @@ class TunnelSession:
                             pending_task.cancel()
                             with contextlib.suppress(asyncio.CancelledError):
                                 await pending_task
+                            # asyncio.Queue.get() removes the item from the
+                            # queue before the coroutine returns.  If the task
+                            # was cancelled after the item was already dequeued
+                            # (i.e. the task finished successfully despite the
+                            # cancel request), rescue the item so it is not
+                            # silently dropped — which would corrupt any
+                            # in-flight TCP stream (e.g. SCP transfers).
+                            if pending_task is data_wait and not pending_task.cancelled():
+                                with contextlib.suppress(Exception):
+                                    rescued = pending_task.result()
+                                    if rescued is not None:
+                                        deferred_data_item = rescued
                         if ctrl_wait in done:
                             item = ctrl_wait.result()
                             # Preserve already-ready data for next iteration

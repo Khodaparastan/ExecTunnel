@@ -415,23 +415,32 @@ class TcpConnectionWorker:
                         sock.shutdown(socket.SHUT_WR)
 
             # If we already sent FIN but the remote hasn't closed within the
-            # deadline, drain whatever is still readable before giving up so we
-            # don't silently discard data that arrived just before the break.
+            # deadline, only break if the remote is also no longer sending data.
+            # Breaking while the remote is still actively sending would silently
+            # discard in-flight data and RST a live connection (e.g. an SSH
+            # session that is still streaming output after the client sent EOF).
             if local_shut and local_shut_deadline is not None and time.monotonic() >= local_shut_deadline:
-                # One final non-blocking drain pass.
-                with contextlib.suppress(OSError):
-                    sock.setblocking(False)
-                    while True:
-                        try:
-                            chunk = sock.recv(4096)
-                        except BlockingIOError:
-                            break
-                        if not chunk:
-                            break
-                        _write_data_frame(
-                            f"{_FRAME_PREFIX}DATA:{cid}:{base64.b64encode(chunk).decode()}{_FRAME_SUFFIX}"
-                        )
-                break
+                # Check whether the remote socket still has data to read.
+                readable_now, _, _ = select.select([sock], [], [], 0)
+                if sock in readable_now:
+                    # Remote is still sending — drain this chunk and reset the
+                    # deadline so we keep waiting rather than hard-killing the
+                    # connection while data is in flight.
+                    try:
+                        chunk = sock.recv(4096)
+                    except OSError:
+                        break
+                    if not chunk:
+                        # Remote sent FIN — we are done.
+                        break
+                    _write_data_frame(
+                        f"{_FRAME_PREFIX}DATA:{cid}:{base64.b64encode(chunk).decode()}{_FRAME_SUFFIX}"
+                    )
+                    # Extend the deadline: remote is still alive and sending.
+                    local_shut_deadline = time.monotonic() + 30.0
+                else:
+                    # Remote is not sending anything — it is safe to close.
+                    break
 
 
 # ── UDP flow worker ───────────────────────────────────────────────────────────
