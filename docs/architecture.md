@@ -46,7 +46,7 @@
 │      ▼                                                           │
 │  TunnelSession._socks_loop()                                     │
 │      │                                                           │
-│      ├─[CONNECT, tunnelled]──► _ConnHandler ──► _ws_send()      │
+│      ├─[CONNECT, tunnelled]──► _TcpConnectionHandler ► _ws_send()│
 │      ├─[CONNECT, excluded]───► _pipe() ──────► direct TCP       │
 │      └─[UDP ASSOCIATE]───────► _UdpFlowHandler ► _ws_send()     │
 │                                                                  │
@@ -58,8 +58,8 @@
 │  Pod                                                             │
 │  agent.py (stdin=WS-in, stdout=WS-out)                          │
 │      │                                                           │
-│      ├─[CONN_OPEN]──► Connection._io_loop() ──► remote TCP      │
-│      └─[UDP_OPEN]───► _udp_worker() ──────────► remote UDP      │
+│      ├─[CONN_OPEN]──► TcpConnectionWorker._io_loop() ──► remote │
+│      └─[UDP_OPEN]───► UdpFlowWorker._run() ───► remote UDP      │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -69,13 +69,13 @@
 
 | Component | File | Role |
 |---|---|---|
-| `Socks5Server` | `socks5.py` | Accepts TCP connections, performs SOCKS5 handshake, yields `Socks5Request` |
-| `UdpRelay` | `socks5.py` | Local UDP socket; strips/adds SOCKS5 UDP headers (RFC 1928 §7) |
-| `TunnelSession` | `tunnel.py` | Orchestrates bootstrap, serve, recv/send loops, request dispatch |
-| `_ConnHandler` | `connection.py` (imported by `tunnel.py`) | Bridges one local TCP stream ↔ WebSocket DATA frames. Defined in `connection.py`; instantiated in `TunnelSession._handle_connect()` which owns `start()` and `abort()`. `close_remote()` and `cancel_upstream()` are also called from `_dispatch_frame_async()` (on `ERROR`, `CONN_CLOSED_ACK`, and reconnect drain) — lifecycle management is split between `_handle_connect` and `_dispatch_frame_async`. |
-| `_UdpFlowHandler` | `tunnel.py` | Bridges one UDP flow ↔ WebSocket UDP_DATA frames |
-| `_DnsForwarder` | `tunnel.py` | Local UDP DNS listener; each query becomes a `_UdpFlowHandler` |
-| `agent.py` | `payload/agent.py` | Runs inside pod; manages `Connection` (TCP worker thread via `Connection._io_loop`) and `UdpFlow` (UDP worker thread via `UdpFlow._io_loop`) |
+| `Socks5Server` | `proxy/server.py` | Accepts TCP connections, performs SOCKS5 handshake, yields `Socks5Request` |
+| `UdpRelay` | `proxy/relay.py` | Local UDP socket; strips/adds SOCKS5 UDP headers (RFC 1928 §7) |
+| `TunnelSession` | `transport/session.py` | Orchestrates bootstrap, serve, recv/send loops, request dispatch |
+| `_TcpConnectionHandler` | `transport/connection.py` | Bridges one local TCP stream ↔ WebSocket DATA frames. Instantiated in `TunnelSession._handle_connect()` which owns `start()`. `close_remote()` is called from `_dispatch_frame_async()` on `ERROR`, `CONN_CLOSED_ACK`, and reconnect drain; `cancel_upstream()` is additionally called on `ERROR` only — lifecycle management is split between `_handle_connect` and `_dispatch_frame_async`. |
+| `_UdpFlowHandler` | `transport/udp_flow.py` | Bridges one UDP flow ↔ WebSocket UDP_DATA frames |
+| `_DnsForwarder` | `transport/dns_forwarder.py` | Local UDP DNS listener; each query becomes a `_UdpFlowHandler` |
+| `agent.py` | `payload/agent.py` | Runs inside pod; manages `TcpConnectionWorker` (TCP worker thread via `_io_loop`) and `UdpFlowWorker` (UDP worker thread via `_io_loop`) |
 
 ---
 
@@ -87,25 +87,28 @@ sequenceDiagram
     participant WS as WebSocket (exec channel)
     participant P as Pod Shell
 
-    L->>WS: connect WSS_URL
+    L->>WS: connect EXECTUNNEL_WSS_URL
     WS->>P: exec channel open
-    L->>P: stty -echo\n
+    L->>P: stty -echo
     Note over L: sleep BOOTSTRAP_STTY_DELAY_SECS
-    L->>P: rm -f /tmp/exectunnel_agent.py /tmp/exectunnel_agent.b64\n
+    L->>P: rm temp agent files
     Note over L: sleep BOOTSTRAP_RM_DELAY_SECS
-    loop base64 chunks (BOOTSTRAP_CHUNK_SIZE bytes each)
-        L->>P: printf '%s' '<chunk>' >> /tmp/exectunnel_agent.b64\n
+
+    loop base64 chunks (BOOTSTRAP_CHUNK_SIZE_CHARS chars each)
+        L->>P: append chunk to /tmp/exectunnel_agent.b64
     end
-    L->>P: base64 -d /tmp/exectunnel_agent.b64 > /tmp/exectunnel_agent.py\n
+
+    L->>P: decode base64 to /tmp/exectunnel_agent.py
     Note over L: sleep BOOTSTRAP_DECODE_DELAY_SECS
-    L->>P: python3 -c 'ast.parse(...); sys.stdout.write("SYNTAX_OK\n")'\n
-    Note over L,P: If syntax is bad, Python writes "SyntaxError: ..." or\n"Traceback (most recent call last):..." to stdout.\n_wait_ready() detects these prefixes and raises AgentSyntaxError immediately.\nSYNTAX_OK itself is NOT explicitly consumed — it is stored in _bootstrap_diag\nas ordinary diagnostic output. Detection is error-pattern matching, not\npositive-confirmation matching.
-    L->>P: exec python3 /tmp/exectunnel_agent.py\n
+    L->>P: python3 syntax check (ast.parse)
+    Note over L,P: On syntax failure, stdout starts with SyntaxError or Traceback.
+    L->>P: exec python3 /tmp/exectunnel_agent.py
     Note over P: Shell replaced by agent process
-    P-->>L: AGENT_READY\n  (via stdout → WebSocket)
-    Note over L: _wait_ready() returns; any frames\nafter AGENT_READY buffered in _pre_ready_buf
-    L->>L: _serve() starts (Socks5Server + recv/send loops)
-    L->>L: _recv_loop() replays _pre_ready_buf frames via _dispatch_frame_async
+    P-->>L: AGENT_READY
+    Note over L: Frames after AGENT_READY are buffered in _pre_ready_buf
+    L->>L: _serve() starts
+    L->>L: _recv_loop() replays _pre_ready_buf
+    Note over L: _run_session resets ACK-failure window counters<br/>(_ack_reconnect_requested, _ack_timeout_window_start,<br/>_ack_timeout_window_count) — prior-session failures<br/>do not pollute the new session's reconnect threshold
 ```
 
 **Key invariant**: After `exec python3 /tmp/exectunnel_agent.py`, the pod shell is replaced — the WebSocket channel IS the agent's stdin/stdout. All subsequent communication is the frame protocol.
@@ -113,8 +116,9 @@ sequenceDiagram
 **Bootstrap failure detection in `_wait_ready()`**:
 - `SYNTAX_OK` is **not validated** — `_wait_ready()` never checks for its presence. It is appended to `_bootstrap_diag` as ordinary diagnostic output.
 - Syntax failure is detected by watching each incoming stdout line for the prefixes `"SyntaxError:"` or `"Traceback (most recent"`. On a match, `AgentSyntaxError` is raised immediately.
-- If no such pattern appears and `AGENT_READY` never arrives within `ready_timeout`, `AgentTimeoutError` is raised (covers cases where `exec` itself fails, e.g. permissions or missing interpreter).
-- Both `AgentSyntaxError` and `AgentTimeoutError` are sub-classes of `BootstrapError` and map to the `Fatal` state in §10.
+- If the WebSocket channel closes before `AGENT_READY` is seen (e.g. `exec` fails because `python3` is missing, permission denied, or the shell exits), the `async for msg in ws` iterator exhausts and `_wait_ready()` raises plain `BootstrapError` directly.
+- If `AGENT_READY` never arrives but the WebSocket *stays open* for longer than `ready_timeout` (e.g. the agent process hangs silently), `asyncio.wait_for()` in `_bootstrap()` raises `TimeoutError` which is caught and re-raised as `AgentReadyTimeoutError`.
+- All three — `AgentSyntaxError`, `AgentReadyTimeoutError`, and plain `BootstrapError` — are sub-classes or instances of `BootstrapError` and all map to the `Fatal` state in §10.
 
 ---
 
@@ -145,7 +149,7 @@ flowchart TD
     B -- yes --> C[direct TCP via asyncio.open_connection]
     B -- no --> D[route through WebSocket tunnel]
     C --> E[_pipe client↔remote]
-    D --> F[_ConnHandler + CONN_OPEN frame]
+    D --> F[_TcpConnectionHandler + CONN_OPEN frame]
 ```
 
 Excluded CIDRs (default: RFC1918 + loopback, configurable via `TunnelConfig.exclude`):
@@ -156,7 +160,7 @@ Excluded CIDRs (default: RFC1918 + loopback, configurable via `TunnelConfig.excl
 ```mermaid
 sequenceDiagram
     participant C as SOCKS5 Client
-    participant H as _ConnHandler
+    participant H as _TcpConnectionHandler
     participant SL as _send_loop
     participant WS as WebSocket
     participant A as agent.py
@@ -190,7 +194,7 @@ sequenceDiagram
         loop while remote sends data
             R->>A: sock.recv(4096)
             A->>WS: DATA:<conn_id>:<b64> (stdout)
-            WS->>H: _recv_loop → _dispatch_frame_async → async_feed → _inbound queue
+            WS->>H: _recv_loop → _dispatch_frame_async → feed_async → _inbound queue
             H->>C: writer.write(data) + drain
         end
         R->>A: TCP EOF (recv returns b"")
@@ -242,7 +246,7 @@ sequenceDiagram
 
 The system implements proper TCP half-close in **three layers**:
 
-#### Layer 1 — `_ConnHandler` (`connection.py`)
+#### Layer 1 — `_TcpConnectionHandler` (`transport/connection.py`)
 
 ```
 _upstream ends cleanly (EOF from client):
@@ -278,7 +282,7 @@ After SHUT_WR:
   → pending = []  [skip inbound drain to avoid EPIPE]
 ```
 
-#### Layer 3 — `_pipe()` (`tunnel.py`, direct connections)
+#### Layer 3 — `_pipe()` (`transport/session.py`, direct connections)
 
 ```
 src EOF → dst.write_eof() + drain [if can_write_eof]
@@ -333,13 +337,13 @@ sequenceDiagram
 
     P->>R: relay.recv() → (payload, dst_host, dst_port)
     P->>P: is_host_excluded? → No
-    P->>P: key=(dst_host,dst_port); handler=active_flows.get(key)
+    P->>P: key=(dst_host,dst_port)&#59; handler=active_flows.get(key)
     alt New flow
         P->>F: _UdpFlowHandler(flow_id, dst_host, dst_port, ...)
         P->>SL: UDP_OPEN:<flow_id>:<host>:<port> (control)
         SL->>WS: send frame
         WS->>A: UDP_OPEN frame
-        A->>A: _udp_worker thread started for flow_id
+        A->>A: UdpFlowWorker._run() thread started for flow_id
         P->>P: drain_flow task started
     end
     P->>F: handler.send_datagram(payload)
@@ -428,21 +432,21 @@ All frames are **newline-terminated UTF-8 strings** sent over the WebSocket chan
 ### Frame Format
 
 ```
-<<<EXECTUNNEL:<TYPE>:<id>[:<payload>]>>>\n
+<<<EXECTUNNEL:<TYPE>[:<id>[:<payload>]]>>>\n
 ```
 
-- `<<<EXECTUNNEL:` = `FRAME_PREFIX` (defined in `consts.py` and `agent.py`)
+- `<<<EXECTUNNEL:` = `FRAME_PREFIX` (defined in `protocol/frames.py` and `agent.py`)
 - `>>>` = `FRAME_SUFFIX`
 - `<TYPE>` = frame type string (e.g. `DATA`, `CONN_OPEN`)
-- `<id>` = connection ID (TCP) or flow ID (UDP)
+- `<id>` = connection ID (TCP) or flow ID (UDP); omitted for frames like `AGENT_READY`
 - `<payload>` = base64-encoded data, or `host:port` for open frames; absent for control-only frames
 - The trailing `\n` is the line delimiter used by both sides to split frames from the stream.
 
-Payload field is **omitted entirely** (no trailing colon) when there is nothing to encode — e.g. `CONN_CLOSE`, `CONN_ACK`.
+Payload and ID fields are **omitted entirely** (no trailing colon) when they are not applicable — e.g. `AGENT_READY` (no ID, no payload) or `CONN_ACK` (has ID, no payload).
 
 Frame parsing is a **two-layer** process:
 
-**Layer 1 — `parse_frame()` (`helpers.py`)**: splits the inner frame string on the first two colons only (`split(":", 2)`):
+**Layer 1 — `parse_frame()` (`protocol/frames.py`)**: splits the inner frame string on the first two colons only (`split(":", 2)`):
 ```
 msg_type = parts[0]   # e.g. "CONN_OPEN"
 conn_id  = parts[1]   # e.g. "c1a2b3"
@@ -455,7 +459,7 @@ This preserves colons inside the payload (IPv6 addresses, base64 padding, etc.) 
 "2001:db8::1:443".rpartition(":")  →  host="2001:db8::1", port="443"
 "example.com:443".rpartition(":")  →  host="example.com",  port="443"
 ```
-Both the local side (`helpers.py encode_conn_open_frame`) and the agent side (`_dispatch_loop` in `agent.py`) use `rpartition(":")` for this step. Any compatible re-implementation **must** use `rpartition` (or equivalent last-colon split) — a left-to-right `split(":", 1)` would silently mis-parse IPv6 hosts.
+Both the local side (`protocol/frames.py encode_conn_open_frame`) and the agent side (`_dispatch_loop` in `agent.py`) use `rpartition(":")` for this step. Any compatible re-implementation **must** use `rpartition` (or equivalent last-colon split) — a left-to-right `split(":", 1)` would silently mis-parse IPv6 hosts.
 
 **Examples:**
 ```
@@ -483,7 +487,7 @@ Both the local side (`helpers.py encode_conn_open_frame`) and the agent side (`_
 | Agent → Local | `UDP_DATA` | base64 bytes | UDP datagram (inbound) |
 | Local → Agent | `UDP_CLOSE` | — | Close UDP flow |
 | Agent → Local | `UDP_CLOSED` | — | Agent closed UDP flow |
-| Agent → Local | `AGENT_READY` | — | Bootstrap complete |
+| Agent → Local | `AGENT_READY` | — | Bootstrap complete (no ID or payload) |
 
 ### Send Queue Architecture
 
@@ -540,29 +544,29 @@ flowchart TD
 
 **Backpressure (tunnel → agent)**: `_upstream` calls `_ws_send(must_queue=True)` which **`await`s `queue.put()`**, asynchronously suspending the coroutine until the send queue has space. When the send queue is full (WS is slow), `_upstream` stalls, the asyncio reader stops consuming from the TCP socket, the kernel receive buffer fills, and TCP window shrinks to zero — slowing the remote sender naturally without tearing down the connection.
 
-**Backpressure (agent → tunnel)**: `_recv_loop` calls `_dispatch_frame_async()` which uses `await handler.async_feed(data)` for post-ACK DATA frames — blocking the WS reader when the inbound queue is full. This stalls the WS reader, fills the kernel TCP receive buffer on the WS connection, and propagates backpressure all the way to the agent's `_emit_data()` call, which blocks the worker thread, which stalls its `select` loop, which fills the remote TCP receive buffer.
+**Backpressure (agent → tunnel)**: `_recv_loop` calls `_dispatch_frame_async()` which uses `await handler.feed_async(data)` for post-ACK DATA frames — blocking the WS reader when the inbound queue is full. This stalls the WS reader, fills the kernel TCP receive buffer on the WS connection, and propagates backpressure all the way to the agent's `_write_data_frame()` call, which blocks the worker thread, which stalls its `select` loop, which fills the remote TCP receive buffer.
 
-**Backpressure (agent stdout)**: `_StdoutWriter.emit_data()` blocks the calling worker thread when the bounded `_data` queue (`_STDOUT_DATA_QUEUE_CAP=2048`) is full. This stalls the worker's `select` loop, fills the kernel TCP receive buffer, and lets TCP flow-control slow the remote sender naturally — no frames dropped.
+**Backpressure (agent stdout)**: `_FrameWriter.emit_data()` blocks the calling worker thread when the bounded `_data` queue (`_STDOUT_DATA_QUEUE_CAP=2048`) is full. This stalls the worker's `select` loop, fills the kernel TCP receive buffer, and lets TCP flow-control slow the remote sender naturally — no frames dropped.
 
 ---
 
 ## 8. Agent Side (pod)
 
 The agent runs as a single Python process with:
-- **Main thread**: reads stdin line-by-line, dispatches frames
-- **`stdout-writer` daemon thread**: `_StdoutWriter._run()` — serialises all stdout writes with control-frame priority
-- **One thread per TCP connection**: `Connection._io_loop()`
-- **One thread per UDP flow**: `UdpFlow._io_loop()` (started by `UdpFlow._run()`, the thread target)
+- **Main thread**: `_dispatch_loop()` — reads stdin line-by-line, dispatches frames
+- **`stdout-writer` daemon thread**: `_FrameWriter._run()` — serialises all stdout writes with control-frame priority
+- **One thread per TCP connection**: `TcpConnectionWorker._io_loop()`
+- **One thread per UDP flow**: `UdpFlowWorker._io_loop()` (started by `UdpFlowWorker._run()`, the thread target)
 
-**`_StdoutWriter` flush timing**: the writer loop does `ctrl.get(timeout=0.005)` (5 ms poll). When a control frame arrives in `_ctrl`, it is written **plus all other pending control frames** (via a `get_nowait()` drain loop) before any data frames are touched. Then up to 64 data frames are written per cycle. Consequence: a `CONN_ACK` (or any other ctrl frame) is dequeued within at most ~5 ms of being enqueued — regardless of how many data frames are queued in `_data`. The 64-frame batch cap governs only the *data frame* drain rate between control-check iterations and does not delay control frames.
+**`_FrameWriter` flush timing**: the writer loop does `ctrl.get(timeout=0.005)` (5 ms poll). When a control frame arrives in `_ctrl`, it is written **plus all other pending control frames** (via a `get_nowait()` drain loop) before any data frames are touched. Then up to 64 data frames are written per cycle. Consequence: a `CONN_ACK` (or any other ctrl frame) is dequeued within at most ~5 ms of being enqueued — regardless of how many data frames are queued in `_data`. The 64-frame batch cap governs only the *data frame* drain rate between control-check iterations and does not delay control frames.
 
-**Timing caveat**: the ~5 ms figure is the maximum *queue-poll wake-up latency*, not the end-to-end write latency. If the kernel pipe buffer is under pressure (e.g. the local-side WebSocket reader is not consuming stdout fast enough), each `sys.stdout.write()` call may block briefly. The actual time from `_emit_ctrl()` call to `sys.stdout.flush()` completion can therefore exceed 5 ms under sustained high-throughput conditions. In practice this only occurs when the entire send path is already saturated.
+**Timing caveat**: the ~5 ms figure is the maximum *queue-poll wake-up latency*, not the end-to-end write latency. If the kernel pipe buffer is under pressure (e.g. the local-side WebSocket reader is not consuming stdout fast enough), each `sys.stdout.write()` call may block briefly. The actual time from `_write_ctrl_frame()` call to `sys.stdout.flush()` completion can therefore exceed 5 ms under sustained high-throughput conditions. In practice this only occurs when the entire send path is already saturated.
 
 ### 8.1 TCP Connection Worker
 
 ```mermaid
 flowchart TD
-    A[CONN_OPEN received] --> B[Connection.__init__\nfield init + pipe pair + Thread created\nNO network ops]
+    A[CONN_OPEN received] --> B[TcpConnectionWorker.__init__\nfield init + pipe pair + Thread created\nNO network ops]
     B --> B2[conn.start\nthread._start → _run begins on worker thread\nmain dispatch loop resumes immediately]
     B2 --> C{socket.create_connection\nhost port timeout=28\nconnect ok?}
     C -- error --> D[_emit_ctrl ERROR:<conn_id>:<reason>\nthread exits]
@@ -599,18 +603,18 @@ flowchart TD
     U --> Z[sock.close\n_on_close _emit_ctrl CONN_CLOSED_ACK]
 ```
 
-**Thread safety**: `_inbound` list is protected by `_inbound_lock`. `_notify_r`/`_notify_w` is a `os.pipe()` pair used to wake the select loop when new data is fed via `Connection.feed()`.
+**Thread safety**: `_inbound` list is protected by `_inbound_lock`. `_notify_r`/`_notify_w` is a `os.pipe()` pair used to wake the select loop when new data is fed via `TcpConnectionWorker.feed()`.
 
-**Two-phase inbound drain on `remote_closed`**: Every loop iteration first drains `_inbound` under `_inbound_lock` into `pending` and sends it (Phase 1). When `remote_closed` is then detected, `_inbound_lock` is re-acquired a second time to capture any chunks that `Connection.feed()` (running on the main stdin-reader thread) may have appended **after** Phase 1 released the lock but **before** the break (Phase 2). `pending` and `remaining` are temporally disjoint — no chunk is ever sent twice.
+**Two-phase inbound drain on `remote_closed`**: Every loop iteration first drains `_inbound` under `_inbound_lock` into `pending` and sends it (Phase 1). When `remote_closed` is then detected, `_inbound_lock` is re-acquired a second time to capture any chunks that `TcpConnectionWorker.feed()` (running on the main stdin-reader thread) may have appended **after** Phase 1 released the lock but **before** the break (Phase 2). `pending` and `remaining` are temporally disjoint — no chunk is ever sent twice.
 
-**Connect timeout**: `socket.create_connection(host, port, timeout=28)` is called inside `Connection._run()` — the worker thread's **first action**, not in `__init__`. `__init__` only initialises fields, creates the `os.pipe()` notification pair, and instantiates (but does not start) the thread. `conn.start()` launches the thread, and the main stdin-reader thread returns to the dispatch loop immediately. If the connection attempt exceeds 28 seconds, `OSError` is caught inside `_run()`, an `ERROR:<conn_id>:<reason>` control frame is emitted, and the worker thread exits without ever entering `_io_loop`.
+**Connect timeout**: `socket.create_connection(host, port, timeout=28)` is called inside `TcpConnectionWorker._run()` — the worker thread's **first action**, not in `__init__`. `__init__` only initialises fields, creates the `os.pipe()` notification pair, and instantiates (but does not start) the thread. `conn.start()` launches the thread, and the main stdin-reader thread returns to the dispatch loop immediately. If the connection attempt exceeds 28 seconds, `OSError` is caught inside `_run()`, an `ERROR:<conn_id>:<reason>` control frame is emitted, and the worker thread exits without ever entering `_io_loop`.
 
-**Inbound saturation path** (`Connection.feed()`, called from main stdin-reader thread): if `len(_inbound) >= _MAX_TCP_INBOUND_CHUNKS` (1024 chunks), the connection is considered saturated:
+**Inbound saturation path** (`TcpConnectionWorker.feed()`, called from main stdin-reader thread): if `len(_inbound) >= _MAX_TCP_INBOUND_CHUNKS` (1024 chunks), the connection is considered saturated:
 1. `_saturated = True` and `_closed = True` are set atomically **inside** `_inbound_lock` to prevent any further `feed()` calls from appending data.
-2. `_inbound_lock` is **released** before calling `_emit_ctrl` — the ERROR control frame is enqueued outside the lock to avoid holding `_inbound_lock` across the `queue.SimpleQueue.put()` call in `_StdoutWriter`, which could unnecessarily extend the lock's critical section under GIL contention.
+2. `_inbound_lock` is **released** before calling `_emit_ctrl` — the ERROR control frame is enqueued outside the lock to avoid holding `_inbound_lock` across the `queue.SimpleQueue.put()` call in `_FrameWriter`, which could unnecessarily extend the lock's critical section under GIL contention.
 3. The IO loop will do `SHUT_WR` on its next iteration, then drain remaining receives and emit `CONN_CLOSED_ACK`.
 
-**Consequence on the local side**: the local `_dispatch_frame_async` will receive **both** `ERROR` and `CONN_CLOSED_ACK` for the same `conn_id`. The `ERROR` handler calls `handler.cancel_upstream()` and `handler.close_remote()` (delivers `None` sentinel). When `CONN_CLOSED_ACK` arrives later, `close_remote()` is called again — this is a no-op because `_ConnHandler._closed` is already set, so no duplicate sentinel is delivered.
+**Consequence on the local side**: the local `_dispatch_frame_async` will receive **both** `ERROR` and `CONN_CLOSED_ACK` for the same `conn_id`. The `ERROR` handler calls `handler.cancel_upstream()` and `handler.close_remote()` (delivers `None` sentinel). When `CONN_CLOSED_ACK` arrives later, `close_remote()` is called again — this is a no-op because `_TcpConnectionHandler._closed` is already set, so no duplicate sentinel is delivered.
 
 ### 8.2 UDP Flow Worker
 
@@ -621,11 +625,11 @@ flowchart TD
     B --> C[sock.connect resolved addr]
     C --> D[select sock + notify_r timeout=0.05s]
     D --> E{sock readable?}
-    E -- yes --> F[sock.recvfrom 65535]
+    E -- yes --> F[sock.recv 65535\nsocket is connected — no address needed]
     F --> G[_emit_data UDP_DATA:<flow_id>:<b64>\nblocks if _data queue full]
     E -- no --> H{notify_r readable?}
     G --> H
-    H -- yes --> I[drain notify_r\ndrain _inbound queue\nsock.sendto each chunk]
+    H -- yes --> I[drain notify_r\ndrain _inbound queue\nsock.send each chunk\nsocket is connected — destination implicit]
     I --> J{_closed?}
     H -- no --> J
     J -- yes --> K[break]
@@ -633,7 +637,9 @@ flowchart TD
     K --> L[sock.close\n_emit_ctrl UDP_CLOSED:<flow_id>]
 ```
 
-**DNS resolution in thread**: `UdpFlow._run()` calls `socket.getaddrinfo(host, port, type=SOCK_DGRAM)` synchronously before creating the socket. This call determines the correct address family (AF_INET vs AF_INET6) and resolves domain names. For numeric IP addresses it returns instantly from the OS name-service cache. For domain-name hosts it performs a blocking DNS lookup — potentially several seconds depending on the resolver. Under high concurrency with domain-name UDP targets, threads can accumulate blocked in `getaddrinfo`, leading to thread-pool exhaustion. In practice, the `_DnsForwarder` always targets a numeric IP (`dns_upstream` config value), so this slow path is rarely exercised in normal operation.
+**Connected socket semantics**: After `sock.connect(addr)`, the UDP socket is bound to a specific remote address at the kernel level. `recv()` (not `recvfrom`) is correct because the source address is fixed by `connect()`; `recvfrom()` would return a redundant `(data, address)` pair. `send()` (not `sendto()`) is correct because the destination is implicit — calling `sendto()` on a connected socket raises `OSError: [Errno 106] Transport endpoint is already connected` on Linux.
+
+**DNS resolution in thread**: `UdpFlowWorker._run()` calls `socket.getaddrinfo(host, port, type=SOCK_DGRAM)` synchronously before creating the socket. This call determines the correct address family (AF_INET vs AF_INET6) and resolves domain names. For numeric IP addresses it returns instantly from the OS name-service cache. For domain-name hosts it performs a blocking DNS lookup — potentially several seconds depending on the resolver. Under high concurrency with domain-name UDP targets, threads can accumulate blocked in `getaddrinfo`, leading to thread-pool exhaustion. In practice, the `_DnsForwarder` always targets a numeric IP (`dns_upstream` config value), so this slow path is rarely exercised in normal operation.
 
 ---
 
@@ -652,7 +658,7 @@ Both gates are acquired before sending `CONN_OPEN` and released after ACK wait c
 
 Special case — `challenges.cloudflare.com`:
 - Per-host limit capped at `connect_max_pending_cf`
-- Paced: minimum `connect_pace_cf_ms` ms between `CONN_OPEN` frames (with jitter up to `CONNECT_PACE_JITTER_CAP_SECS`)
+- Paced: minimum `CONNECT_PACE_CF_INTERVAL_SECS` seconds between `CONN_OPEN` frames (with jitter up to `CONNECT_PACE_JITTER_CAP_SECS`)
 
 ### ACK Timeout & Reconnect Trigger
 
@@ -688,7 +694,7 @@ stateDiagram-v2
     Connecting --> Bootstrapping: WebSocket connected
     Bootstrapping --> Serving: AGENT_READY received
     Serving --> Reconnecting: OSError / ConnectionClosed / TimeoutError
-    Bootstrapping --> Fatal: BootstrapError (AgentSyntaxError / AgentTimeoutError)
+    Bootstrapping --> Fatal: BootstrapError
     Reconnecting --> Connecting: delay = min(base * 2^attempt, max_delay)
     Reconnecting --> Fatal: attempt >= reconnect_max_retries
     Serving --> [*]: clean exit (rare)
@@ -696,10 +702,18 @@ stateDiagram-v2
 ```
 
 On reconnect:
-- All open `_ConnHandler` instances receive `close_remote()` (None sentinel) via `_recv_loop` finally block
+- All open `_TcpConnectionHandler` instances receive `close_remote()` (None sentinel) via `_recv_loop` finally block
 - All `_UdpFlowHandler` instances receive `close_remote()`
 - `_ws_closed` event is set — unblocks any pending ACK waits **that have already entered `asyncio.wait`**
-- Bootstrap attempt counter resets to 0 on successful bootstrap
+- The reconnect `attempt` counter in `run()` resets to `0` after each successful bootstrap (once `_serve()` starts). The retry budget is per-consecutive-failure-run, not lifetime — a long-running process with 5 widely-spaced reconnects never exhausts retries.
+- `_run_session()` resets the per-session ACK-failure window counters (`_ack_reconnect_requested = False`, `_ack_timeout_window_count = 0`) immediately after `_bootstrap()` completes, preventing stale counts from a prior session triggering a premature reconnect in the new one.
+
+`Bootstrapping → Fatal` is triggered by any `BootstrapError`. Three concrete causes:
+1. `AgentSyntaxError` — agent script syntax error (stdout prefix `SyntaxError:` / `Traceback (most recent`)
+2. `AgentReadyTimeoutError` — WebSocket stayed open but `AGENT_READY` not received within `ready_timeout`
+3. plain `BootstrapError` — WebSocket closed before `AGENT_READY` (`exec` failed, `python3` missing, permission denied, etc.)
+
+All three are caught by `except BootstrapError: raise` in `run()` and are **not** retried.
 
 **Semaphore-blocked connects**: `_handle_connect` coroutines that are still waiting to acquire `_connect_gate` or a per-host gate have not yet started the ACK wait and are not directly unblocked by `_ws_closed`. They remain queued on the semaphore until a prior holder releases it, at which point they acquire it and attempt to send `CONN_OPEN`. However, `_ws_send(frame, control=True)` first checks `_ws_closed.is_set()` before enqueuing the frame — if `_ws_closed` is already set, the `CONN_OPEN` frame is **silently suppressed** (never sent to the agent). The coroutine then enters `asyncio.wait({ack_task, ws_future}, ...)`. Because `_ws_closed` is already set, `ws_future` resolves in the same event loop iteration — the coroutine aborts with `"ws_closed"` without waiting for `conn_ack_timeout`. The observable delay between the reconnect event and the SOCKS5 error response for these connections is bounded only by the **semaphore wait time** (i.e. how long until a prior holder exits), not by `conn_ack_timeout`. They do exit correctly and clean up `_pending_connects`.
 
@@ -711,17 +725,17 @@ On reconnect:
 
 | Field | Type | Purpose |
 |---|---|---|
-| `_conn_handlers` | `dict[str, _ConnHandler]` | Active TCP connections keyed by conn_id |
-| `_pending_connects` | `dict[str, PendingConnect]` | Connections awaiting CONN_ACK |
+| `_conn_handlers` | `dict[str, _TcpConnectionHandler]` | Active TCP connections keyed by conn_id |
+| `_pending_connects` | `dict[str, PendingConnectState]` | Connections awaiting CONN_ACK |
 | `_udp_registry` | `dict[str, _UdpFlowHandler]` | Active UDP flows keyed by flow_id |
 
-### `_ConnHandler` queues and state
+### `_TcpConnectionHandler` queues and state
 
 | Field | Type | Cap | Purpose |
 |---|---|---|---|
-| `_inbound` | `asyncio.Queue[bytes\|None]` | `QUEUE_CAP` | Agent→client data + None sentinel |
+| `_inbound` | `asyncio.Queue[bytes\|None]` | `TCP_INBOUND_QUEUE_CAP` | Agent→client data + None sentinel |
 | `_pre_ack_buffer` | `list[bytes]` | `pre_ack_buffer_cap_bytes` | Data before CONN_ACK |
-| `_closed` | `asyncio.Event` | — | Set when handler is fully torn down; gates `feed()`, `async_feed()`, `close_remote()`, `_cleanup()`, and `abort()`. Primary liveness check in `_dispatch_frame_async`. |
+| `_closed` | `asyncio.Event` | — | Set when handler is fully torn down; gates `feed()`, `feed_async()`, `close_remote()`, and `_cleanup()`. Primary liveness check in `_dispatch_frame_async`. |
 | `_upstream_ended_cleanly` | `bool` | — | `True` when `_upstream` read EOF without error; prevents `_on_task_done` from cancelling the peer `_downstream` task (half-close invariant) |
 | `_downstream_ended_cleanly` | `bool` | — | `True` when `_downstream` received the `None` sentinel without error; prevents `_on_task_done` from cancelling the peer `_upstream` task (half-close invariant) |
 
@@ -729,15 +743,15 @@ On reconnect:
 
 | Field | Type | Cap | Purpose |
 |---|---|---|---|
-| `_inbound` | `asyncio.Queue[bytes\|None]` | `QUEUE_CAP` | Agent→client datagrams + None sentinel |
+| `_inbound` | `asyncio.Queue[bytes\|None]` | `TCP_INBOUND_QUEUE_CAP` | Agent→client datagrams + None sentinel |
 
 ### `UdpRelay` queue
 
 | Field | Type | Cap | Purpose |
 |---|---|---|---|
-| `_queue` | `asyncio.Queue[tuple[bytes,str,int]]` | `UDP_QUEUE_CAP` | Client→tunnel datagrams (payload, host, port) |
+| `_queue` | `asyncio.Queue[tuple[bytes,str,int]]` | `UDP_SEND_QUEUE_CAP` | Client→tunnel datagrams (payload, host, port) |
 
-### Agent `Connection` (pod side)
+### Agent `TcpConnectionWorker` (pod side)
 
 | Field | Type | Purpose |
 |---|---|---|
@@ -745,7 +759,7 @@ On reconnect:
 | `_notify_r/w` | `os.pipe()` | Wakes select loop when `feed()` adds data |
 | `_closed` | `bool` | Set when `CONN_CLOSE` received from local |
 
-### Agent `_StdoutWriter`
+### Agent `_FrameWriter`
 
 | Field | Type | Cap | Purpose |
 |---|---|---|---|
@@ -764,5 +778,5 @@ On reconnect:
 6. **Queue full → guaranteed sentinel delivery**: `close_remote()` evicts one item if queue is full before inserting `None`.
 7. **Single WebSocket writer**: All frames go through `_send_loop` — no concurrent `ws.send()` calls.
 8. **No ping lock contention**: Built-in websockets ping is disabled (`ping_interval=None`); keepalive is sent as a `KEEPALIVE` control frame through `_send_ctrl_queue` by `_keepalive_loop`, serialised safely through `_send_loop`.
-9. **End-to-end backpressure (downstream)**: `_recv_loop` → `async_feed` → `_inbound.put()` → WS reader stalls → agent `emit_data()` blocks → worker `select` stalls → remote TCP window shrinks.
-10. **Agent stdout serialised**: All agent stdout writes go through `_StdoutWriter` daemon thread — no concurrent `sys.stdout.write()` calls from worker threads.
+9. **End-to-end backpressure (downstream)**: `_recv_loop` → `feed_async` → `_inbound.put()` → WS reader stalls → agent `emit_data()` blocks → worker `select` stalls → remote TCP window shrinks.
+10. **Agent stdout serialised**: All agent stdout writes go through `_FrameWriter` daemon thread — no concurrent `sys.stdout.write()` calls from worker threads.

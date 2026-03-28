@@ -1,20 +1,37 @@
 [project]
 name = "exectunnel"
-version = "0.2.0"
+dynamic = ["version"]
 description = "SOCKS5 proxy tunnel over WebSocket into Kubernetes pods"
 requires-python = ">=3.13"
 authors = [{ name = "khodaparastan", email = "mohammad@khodaparastan.com" }]
-dependencies = ["websockets (>=16.0)", "colorama (>=0.4.6,<0.5.0)", "structlog (>=25.5.0,<26.0.0)", "pyrefly (>=0.57.1,<0.58.0)"]
+dependencies = [
+    "websockets (>=16.0)",
+    "structlog (>=25.5.0,<26.0.0)",
+    "colorama (>=0.4.6,<1.0.0)",
+]
 
 [project.scripts]
 exectunnel = "exectunnel.cli:main"
 
-[project.optional-dependencies]
-observability = ["colorama (>=0.4.6,<1.0.0)", "structlog (>=25.0.0)"]
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+version = "1.1.0a0"
+
+[tool.poetry.requires-plugins]
+poetry-dynamic-versioning = ">=1.0.0"
+
+[tool.poetry-dynamic-versioning]
+enable = true
+vcs = "none"
+format = "{base}"
+pattern = "default-unprefixed"
+
+[tool.poetry-dynamic-versioning.substitution]
+files = ["exectunnel/_version.py"]
 
 [tool.mypy]
 python_version = "3.13"
@@ -30,6 +47,8 @@ mypy = "^1.19.1"
 ruff = "^0.15.6"
 pytest = "^9.0.2"
 pytest-asyncio = ">=0.24"
+pyrefly = "^0.58.0"
+
 
 [tool.poetry.scripts]
 exectunnel = "exectunnel.cli:main"

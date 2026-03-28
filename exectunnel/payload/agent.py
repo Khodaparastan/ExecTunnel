@@ -36,7 +36,7 @@ Design notes
 * ``sock.setblocking(True)`` is **never** used while we own the select loop.
   All sends use a per-chunk write loop with non-blocking sockets so a slow
   remote cannot stall the entire thread.
-* Stdout is written by a single dedicated ``_StdoutWriter`` daemon thread.
+* Stdout is written by a single dedicated ``_FrameWriter`` daemon thread.
   Control frames (CONN_ACK, ERROR, …) go into an unbounded
   ``queue.SimpleQueue`` that is always drained first; DATA/UDP_DATA frames
   go into a bounded ``queue.Queue`` (cap ``_STDOUT_DATA_QUEUE_CAP``).
@@ -77,7 +77,7 @@ _MAX_UDP_INBOUND_DGRAMS = 2048
 _STDOUT_DATA_QUEUE_CAP = 2048
 
 
-class _StdoutWriter:
+class _FrameWriter:
     """
     Single daemon thread that serialises all stdout writes.
 
@@ -169,7 +169,7 @@ class _StdoutWriter:
 
 
 # Module-level writer instance — initialised in main() before any threads start.
-_writer: _StdoutWriter | None = None
+_writer: _FrameWriter | None = None
 
 
 def _log(level: str, msg: str, *args: object) -> None:
@@ -183,7 +183,7 @@ def _log(level: str, msg: str, *args: object) -> None:
     sys.stderr.flush()
 
 
-def _emit_ctrl(line: str) -> None:
+def _write_ctrl_frame(line: str) -> None:
     """Emit a control frame — always delivered before any pending data frame."""
     if _writer is not None:
         _writer.emit_ctrl(line)
@@ -192,7 +192,7 @@ def _emit_ctrl(line: str) -> None:
         sys.stdout.flush()
 
 
-def _emit_data(line: str) -> None:
+def _write_data_frame(line: str) -> None:
     """Emit a data frame — blocks the calling thread when the stdout queue is full,
     propagating backpressure through the kernel TCP receive buffer to the sender."""
     if _writer is not None:
@@ -212,7 +212,7 @@ def _disable_echo() -> None:
         _log("debug", "stdin is not a tty; skipping echo disable")
 
 
-def _nonblocking_sendall(sock: socket.socket, data: bytes) -> bool:
+def _send_all_nonblocking(sock: socket.socket, data: bytes) -> bool:
     """
     Send all of *data* through a non-blocking *sock*.
 
@@ -242,7 +242,7 @@ def _nonblocking_sendall(sock: socket.socket, data: bytes) -> bool:
 # ── TCP connection worker ─────────────────────────────────────────────────────
 
 
-class Connection:
+class TcpConnectionWorker:
     """
     Manages one TCP connection to (host, port) on behalf of a conn_id.
 
@@ -292,12 +292,12 @@ class Connection:
             else:
                 self._inbound.append(data)
         # Emit the ERROR control frame *outside* the lock so that
-        # _inbound_lock is not held while calling into _StdoutWriter —
+        # _inbound_lock is not held while calling into _FrameWriter —
         # this avoids holding the lock across a potential GIL-release
         # in queue.SimpleQueue.put() and keeps the critical section tight.
         if saturated:
             reason = base64.b64encode(b"agent tcp inbound saturated").decode()
-            _emit_ctrl(f"{_FRAME_PREFIX}ERROR:{self.conn_id}:{reason}{_FRAME_SUFFIX}")
+            _write_ctrl_frame(f"{_FRAME_PREFIX}ERROR:{self.conn_id}:{reason}{_FRAME_SUFFIX}")
             _log(
                 "warning",
                 "conn %s inbound saturated; closing connection",
@@ -307,7 +307,7 @@ class Connection:
         with contextlib.suppress(OSError):
             os.write(self._notify_w, b"\x00")
 
-    def close_inbound(self) -> None:
+    def signal_inbound_eof(self) -> None:
         """Signal the IO loop to stop after draining queued writes."""
         self._closed = True
         with contextlib.suppress(OSError):
@@ -320,7 +320,7 @@ class Connection:
             sock.setblocking(False)
         except OSError as exc:
             reason = base64.b64encode(str(exc).encode()).decode()
-            _emit_ctrl(f"{_FRAME_PREFIX}ERROR:{cid}:{reason}{_FRAME_SUFFIX}")
+            _write_ctrl_frame(f"{_FRAME_PREFIX}ERROR:{cid}:{reason}{_FRAME_SUFFIX}")
             _log("warning", "conn %s open failed: %s", cid, exc)
             os.close(self._notify_r)
             os.close(self._notify_w)
@@ -329,7 +329,7 @@ class Connection:
             return
 
         self._sock = sock
-        _emit_ctrl(f"{_FRAME_PREFIX}CONN_ACK:{cid}{_FRAME_SUFFIX}")
+        _write_ctrl_frame(f"{_FRAME_PREFIX}CONN_ACK:{cid}{_FRAME_SUFFIX}")
 
         try:
             self._io_loop(sock, cid)
@@ -337,7 +337,7 @@ class Connection:
             sock.close()
             os.close(self._notify_r)
             os.close(self._notify_w)
-            _emit_ctrl(f"{_FRAME_PREFIX}CONN_CLOSED_ACK:{cid}{_FRAME_SUFFIX}")
+            _write_ctrl_frame(f"{_FRAME_PREFIX}CONN_CLOSED_ACK:{cid}{_FRAME_SUFFIX}")
             if self._on_close is not None:
                 self._on_close()
 
@@ -361,7 +361,7 @@ class Connection:
                     # then exit.
                     remote_closed = True
                 else:
-                    _emit_data(
+                    _write_data_frame(
                         f"{_FRAME_PREFIX}DATA:{cid}:{base64.b64encode(chunk).decode()}{_FRAME_SUFFIX}"
                     )
 
@@ -379,7 +379,7 @@ class Connection:
                     self._inbound.clear()
 
                 for chunk in pending:
-                    if not _nonblocking_sendall(sock, chunk):
+                    if not _send_all_nonblocking(sock, chunk):
                         return
             else:
                 pending = []
@@ -392,7 +392,7 @@ class Connection:
                         remaining = self._inbound[:]
                         self._inbound.clear()
                     for chunk in remaining:
-                        _nonblocking_sendall(sock, chunk)
+                        _send_all_nonblocking(sock, chunk)
                 break
 
             # ── Half-close: local side done sending ───────────────────────────
@@ -423,7 +423,7 @@ class Connection:
                             break
                         if not chunk:
                             break
-                        _emit_data(
+                        _write_data_frame(
                             f"{_FRAME_PREFIX}DATA:{cid}:{base64.b64encode(chunk).decode()}{_FRAME_SUFFIX}"
                         )
                 break
@@ -432,7 +432,7 @@ class Connection:
 # ── UDP flow worker ───────────────────────────────────────────────────────────
 
 
-class UdpFlow:
+class UdpFlowWorker:
     """
     UDP flow: datagrams are sent to (host, port) and responses forwarded back.
 
@@ -500,7 +500,7 @@ class UdpFlow:
             # connect() restricts recv to packets from this address.
             sock.connect(addr)
         except OSError as exc:
-            _emit_ctrl(f"{_FRAME_PREFIX}UDP_CLOSED:{fid}{_FRAME_SUFFIX}")
+            _write_ctrl_frame(f"{_FRAME_PREFIX}UDP_CLOSED:{fid}{_FRAME_SUFFIX}")
             _log("warning", "udp flow %s open failed: %s", fid, exc)
             os.close(self._notify_r)
             os.close(self._notify_w)
@@ -515,7 +515,7 @@ class UdpFlow:
             sock.close()
             os.close(self._notify_r)
             os.close(self._notify_w)
-            _emit_ctrl(f"{_FRAME_PREFIX}UDP_CLOSED:{fid}{_FRAME_SUFFIX}")
+            _write_ctrl_frame(f"{_FRAME_PREFIX}UDP_CLOSED:{fid}{_FRAME_SUFFIX}")
             if self._on_close is not None:
                 self._on_close()
 
@@ -531,7 +531,7 @@ class UdpFlow:
                         break
                     chunk = b""
                 if chunk:
-                    _emit_data(
+                    _write_data_frame(
                         f"{_FRAME_PREFIX}UDP_DATA:{fid}:{base64.b64encode(chunk).decode()}"
                         f"{_FRAME_SUFFIX}"
                     )
@@ -558,8 +558,8 @@ class UdpFlow:
 
 
 def _dispatch_loop(fixed_host: str | None, fixed_port: int | None) -> None:
-    conn_map: dict[str, Connection | None] = {}
-    udp_map: dict[str, UdpFlow | None] = {}
+    conn_map: dict[str, TcpConnectionWorker | None] = {}
+    udp_map: dict[str, UdpFlowWorker | None] = {}
     conn_lock = threading.Lock()
     udp_lock = threading.Lock()
 
@@ -614,7 +614,7 @@ def _dispatch_loop(fixed_host: str | None, fixed_port: int | None) -> None:
                 with conn_lock:
                     conn_map.pop(conn_id, None)
 
-            conn = Connection(cid, host, port, on_close=on_conn_close)
+            conn = TcpConnectionWorker(cid, host, port, on_close=on_conn_close)
             with conn_lock:
                 conn_map[cid] = conn
             conn.start()
@@ -640,7 +640,7 @@ def _dispatch_loop(fixed_host: str | None, fixed_port: int | None) -> None:
             with conn_lock:
                 closed_conn = conn_map.pop(cid, None)
             if closed_conn:
-                closed_conn.close_inbound()
+                closed_conn.signal_inbound_eof()
 
         # ── UDP ───────────────────────────────────────────────────────────────
 
@@ -669,7 +669,7 @@ def _dispatch_loop(fixed_host: str | None, fixed_port: int | None) -> None:
                 with udp_lock:
                     udp_map.pop(flow_id, None)
 
-            flow = UdpFlow(fid, host, port, on_close=on_udp_close)
+            flow = UdpFlowWorker(fid, host, port, on_close=on_udp_close)
             with udp_lock:
                 udp_map[fid] = flow
             flow.start()
@@ -717,8 +717,8 @@ def main() -> None:
 
     global _writer
     _disable_echo()
-    _writer = _StdoutWriter()
-    _emit_ctrl(f"{_FRAME_PREFIX}AGENT_READY{_FRAME_SUFFIX}")
+    _writer = _FrameWriter()
+    _write_ctrl_frame(f"{_FRAME_PREFIX}AGENT_READY{_FRAME_SUFFIX}")
     try:
         _dispatch_loop(fixed_host, fixed_port)
     finally:

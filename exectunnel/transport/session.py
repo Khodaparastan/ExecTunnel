@@ -1,35 +1,7 @@
-"""
-``TunnelSession`` bootstraps ``agent.py` into the pod
-and runs a local SOCKS5 proxy that routes all connections through the
-WebSocket tunnel.
-Architecture
-------------
-::
+"""TunnelSession — core session orchestration, bootstrap, and SOCKS5 routing.
 
-    ┌─────────────────────────────────────────────────────────┐
-    │  local machine                                           │
-    │                                                          │
-    │  SOCKS5 client → Socks5Server → TunnelSession           │
-    │                                      │                   │
-    │                               _send_loop (queue)        │
-    │                                      │   WebSocket       │
-    │                               _recv_loop ──────────────►│
-    └─────────────────────────────────────────────────────────┘
-                                           │
-                                    (pod exec channel)
-                                           │
-    ┌─────────────────────────────────────────────────────────┐
-    │  pod                                                     │
-    │  agent.py — stdin/stdout = WebSocket stdio channel       │
-    └─────────────────────────────────────────────────────────┘
-
-Exclusions (bypass tunnel, connect directly):
-  10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16  (RFC1918)
-  127.0.0.0/8                                  (loopback)
-
-DNS:
-  If ``--dns`` is given, a local UDP forwarder listens on 127.0.0.1:<dns-port>
-  and sends queries through the tunnel to the specified upstream:53.
+Bootstraps ``agent.py`` into the pod and runs a local SOCKS5 proxy that routes
+all connections through the WebSocket tunnel.
 """
 
 from __future__ import annotations
@@ -40,264 +12,61 @@ import contextlib
 import logging
 import random
 from collections import defaultdict
-from collections.abc import Callable, Coroutine
-from typing import Any
 
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed
 
-from exectunnel.core.config import AppConfig, TunnelConfig
-from exectunnel.core.consts import (
-    BOOTSTRAP_CHUNK_SIZE,
+from exectunnel.config.defaults import (
     BOOTSTRAP_DECODE_DELAY_SECS,
     BOOTSTRAP_DIAG_MAX_LINES,
     BOOTSTRAP_RM_DELAY_SECS,
     BOOTSTRAP_STTY_DELAY_SECS,
     CONNECT_FAILURE_WARN_EVERY,
     CONNECT_PACE_JITTER_CAP_SECS,
-    DNS_MAX_INFLIGHT,
-    DNS_QUERY_TIMEOUT_SECS,
-    DNS_UPSTREAM_PORT,
-    FRAME_PREFIX,
-    FRAME_SUFFIX,
-    PIPE_CHUNK_SIZE,
-    QUEUE_CAP,
-    READY_FRAME,
     SEND_DROP_LOG_EVERY,
     UDP_DIRECT_RECV_TIMEOUT_SECS,
     UDP_PUMP_POLL_TIMEOUT_SECS,
-    UDP_WARN_EVERY,
     WS_CLOSE_CODE_UNHEALTHY,
-    Reply,
 )
-from exectunnel.exceptions import AgentSyntaxError, AgentTimeoutError, BootstrapError
+from exectunnel.config.settings import AppConfig, TunnelConfig
+from exectunnel.exceptions import (
+    AgentReadyTimeoutError,
+    AgentSyntaxError,
+    BootstrapError,
+)
 from exectunnel.helpers import (
-    encode_conn_open_frame,
-    encode_udp_close_frame,
-    encode_udp_data_frame,
-    encode_udp_open_frame,
     is_host_excluded,
     load_agent_b64,
     make_udp_socket,
-    new_conn_id,
-    new_flow_id,
-    parse_frame,
 )
 from exectunnel.observability import metrics_inc, metrics_observe, span
+from exectunnel.protocol.enums import Reply
+from exectunnel.protocol.frames import (
+    BOOTSTRAP_CHUNK_SIZE_CHARS as BOOTSTRAP_CHUNK_SIZE,
+)
+from exectunnel.protocol.frames import (
+    FRAME_PREFIX,
+    FRAME_SUFFIX,
+    READY_FRAME,
+    encode_conn_open_frame,
+    parse_frame,
+)
+from exectunnel.protocol.frames import (
+    PIPE_READ_CHUNK_BYTES as PIPE_CHUNK_SIZE,
+)
+from exectunnel.protocol.ids import new_conn_id, new_flow_id
+from exectunnel.proxy.relay import UdpRelay
+from exectunnel.proxy.request import Socks5Request
+from exectunnel.proxy.server import Socks5Server
+from exectunnel.transport.connection import _TcpConnectionHandler
+from exectunnel.transport.dns_forwarder import _DnsForwarder
+from exectunnel.transport.models import PendingConnectState
+from exectunnel.transport.udp_flow import _UdpFlowHandler
 
-from .connection import _ConnHandler
-from .core.models import PendingConnect
-from .socks5 import Socks5Request, Socks5Server, UdpRelay
+# Legacy alias for bootstrap
+AgentTimeoutError = AgentReadyTimeoutError
 
-logger = logging.getLogger("exectunnel.tunnel")
-
-
-
-# ── UDP flow handler (local side) ─────────────────────────────────────────────
-
-
-class _UdpFlowHandler:
-    """Bridges one SOCKS5 UDP ASSOCIATE flow through the tunnel."""
-
-    def __init__(
-        self,
-        flow_id: str,
-        host: str,
-        port: int,
-        ws_send: Callable[..., Coroutine[Any, Any, None]],
-        registry: dict[str, _UdpFlowHandler],
-    ) -> None:
-        self._id = flow_id
-        self._host = host
-        self._port = port
-        self._ws_send = ws_send
-        self._registry = registry
-        self._inbound: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=QUEUE_CAP)
-        self._drop_count = 0
-
-    async def open(self) -> None:
-        await self._ws_send(
-            encode_udp_open_frame(self._id, self._host, self._port), control=True
-        )
-
-    def feed(self, data: bytes) -> None:
-        try:
-            self._inbound.put_nowait(data)
-        except asyncio.QueueFull:
-            self._drop_count += 1
-            metrics_inc("udp.flow.inbound_queue.drop")
-            if self._drop_count == 1 or self._drop_count % UDP_WARN_EVERY == 0:
-                logger.warning(
-                    "udp flow %s inbound queue full, dropping datagram (drops=%d)",
-                    self._id,
-                    self._drop_count,
-                )
-
-    def close_remote(self) -> None:
-        """Deliver a ``None`` sentinel even if the queue is full."""
-        if self._inbound.full():
-            with contextlib.suppress(asyncio.QueueEmpty):
-                self._inbound.get_nowait()
-        with contextlib.suppress(asyncio.QueueFull):
-            self._inbound.put_nowait(None)
-
-    async def send_datagram(self, data: bytes) -> None:
-        """Encode *data* as a UDP_DATA frame and enqueue it for sending.
-
-        The frame is placed on the *data* send queue (``_send_data_queue``), not
-        the control queue.  When the data queue is full, ``_ws_send`` drops the
-        frame silently — this is intentional UDP semantics (datagrams may be
-        lost).
-
-        **Implication for DNS forwarding**: if sustained TCP throughput has
-        already saturated the data queue, a DNS query enqueued here will be
-        silently dropped.  The DNS forwarder's ``asyncio.wait_for`` will then
-        time out and the query will fail.  Operators who see elevated
-        ``dns.query.timeout`` metric counts under heavy load should increase
-        ``WSS_SEND_QUEUE_CAP`` (default 512) to reduce this probability.
-        """
-        b64 = base64.b64encode(data).decode()
-        await self._ws_send(encode_udp_data_frame(self._id, b64))
-
-    async def recv_datagram(self) -> bytes | None:
-        return await self._inbound.get()
-
-    async def close(self) -> None:
-        self._registry.pop(self._id, None)
-        await self._ws_send(encode_udp_close_frame(self._id), control=True)
-
-
-# ── DNS forwarder ─────────────────────────────────────────────────────────────
-
-
-class _DnsForwarder:
-    """
-    Minimal DNS UDP forwarder.
-
-    Listens locally; forwards each query as a UDP flow through the tunnel to
-    ``dns_upstream:53`` and returns the response to the client.
-    """
-
-    def __init__(
-        self,
-        local_port: int,
-        upstream: str,
-        tunnel: TunnelSession,
-        max_inflight: int = DNS_MAX_INFLIGHT,
-    ) -> None:
-        self._local_port = local_port
-        self._upstream = upstream
-        self._tunnel = tunnel
-        self._max_inflight = max(1, max_inflight)
-        self._transport: asyncio.DatagramTransport | None = None
-        self._tasks: set[asyncio.Task[None]] = set()
-        self._drop_count = 0
-
-    async def start(self) -> None:
-        loop = asyncio.get_running_loop()
-        metrics_inc("dns.forwarder.started")
-
-        class _Proto(asyncio.DatagramProtocol):
-            def __init__(self, fwd: _DnsForwarder) -> None:
-                self._fwd = fwd
-
-            def connection_made(self, transport: asyncio.BaseTransport) -> None:
-                assert isinstance(transport, asyncio.DatagramTransport)
-                self._fwd._transport = transport
-
-            def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
-                metrics_inc("dns.query.received")
-                if len(self._fwd._tasks) >= self._fwd._max_inflight:
-                    self._fwd._drop_count += 1
-                    metrics_inc("dns.query.drop.saturated")
-                    if self._fwd._drop_count == 1 or self._fwd._drop_count % UDP_WARN_EVERY == 0:
-                        logger.warning(
-                            "dns forwarder saturated (%d inflight), dropping query from %s:%d "
-                            "(drops=%d)",
-                            self._fwd._max_inflight,
-                            addr[0],
-                            addr[1],
-                            self._fwd._drop_count,
-                        )
-                    return
-                task = asyncio.create_task(
-                    self._fwd._forward(data, addr),
-                    name=f"dns-fwd-{addr[0]}:{addr[1]}",
-                )
-                self._fwd._tasks.add(task)
-                task.add_done_callback(self._fwd._tasks.discard)
-
-            def error_received(self, exc: Exception) -> None:
-                logger.debug("dns forwarder error: %s", exc)
-
-        self._transport, _ = await loop.create_datagram_endpoint(
-            lambda: _Proto(self),
-            local_addr=("127.0.0.1", self._local_port),
-        )
-        logger.info(
-            "DNS forwarder listening on 127.0.0.1:%d → %s:53",
-            self._local_port,
-            self._upstream,
-        )
-
-    async def _forward(self, query: bytes, client_addr: tuple[str, int]) -> None:
-        start = asyncio.get_running_loop().time()
-        metrics_observe("dns.query.bytes.in", float(len(query)))
-        flow_id = new_flow_id()
-        handler = _UdpFlowHandler(
-            flow_id,
-            self._upstream,
-            DNS_UPSTREAM_PORT,
-            self._tunnel._ws_send,
-            self._tunnel._udp_registry,
-        )
-        self._tunnel._udp_registry[flow_id] = handler
-        await handler.open()
-        await handler.send_datagram(query)
-
-        # Track whether the agent closed the flow first (response == None means
-        # UDP_CLOSED was received).  In that case we must NOT send UDP_CLOSE back
-        # — the agent already tore down the flow and the frame would be spurious.
-        agent_closed = False
-        try:
-            response = await asyncio.wait_for(handler.recv_datagram(), timeout=DNS_QUERY_TIMEOUT_SECS)
-            if response is None:
-                agent_closed = True
-        except TimeoutError:
-            metrics_inc("dns.query.timeout")
-            logger.debug("dns query timed out for %s:%d", *client_addr)
-            return
-        except Exception as exc:
-            metrics_inc("dns.query.error", error=exc.__class__.__name__)
-            logger.warning(
-                "dns query failed for %s:%d: %s", client_addr[0], client_addr[1], exc
-            )
-            logger.debug(
-                "dns query traceback for %s:%d",
-                client_addr[0],
-                client_addr[1],
-                exc_info=True,
-            )
-            return
-        finally:
-            if not agent_closed:
-                await handler.close()
-            metrics_observe(
-                "dns.query.duration_sec", asyncio.get_running_loop().time() - start
-            )
-
-        if response is not None and self._transport is not None:
-            metrics_inc("dns.query.ok")
-            metrics_observe("dns.query.bytes.out", float(len(response)))
-            self._transport.sendto(response, client_addr)
-
-    def stop(self) -> None:
-        metrics_inc("dns.forwarder.stopped")
-        if self._transport:
-            self._transport.close()
-        for task in list(self._tasks):
-            task.cancel()
-
+logger = logging.getLogger("exectunnel.transport.session")
 
 # ── Tunnel session ────────────────────────────────────────────────────────────
 
@@ -321,8 +90,8 @@ class TunnelSession:
         self._app = app_cfg
         self._tun = tun_cfg
         self._ws: ClientConnection | None = None
-        self._conn_handlers: dict[str, _ConnHandler] = {}
-        self._pending_connects: dict[str, PendingConnect] = {}
+        self._conn_handlers: dict[str, _TcpConnectionHandler] = {}
+        self._pending_connects: dict[str, PendingConnectState] = {}
         self._udp_registry: dict[str, _UdpFlowHandler] = {}
         # Set when the WebSocket closes (signals waiters to abort).
         self._ws_closed: asyncio.Event = asyncio.Event()
@@ -377,6 +146,7 @@ class TunnelSession:
         with span("tunnel.session"):
             while True:
                 reconnect_reason: str | None = None
+                bootstrapped = False
                 try:
                     metrics_inc("tunnel.connect.attempt")
                     async with connect(
@@ -393,6 +163,7 @@ class TunnelSession:
                         ping_interval=None,
                         max_size=None,
                     ) as ws:
+                        bootstrapped = True
                         await self._run_session(ws)
                         reconnect_reason = "session ended"
                 except BootstrapError:
@@ -406,6 +177,14 @@ class TunnelSession:
 
                 if reconnect_reason is None:
                     return
+
+                # Reset the backoff counter after each healthy session so the
+                # retry budget is per-consecutive-failure-run, not lifetime.
+                # Without this reset a process that reconnects 5 times over its
+                # entire lifetime (regardless of healthy uptime between events)
+                # would exhaust retries and crash on the 6th disconnect.
+                if bootstrapped:
+                    attempt = 0
 
                 if attempt >= retries:
                     metrics_inc("tunnel.reconnect.exhausted")
@@ -578,7 +357,8 @@ class TunnelSession:
             dns_fwd = _DnsForwarder(
                 self._tun.dns_local_port,
                 self._tun.dns_upstream,
-                self,
+                self._ws_send,
+                self._udp_registry,
                 max_inflight=self._app.bridge.send_queue_cap,
             )
             await dns_fwd.start()
@@ -639,9 +419,9 @@ class TunnelSession:
                 name=f"req-{req.cmd.name}-{req.host}:{req.port}",
             )
             self._request_tasks.add(task)
-            task.add_done_callback(self._on_request_done)
+            task.add_done_callback(self._on_request_complete)
 
-    def _on_request_done(self, task: asyncio.Task[None]) -> None:
+    def _on_request_complete(self, task: asyncio.Task[None]) -> None:
         self._request_tasks.discard(task)
         if task.cancelled():
             return
@@ -669,7 +449,7 @@ class TunnelSession:
         else:
             await req.send_reply_error(Reply.CMD_NOT_SUPPORTED)
 
-    def _record_conn_ack_failure(self, conn_id: str, reason: str) -> None:
+    def _track_ack_failure(self, conn_id: str, reason: str) -> None:
         self._ack_timeout_count += 1
         metrics_inc("tunnel.conn_ack.failed", reason=reason)
         if reason == "timeout":
@@ -719,7 +499,9 @@ class TunnelSession:
         )
         ws = self._ws
         if ws is not None:
-            asyncio.create_task(ws.close(code=WS_CLOSE_CODE_UNHEALTHY, reason="conn ack timeout surge"))
+            task = asyncio.create_task(ws.close(code=WS_CLOSE_CODE_UNHEALTHY, reason="conn ack timeout surge"))
+            self._request_tasks.add(task)
+            task.add_done_callback(self._request_tasks.discard)
 
     @staticmethod
     def _connect_host_key(host: str) -> str:
@@ -730,7 +512,7 @@ class TunnelSession:
             return min(self._connect_max_pending_per_host, self._connect_max_pending_cf)
         return self._connect_max_pending_per_host
 
-    def _connect_host_pace_interval(self, host_key: str) -> float:
+    def _connect_pace_interval_for_host(self, host_key: str) -> float:
         if host_key == "challenges.cloudflare.com":
             return self._connect_pace_cf_ms / 1000.0
         return 0.0
@@ -743,8 +525,8 @@ class TunnelSession:
             self._host_connect_gates[key] = gate
         return gate
 
-    async def _pace_connect_open(self, host_key: str) -> None:
-        interval = self._connect_host_pace_interval(host_key)
+    async def _apply_connect_pacing(self, host_key: str) -> None:
+        interval = self._connect_pace_interval_for_host(host_key)
         if interval <= 0:
             return
         lock = self._host_connect_open_locks.get(host_key)
@@ -765,7 +547,7 @@ class TunnelSession:
                 asyncio.get_running_loop().time()
             )
 
-    def _observe_pending_connects(self) -> None:
+    def _report_pending_connects_metric(self) -> None:
         metrics_observe("pending_connects", float(len(self._pending_connects)))
 
     def _record_connect_failure(self, host: str, reason: str, reply: Reply) -> None:
@@ -811,7 +593,7 @@ class TunnelSession:
         conn_id = new_conn_id()
         loop = asyncio.get_running_loop()
         ack_future: asyncio.Future[str] = loop.create_future()
-        handler = _ConnHandler(
+        handler = _TcpConnectionHandler(
             conn_id,
             req.reader,
             req.writer,
@@ -819,15 +601,13 @@ class TunnelSession:
             self._conn_handlers,
             pre_ack_buffer_cap_bytes=self._pre_ack_buffer_cap_bytes,
         )
-        pending = PendingConnect(
+        pending = PendingConnectState(
             host=host,
-            request=req,
-            handler=handler,
             ack_future=ack_future,
         )
         self._conn_handlers[conn_id] = handler
         self._pending_connects[conn_id] = pending
-        self._observe_pending_connects()
+        self._report_pending_connects_metric()
 
         ack_wait_start = loop.time()
         ack_status = "ok"
@@ -836,7 +616,7 @@ class TunnelSession:
         try:
             async with self._connect_gate, host_gate:
                 host_key = self._connect_host_key(host)
-                await self._pace_connect_open(host_key)
+                await self._apply_connect_pacing(host_key)
                 await self._ws_send(
                     encode_conn_open_frame(conn_id, host, port), control=True
                 )
@@ -874,9 +654,10 @@ class TunnelSession:
             # Semaphores released here — before starting data flow.
 
             if failure_reason is not None:
-                self._record_conn_ack_failure(conn_id, failure_reason)
+                self._track_ack_failure(conn_id, failure_reason)
                 self._record_connect_failure(host, failure_reason, reply)
-                await handler.abort(close_writer=False)
+                handler.close_remote()
+                self._conn_handlers.pop(conn_id, None)
                 await req.send_reply_error(reply)
                 return
 
@@ -886,20 +667,21 @@ class TunnelSession:
             handler.start()
         except Exception as exc:
             ack_status = "error"
-            self._record_conn_ack_failure(conn_id, "error")
+            self._track_ack_failure(conn_id, "error")
             self._record_connect_failure(host, "error", reply)
             logger.warning(
                 "conn %s: ACK wait error: %s", conn_id, exc,
                 extra={"conn_id": conn_id, "host": host, "port": port},
             )
             logger.debug("conn %s ACK wait traceback", conn_id, exc_info=True, extra={"conn_id": conn_id})
-            await handler.abort(close_writer=False)
+            handler.close_remote()
+            self._conn_handlers.pop(conn_id, None)
             await req.send_reply_error(reply)
         finally:
             if not ack_future.done():
                 ack_future.cancel()
             self._pending_connects.pop(conn_id, None)
-            self._observe_pending_connects()
+            self._report_pending_connects_metric()
             metrics_observe(
                 "tunnel.conn_ack.wait_sec",
                 loop.time() - ack_wait_start,
@@ -1075,7 +857,7 @@ class TunnelSession:
 
         # Replay frames buffered during bootstrap through the same async
         # dispatcher used for live frames so post-ACK DATA frames get proper
-        # backpressure via async_feed.
+        # backpressure via feed_async.
         for line in self._pre_ready_buf:
             await self._dispatch_frame_async(line)
         self._pre_ready_buf.clear()
@@ -1101,7 +883,7 @@ class TunnelSession:
         """Parse and dispatch one frame line — the sole dispatcher for all incoming frames.
 
         Used by ``_recv_loop`` for both the pre-ready-buffer replay and the
-        live WebSocket iterator.  DATA frames use ``async_feed`` to block the
+        live WebSocket iterator.  DATA frames use ``feed_async`` to block the
         WS reader when the inbound queue is full, propagating backpressure all
         the way to the agent's TCP receive buffer instead of dropping or
         aborting the connection.
@@ -1138,7 +920,7 @@ class TunnelSession:
                 # Skip silently if the handler is already being torn down — feed()
                 # would return False for _closed too, which would incorrectly
                 # trigger the overflow path and fire spurious failure metrics.
-                if handler._closed.is_set():  # noqa: SLF001
+                if handler._closed.is_set():
                     return
                 accepted = handler.feed(data)
                 if not accepted:
@@ -1147,7 +929,7 @@ class TunnelSession:
                     metrics_inc("tunnel.pre_ack_buffer.overflow")
             else:
                 # Post-ACK: block until queue has space — true backpressure.
-                await handler.async_feed(data)
+                await handler.feed_async(data)
             return
 
         if msg_type in ("CONN_CLOSED_ACK", "ERROR"):
