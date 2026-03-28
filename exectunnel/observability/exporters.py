@@ -15,18 +15,6 @@ from urllib import request as urllib_request
 from exectunnel.observability.tracing import current_span_id, current_trace_id
 
 
-def parse_bool_env(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    token = raw.strip().lower()
-    if token in {"1", "true", "yes", "on"}:
-        return True
-    if token in {"0", "false", "no", "off"}:
-        return False
-    return default
-
-
 def parse_headers(raw: str) -> dict[str, str]:
     headers: dict[str, str] = {}
     for part in raw.split(";"):

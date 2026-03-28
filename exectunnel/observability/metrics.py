@@ -19,7 +19,7 @@ def _render_metric_key(name: str, tags: tuple[tuple[str, str], ...]) -> str:
 
 
 @dataclass
-class _Hist:
+class _Histogram:
     count: int = 0
     total: float = 0.0
     min: float | None = None
@@ -40,7 +40,7 @@ class MetricsRegistry:
         self._counters: defaultdict[tuple[str, tuple[tuple[str, str], ...]], int] = (
             defaultdict(int)
         )
-        self._hists: dict[tuple[str, tuple[tuple[str, str], ...]], _Hist] = {}
+        self._hists: dict[tuple[str, tuple[tuple[str, str], ...]], _Histogram] = {}
 
     def inc(
         self, name: str, value: int = 1, tags: dict[str, object] | None = None
@@ -56,7 +56,7 @@ class MetricsRegistry:
         with self._lock:
             hist = self._hists.get(key)
             if hist is None:
-                hist = _Hist()
+                hist = _Histogram()
                 self._hists[key] = hist
             hist.observe(value)
 

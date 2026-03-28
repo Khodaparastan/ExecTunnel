@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover - optional dependency
     structlog = None  # type: ignore[assignment]
 
 
-class _ContextFilter(logging.Filter):
+class _TraceContextFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         record.trace_id = current_trace_id() or "-"
         record.span_id = current_span_id() or "-"
@@ -51,7 +51,7 @@ _LOG_RECORD_BUILTIN_ATTRS: frozenset[str] = frozenset(
 )
 
 
-class _JsonFormatter(logging.Formatter):
+class _JsonLogFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, object] = {
             "ts": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -187,14 +187,14 @@ def configure_logging(level: LevelName = "info") -> None:
 
     handler = logging.StreamHandler(sys.stderr)
     handler.setLevel(numeric)
-    handler.addFilter(_ContextFilter())
+    handler.addFilter(_TraceContextFilter())
     structlog_enabled = log_engine == "structlog" and _configure_structlog(
         handler=handler,
         log_format=log_format,
         enable_color=enable_color,
     )
     if not structlog_enabled and log_format == "json":
-        handler.setFormatter(_JsonFormatter())
+        handler.setFormatter(_JsonLogFormatter())
     elif not structlog_enabled:
         handler.setFormatter(_ConsoleFormatter(enable_color=enable_color))
     handler._exectunnel_handler = True  # type: ignore[attr-defined]

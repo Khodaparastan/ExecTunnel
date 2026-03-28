@@ -6,12 +6,12 @@ import json
 import logging
 import os
 
+from exectunnel.config.env import parse_bool_env
 from exectunnel.observability.exporters import (
     EXPORTER_ERRORS,
     Exporter,
     build_exporters,
     build_obs_payload,
-    parse_bool_env,
 )
 from exectunnel.observability.metrics import metrics_snapshot
 
