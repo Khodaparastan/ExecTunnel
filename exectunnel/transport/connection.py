@@ -301,8 +301,19 @@ class _TcpConnectionHandler:
                         if data_task in done:
                             item = data_task.result()
                         else:
-                            # close_event fired; loop back to drain any remaining
-                            # items that arrived before the flag was set.
+                            # close_event fired; but data_task may have already
+                            # dequeued an item before being cancelled — rescue it
+                            # so it is not silently dropped (would truncate SSH
+                            # sessions or corrupt SCP transfers at close time).
+                            if not data_task.cancelled():
+                                with contextlib.suppress(Exception):
+                                    item = data_task.result()
+                                    if item is not None:
+                                        self._bytes_downstream += len(item)
+                                        self._writer.write(item)
+                                        await self._writer.drain()
+                            # Loop back to drain any remaining items that arrived
+                            # before the flag was set.
                             continue
                     else:
                         item = self._inbound.get_nowait()

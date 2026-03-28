@@ -913,7 +913,13 @@ class TunnelSession:
             pass
         finally:
             # Signal all open connections that the relay is gone.
+            # close_remote() wakes _downstream so it drains buffered data and
+            # exits cleanly.  cancel_upstream() is also required: without it,
+            # _upstream stays blocked on await _send_data_queue.put() forever
+            # (the send loop has already exited), preventing _cleanup() from
+            # running and leaving the local SSH/SCP writer open indefinitely.
             for handler in list(self._conn_handlers.values()):
+                handler.cancel_upstream()
                 handler.close_remote()
             for flow in list(self._udp_registry.values()):
                 flow.close_remote()
@@ -1114,22 +1120,27 @@ class TunnelSession:
                             {ctrl_wait, data_wait},
                             return_when=asyncio.FIRST_COMPLETED,
                         )
+                        # Rescue any item that a pending task already dequeued
+                        # before cancellation took effect.  asyncio.Queue.get()
+                        # removes the item from the queue atomically — if the
+                        # task finished successfully despite the cancel request,
+                        # its result() holds the dequeued item and we must not
+                        # discard it.  Dropping a DATA frame corrupts TCP
+                        # streams (e.g. SCP); dropping a CONN_CLOSE control
+                        # frame leaves the agent connection half-open.
+                        rescued_ctrl: tuple[str, bool] | None = None
                         for pending_task in pending:
                             pending_task.cancel()
                             with contextlib.suppress(asyncio.CancelledError):
                                 await pending_task
-                            # asyncio.Queue.get() removes the item from the
-                            # queue before the coroutine returns.  If the task
-                            # was cancelled after the item was already dequeued
-                            # (i.e. the task finished successfully despite the
-                            # cancel request), rescue the item so it is not
-                            # silently dropped — which would corrupt any
-                            # in-flight TCP stream (e.g. SCP transfers).
-                            if pending_task is data_wait and not pending_task.cancelled():
+                            if not pending_task.cancelled():
                                 with contextlib.suppress(Exception):
                                     rescued = pending_task.result()
                                     if rescued is not None:
-                                        deferred_data_item = rescued
+                                        if pending_task is data_wait:
+                                            deferred_data_item = rescued
+                                        else:
+                                            rescued_ctrl = rescued
                         if ctrl_wait in done:
                             item = ctrl_wait.result()
                             # Preserve already-ready data for next iteration
@@ -1140,6 +1151,11 @@ class TunnelSession:
                                     deferred_data_item = data_item
                         else:
                             item = data_wait.result()
+                            # If ctrl_wait was cancelled but had already dequeued
+                            # a control frame, re-queue it so it is sent before
+                            # the next data frame (control frames take priority).
+                            if rescued_ctrl is not None:
+                                await ctrl_q.put(rescued_ctrl)
                 if item is None:
                     return
                 frame, is_data_frame = item
