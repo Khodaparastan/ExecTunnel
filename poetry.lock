@@ -443,11 +443,7 @@ files = [
     {file = "websockets-16.0.tar.gz", hash = "sha256:5f6261a5e56e8d5c42a4497b364ea24d94d9563e8fbd44e78ac40879c60179b5"},
 ]
 
-[extras]
-colorama = ["colorama"]
-structlog = ["structlog"]
-
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.13"
-content-hash = "66d55e110924dd6bc82b2a83dabd2d3c3a53fc45cb4a8d59ca3b388cf3009469"
+content-hash = "200ea00996730eff80cca0fe34020643a3542d242b8f6b1c5035919185d63e00"
