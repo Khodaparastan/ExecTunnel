@@ -76,6 +76,12 @@ _MAX_UDP_INBOUND_DGRAMS = 2048
 # kernel TCP receive buffer to the remote sender naturally.
 _STDOUT_DATA_QUEUE_CAP = 2048
 
+# TCP connect timeout for agent outbound connections.
+# 28 s is intentionally conservative: pod-to-pod connections almost always
+# succeed in < 1 s; the extra headroom covers cross-namespace DNS resolution
+# delays and Kubernetes network-policy enforcement latency.
+_TCP_CONNECT_TIMEOUT_SECS: float = 28.0
+
 
 class _FrameWriter:
     """
@@ -321,7 +327,7 @@ class TcpConnectionWorker:
     def _run(self) -> None:
         cid = self.conn_id
         try:
-            sock = socket.create_connection((self._host, self._port), timeout=28)
+            sock = socket.create_connection((self._host, self._port), timeout=_TCP_CONNECT_TIMEOUT_SECS)
             sock.setblocking(False)
         except OSError as exc:
             reason = base64.b64encode(str(exc).encode()).decode()
@@ -728,6 +734,11 @@ def main() -> None:
     else:
         sys.stderr.write("usage: agent.py [<host> <port>]\n")
         sys.exit(1)
+
+    # Remove own files immediately so agent source code is not left on disk.
+    for _agent_file in ("/tmp/exectunnel_agent.py", "/tmp/exectunnel_agent.b64"):
+        with contextlib.suppress(OSError):
+            os.unlink(_agent_file)
 
     global _writer
     _disable_echo()

@@ -86,6 +86,14 @@ class Socks5Server:
 
         logger.info("SOCKS5 listening on %s:%d", self._host, self._port)
         metrics_inc("socks5.server.started")
+        if self._host not in ("127.0.0.1", "::1", "localhost"):
+            logger.warning(
+                "SOCKS5 server bound to non-loopback address %s:%d — "
+                "any network-reachable host can use this as an open proxy. "
+                "Set EXECTUNNEL_SOCKS_HOST=127.0.0.1 unless you intend public access.",
+                self._host,
+                self._port,
+            )
 
     async def stop(self) -> None:
         """Close the listen socket, drain unconsumed requests, and signal the iterator."""
@@ -336,7 +344,7 @@ class Socks5Server:
 
         if req_header[2] != 0x00:
             # RSV byte must be 0x00 per RFC 1928 §4.
-            _write_and_suppress(writer, _build_reply(Reply.GENERAL_FAILURE))
+            await _write_and_drain_suppress(writer, _build_reply(Reply.GENERAL_FAILURE))
             raise ProtocolError(
                 f"SOCKS5 request RSV byte is {req_header[2]:#x}, expected 0x00.",
                 error_code="protocol.socks5_bad_rsv",
@@ -347,7 +355,7 @@ class Socks5Server:
         try:
             cmd = Cmd(req_header[1])
         except ValueError:
-            _write_and_suppress(writer, _build_reply(Reply.CMD_NOT_SUPPORTED))
+            await _write_and_drain_suppress(writer, _build_reply(Reply.CMD_NOT_SUPPORTED))
             raise ProtocolError(
                 f"Unsupported SOCKS5 command: {req_header[1]:#x}.",
                 error_code="protocol.socks5_unsupported_cmd",
@@ -362,7 +370,7 @@ class Socks5Server:
         host, port = await _read_addr(reader)
 
         if cmd == Cmd.CONNECT and port == 0:
-            _write_and_suppress(writer, _build_reply(Reply.GENERAL_FAILURE))
+            await _write_and_drain_suppress(writer, _build_reply(Reply.GENERAL_FAILURE))
             raise ProtocolError(
                 f"SOCKS5 CONNECT request for {host!r} has port 0.",
                 error_code="protocol.socks5_connect_zero_port",
@@ -390,7 +398,7 @@ class Socks5Server:
 
         # BIND and any future commands — send CMD_NOT_SUPPORTED and return None
         # so _handle_client does not enqueue a request it cannot route.
-        _write_and_suppress(writer, _build_reply(Reply.CMD_NOT_SUPPORTED))
+        await _write_and_drain_suppress(writer, _build_reply(Reply.CMD_NOT_SUPPORTED))
         return None
 
 
@@ -401,8 +409,23 @@ def _write_and_suppress(writer: asyncio.StreamWriter, data: bytes) -> None:
     """Write *data* to *writer*, suppressing any ``OSError``.
 
     Used for best-effort error-reply writes inside ``_negotiate`` where the
-    connection may already be half-closed.  Drain is intentionally omitted —
-    the caller closes the writer immediately after.
+    connection may already be half-closed.  ``drain()`` is called to flush the
+    kernel write buffer so the SOCKS5 error reply reaches the client before the
+    socket is closed by the caller.  Both the write and drain are suppressed on
+    ``OSError`` because the connection may already be half-closed.
     """
     with contextlib.suppress(OSError):
         writer.write(data)
+
+
+async def _write_and_drain_suppress(writer: asyncio.StreamWriter, data: bytes) -> None:
+    """Write *data* and drain, suppressing ``OSError`` on either operation.
+
+    Async variant of :func:`_write_and_suppress` that also flushes the kernel
+    write buffer so the SOCKS5 error reply actually reaches the client before
+    the caller closes the socket.
+    """
+    with contextlib.suppress(OSError):
+        writer.write(data)
+    with contextlib.suppress(OSError):
+        await writer.drain()

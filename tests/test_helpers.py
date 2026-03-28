@@ -71,20 +71,19 @@ def test_new_conn_id_prefix() -> None:
     for _ in range(20):
         cid = new_conn_id()
         assert cid.startswith("c"), f"expected 'c' prefix, got {cid!r}"
-        assert len(cid) == 7  # 'c' + 6 hex chars
+        assert len(cid) == 17  # 'c' + 16 hex chars (8 bytes)
 
 
 def test_new_flow_id_prefix() -> None:
     for _ in range(20):
         fid = new_flow_id()
         assert fid.startswith("u"), f"expected 'u' prefix, got {fid!r}"
-        assert len(fid) == 7
+        assert len(fid) == 17  # 'u' + 16 hex chars (8 bytes)
 
 
 def test_ids_are_unique() -> None:
-    # Generate 500 IDs from a ~16M-value space (6 hex chars).
-    # The birthday-paradox probability of ≥1 collision is ~0.75%, so we allow
-    # ≤2 collisions to make the test robust while still catching broken RNG.
+    # Generate 500 IDs from a ~1.8×10^19-value space (16 hex chars / 8 bytes).
+    # Collision probability is negligible; expect zero duplicates.
     ids = [new_conn_id() for _ in range(500)]
     duplicates = len(ids) - len(set(ids))
-    assert duplicates <= 2, f"too many collisions in conn IDs: {duplicates}"
+    assert duplicates == 0, f"unexpected collision in conn IDs: {duplicates}"

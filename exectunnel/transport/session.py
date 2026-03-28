@@ -186,8 +186,8 @@ class TunnelSession:
                         ping_interval=None,
                         max_size=None,
                     ) as ws:
-                        bootstrapped = True
                         await self._run_session(ws)
+                        bootstrapped = True
                         reconnect_reason = "session ended"
 
                 except BootstrapError:
@@ -294,6 +294,8 @@ class TunnelSession:
             maxsize=self._app.bridge.send_queue_cap
         )
         self._bootstrap_diag.clear()
+        self._pre_ready_buf.clear()
+        self._pre_ready_carry = ""
         await self._bootstrap()
         # A successful bootstrap resets reconnect backoff state.
         self._ack_reconnect_requested = False
@@ -994,6 +996,13 @@ class TunnelSession:
                         relay.send_to_client(response, dst_host, dst_port)
                     except (TimeoutError, OSError):
                         pass
+                    except Exception:
+                        logger.debug(
+                            "unexpected error in UDP direct relay to %s:%d",
+                            dst_host,
+                            dst_port,
+                            exc_info=True,
+                        )
                     finally:
                         sock.close()
                     continue
@@ -1156,7 +1165,16 @@ class TunnelSession:
         self._pre_ready_carry = ""
 
         for line in self._pre_ready_buf:
-            await self._dispatch_frame_async(line)
+            try:
+                await self._dispatch_frame_async(line)
+            except (FrameDecodingError, ProtocolError) as exc:
+                metrics_inc("tunnel.frames.decode_error")
+                logger.debug(
+                    "bad frame in pre-ready buffer [%s]: %s (error_id=%s) — skipping",
+                    exc.error_code,
+                    exc.message,
+                    exc.error_id,
+                )
         self._pre_ready_buf.clear()
 
         try:
@@ -1165,7 +1183,16 @@ class TunnelSession:
                 buf += chunk
                 while "\n" in buf:
                     line, buf = buf.split("\n", 1)
-                    await self._dispatch_frame_async(line)
+                    try:
+                        await self._dispatch_frame_async(line)
+                    except (FrameDecodingError, ProtocolError) as exc:
+                        metrics_inc("tunnel.frames.decode_error")
+                        logger.debug(
+                            "bad frame [%s]: %s (error_id=%s) — skipping",
+                            exc.error_code,
+                            exc.message,
+                            exc.error_id,
+                        )
         except ConnectionClosed:
             pass
         finally:
@@ -1350,8 +1377,8 @@ class TunnelSession:
         """Single writer to the WebSocket — serialises all outgoing frames.
 
         Queue items are ``(frame_str, is_data)`` tuples.  ``is_data=True``
-        means the frame is a DATA/UDP_DATA payload frame (no send timeout);
-        ``is_data=False`` means it is a control frame (bounded send timeout).
+        means the frame is a DATA/UDP_DATA payload frame (send timeout applied);
+        ``is_data=False`` means it is a control frame (same send timeout).
         Exits cleanly when it dequeues the ``None`` sentinel (sent by
         ``_serve``'s finally block) or when the WebSocket reports closed.
 
@@ -1392,8 +1419,19 @@ class TunnelSession:
                         rescued_ctrl: tuple[str, bool] | None = None
                         for pending_task in pending:
                             pending_task.cancel()
-                            with contextlib.suppress(asyncio.CancelledError):
+                            try:
                                 await pending_task
+                            except asyncio.CancelledError:
+                                # cancel() beat get(): the item may have been
+                                # placed into the queue at the same instant as
+                                # the cancellation, in which case Python leaves
+                                # it in the queue.  Recover it now so it is not
+                                # silently lost (the primary download-drop bug).
+                                if pending_task is data_wait:
+                                    with contextlib.suppress(asyncio.QueueEmpty):
+                                        deferred_data_item = data_q.get_nowait()
+                                continue
+                            # get() beat cancel(): task completed normally.
                             if not pending_task.cancelled():
                                 with contextlib.suppress(Exception):
                                     rescued = pending_task.result()
@@ -1419,18 +1457,15 @@ class TunnelSession:
                 frame, is_data_frame = item
                 try:
                     metrics_inc("tunnel.frames.sent")
-                    if is_data_frame:
-                        await ws.send(frame.encode())
-                    else:
-                        send_timeout = self._app.bridge.send_timeout
-                        await asyncio.wait_for(
-                            ws.send(frame.encode()),
-                            timeout=send_timeout,
-                        )
+                    send_timeout = self._app.bridge.send_timeout
+                    await asyncio.wait_for(
+                        ws.send(frame.encode()),
+                        timeout=send_timeout,
+                    )
                 except TimeoutError:
                     metrics_inc("tunnel.frames.send_timeout")
                     raise WebSocketSendTimeoutError(
-                        "WebSocket control-frame send timed out — connection stalled.",
+                        "WebSocket frame send timed out — connection stalled.",
                         error_code="transport.ws_send_timeout",
                         details={
                             "timeout_s": self._app.bridge.send_timeout,
