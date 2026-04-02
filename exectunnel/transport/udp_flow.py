@@ -1,13 +1,37 @@
-"""UDP flow handler — local side of a SOCKS5 UDP ASSOCIATE flow."""
+"""UDP flow handler — local side of a SOCKS5 UDP ASSOCIATE flow.
+
+Data flow
+---------
+* **outbound**: local SOCKS5 relay → ``encode_udp_data_frame`` → WebSocket
+* **inbound**:  WebSocket UDP_DATA frames (queued by recv_loop) → local relay
+
+Lifecycle
+---------
+1. Create handler, register it in the shared registry.
+2. Call :meth:`open` to send ``UDP_OPEN`` to the agent.
+3. Call :meth:`send_datagram` / :meth:`recv_datagram` to relay datagrams.
+4. Call :meth:`close` for local teardown (sends ``UDP_CLOSE`` to agent).
+   OR the agent signals closure → recv_loop calls :meth:`close_remote`.
+5. Both paths set ``_remote_closed`` so :meth:`recv_datagram` unblocks.
+
+Protocol alignment
+------------------
+All frame encoding uses the typed helpers from :mod:`exectunnel.protocol.frames`:
+
+* :func:`~exectunnel.protocol.frames.encode_udp_open_frame`  — validates host
+  via :func:`~exectunnel.protocol.frames.encode_host_port`.
+* :func:`~exectunnel.protocol.frames.encode_udp_data_frame`  — accepts raw
+  ``bytes``; applies ``urlsafe_b64encode`` with no padding internally.
+* :func:`~exectunnel.protocol.frames.encode_udp_close_frame` — no payload.
+
+No manual base64 encoding is performed in this module.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
 import logging
-from collections.abc import Callable, Coroutine
-from typing import Any
 
 from exectunnel.config.defaults import TCP_INBOUND_QUEUE_CAP, UDP_WARN_EVERY
 from exectunnel.exceptions import (
@@ -22,19 +46,31 @@ from exectunnel.protocol.frames import (
     encode_udp_data_frame,
     encode_udp_open_frame,
 )
+from exectunnel.transport.connection import WsSendCallable
 
 logger = logging.getLogger("exectunnel.transport.udp_flow")
 
 
 class _UdpFlowHandler:
-    """Bridges one SOCKS5 UDP ASSOCIATE flow through the tunnel."""
+    """Bridges one SOCKS5 UDP ASSOCIATE flow through the tunnel.
+
+    Args:
+        flow_id:  Stable identifier for this UDP flow.
+        host:     Destination hostname or IP address string.
+        port:     Destination UDP port.
+        ws_send:  Coroutine callable that sends a frame string over the
+                  WebSocket / exec channel.  Must conform to
+                  :class:`~exectunnel.transport.connection.WsSendCallable`.
+        registry: Shared mapping of ``flow_id → handler``; the handler
+                  removes itself on :meth:`close`.
+    """
 
     def __init__(
         self,
         flow_id: str,
         host: str,
         port: int,
-        ws_send: Callable[..., Coroutine[Any, Any, None]],
+        ws_send: WsSendCallable,
         registry: dict[str, _UdpFlowHandler],
     ) -> None:
         self._id = flow_id
@@ -42,38 +78,73 @@ class _UdpFlowHandler:
         self._port = port
         self._ws_send = ws_send
         self._registry = registry
-        self._inbound: asyncio.Queue[bytes | None] = asyncio.Queue(
+
+        # Inbound queue: agent → local relay.  No None sentinel — closure is
+        # signalled exclusively via _remote_closed.
+        self._inbound: asyncio.Queue[bytes] = asyncio.Queue(
             maxsize=TCP_INBOUND_QUEUE_CAP
         )
-        self._drop_count = 0
-        # Set by close_remote() to signal EOF without evicting queued datagrams.
-        self._close_remote_requested = False
-        self._close_event: asyncio.Event = asyncio.Event()
+
+        # Single event replaces both _close_remote_requested bool and
+        # _close_event asyncio.Event — one piece of state, one source of truth.
+        # Set by both close_remote() (agent-initiated) and close() (local).
+        self._remote_closed = asyncio.Event()
+
+        # Lifecycle guards.
+        self._opened: bool = False
+        self._closed: bool = False
+
+        # Telemetry.
+        self._drop_count: int = 0
+        self._bytes_sent: int = 0
+        self._bytes_recv: int = 0
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def open(self) -> None:
-        """Send the UDP_OPEN control frame to the remote agent.
+        """Send the ``UDP_OPEN`` control frame to the remote agent.
 
-        Raises
-        ------
-        WebSocketSendTimeoutError
-            If the control frame cannot be delivered within the configured
-            send timeout.
-        ConnectionClosedError
-            If the underlying WebSocket connection is already closed when
-            the open frame is attempted.
-        TransportError
-            For any other transport-level failure during the open handshake.
+        Idempotent — subsequent calls are no-ops.
+
+        Raises:
+            TransportError:
+                * If *host* contains frame-unsafe characters (propagated from
+                  :func:`~exectunnel.protocol.frames.encode_host_port` as
+                  ``ValueError``, wrapped here).
+                * For any other transport-level failure during the open
+                  handshake.
+            WebSocketSendTimeoutError:
+                If the control frame cannot be delivered within the configured
+                send timeout.
+            ConnectionClosedError:
+                If the underlying WebSocket connection is already closed.
         """
+        if self._opened:
+            return
+        self._opened = True
+
         try:
-            await self._ws_send(
-                encode_udp_open_frame(self._id, self._host, self._port),
-                control=True,
-            )
-        except WebSocketSendTimeoutError:
-            raise
-        except ConnectionClosedError:
+            frame = encode_udp_open_frame(self._id, self._host, self._port)
+        except ValueError as exc:
+            # encode_host_port raises ValueError for frame-unsafe host strings.
+            raise TransportError(
+                f"UDP flow {self._id!r}: invalid host {self._host!r} for UDP_OPEN frame.",
+                error_code="transport.udp_open_invalid_host",
+                details={
+                    "flow_id": self._id,
+                    "host": self._host,
+                    "port": self._port,
+                },
+                hint=(
+                    "The destination host contains characters that are unsafe in "
+                    "the tunnel frame format. Validate the host before opening a flow."
+                ),
+            ) from exc
+
+        try:
+            await self._ws_send(frame, control=True)
+            metrics_inc("udp.flow.opened")
+        except (WebSocketSendTimeoutError, ConnectionClosedError):
             raise
         except Exception as exc:
             raise TransportError(
@@ -88,20 +159,33 @@ class _UdpFlowHandler:
             ) from exc
 
     async def close(self) -> None:
-        """Evict this flow from the registry and send the UDP_CLOSE control frame.
+        """Evict this flow from the registry and send the ``UDP_CLOSE`` frame.
 
-        Raises
-        ------
-        WebSocketSendTimeoutError
-            If the close frame cannot be delivered within the configured
-            send timeout.
-        ConnectionClosedError
-            If the connection is already gone — treated as a no-op because
-            the remote side will time-out the flow independently.
-        TransportError
-            For any other transport-level failure during teardown.
+        Idempotent — subsequent calls are no-ops.
+
+        Also sets ``_remote_closed`` so any coroutine blocked in
+        :meth:`recv_datagram` unblocks immediately.
+
+        Any datagrams still queued in ``_inbound`` at close time are silently
+        abandoned — this is intentional UDP semantics; datagrams may be lost.
+
+        Raises:
+            WebSocketSendTimeoutError:
+                If the close frame cannot be delivered within the configured
+                send timeout.
+            TransportError:
+                For any other transport-level failure during teardown.
         """
+        if self._closed:
+            return
+        self._closed = True
+
+        # Wake recv_datagram() before touching the network so the caller's
+        # receive loop exits cleanly even if ws_send raises.
+        self._remote_closed.set()
         self._registry.pop(self._id, None)
+        metrics_inc("udp.flow.closed")
+
         try:
             await self._ws_send(encode_udp_close_frame(self._id), control=True)
         except ConnectionClosedError:
@@ -129,11 +213,13 @@ class _UdpFlowHandler:
         Silently drops the datagram and increments the drop counter when the
         inbound queue is full — this is intentional UDP semantics.
 
-        Raises
-        ------
-        FrameDecodingError
-            If *data* is ``None`` or not a ``bytes`` instance, indicating the
-            caller passed a malformed or already-decoded payload.
+        No-op if the flow has already been closed.
+
+        Args:
+            data: Raw bytes decoded from a ``UDP_DATA`` frame payload.
+
+        Raises:
+            FrameDecodingError: If *data* is not a ``bytes`` instance.
         """
         if not isinstance(data, bytes):
             raise FrameDecodingError(
@@ -145,96 +231,137 @@ class _UdpFlowHandler:
                 },
                 hint="Ensure the frame decoder passes raw bytes to feed().",
             )
+
+        # Guard against feeding a closed flow — data would sit in the queue
+        # forever since recv_datagram() will never be called again.
+        if self._closed:
+            metrics_inc("udp.flow.feed_after_close.drop")
+            return
+
         try:
             self._inbound.put_nowait(data)
+            self._bytes_recv += len(data)
+            metrics_inc("udp.flow.datagram.accepted")
         except asyncio.QueueFull:
             self._drop_count += 1
             metrics_inc("udp.flow.inbound_queue.drop")
             if self._drop_count == 1 or self._drop_count % UDP_WARN_EVERY == 0:
                 logger.warning(
-                    "udp flow %s inbound queue full, dropping datagram (drops=%d)",
+                    "udp flow %s inbound queue full, dropping datagram "
+                    "(total_drops=%d)",
                     self._id,
                     self._drop_count,
                 )
 
     def close_remote(self) -> None:
-        """Signal remote closure without evicting queued datagrams.
+        """Signal that the agent has closed its side of the flow.
 
-        Sets ``_close_remote_requested`` and fires ``_close_event`` so that
-        ``recv_datagram()`` can wake up and return ``None`` after draining any
-        already-queued datagrams — no data is ever discarded.
+        Sets ``_remote_closed`` so :meth:`recv_datagram` drains remaining
+        queued datagrams and then returns ``None``.
+
+        Idempotent — subsequent calls are no-ops.
+        Safe to call before :meth:`open` or after :meth:`close`.
         """
-        self._close_remote_requested = True
-        self._close_event.set()
+        self._remote_closed.set()
 
     async def recv_datagram(self) -> bytes | None:
         """Return the next inbound datagram, or ``None`` when the flow is closed.
 
         Drains any already-queued datagrams before honouring the close flag so
-        that no data is lost when ``close_remote()`` races with a queued item.
+        that no data is lost when :meth:`close_remote` races with a queued item.
 
-        Raises
-        ------
-        TransportError
-            If an unexpected error occurs while waiting on the inbound queue
-            or the close event (e.g. the event loop is shutting down).
+        Returns:
+            Raw datagram bytes, or ``None`` when the flow is closed and the
+            inbound queue is empty.
+
+        Raises:
+            asyncio.CancelledError: Propagated as-is — never suppressed.
         """
-        if not self._inbound.empty():
+        # Fast path: drain any immediately available datagrams first.
+        try:
             return self._inbound.get_nowait()
-        if self._close_remote_requested:
+        except asyncio.QueueEmpty:
+            pass
+
+        # If already closed and queue is empty, signal EOF.
+        if self._remote_closed.is_set():
             return None
 
         # Block until a datagram arrives OR the flow is closed.
-        data_task: asyncio.Task[bytes | None] = asyncio.create_task(self._inbound.get())
-        close_task: asyncio.Task[None] = asyncio.create_task(self._close_event.wait())
+        # Create tasks once per blocking wait — not per loop iteration.
+        get_task: asyncio.Task[bytes] = asyncio.create_task(
+            self._inbound.get(),
+            name=f"udp-flow-get-{self._id}",
+        )
+        close_task: asyncio.Task[None] = asyncio.create_task(
+            self._remote_closed.wait(),
+            name=f"udp-flow-close-{self._id}",
+        )
 
         try:
             done, pending = await asyncio.wait(
-                {data_task, close_task},
+                {get_task, close_task},
                 return_when=asyncio.FIRST_COMPLETED,
             )
-        except Exception as exc:
-            data_task.cancel()
+        except asyncio.CancelledError:
+            # Task was cancelled externally — clean up and propagate.
+            get_task.cancel()
             close_task.cancel()
-            raise TransportError(
-                f"UDP flow {self._id!r}: unexpected error while waiting for datagram.",
-                error_code="transport.udp_recv_wait_failed",
-                details={"flow_id": self._id},
-                hint="This may indicate an event-loop shutdown or task cancellation.",
-            ) from exc
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.gather(get_task, close_task, return_exceptions=True)
+            raise
 
+        # Cancel and await all pending tasks to release resources.
         for t in pending:
             t.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await t
 
-        if data_task in done:
-            return data_task.result()
+        if get_task in done and not get_task.cancelled():
+            # Data arrived — return it.
+            return get_task.result()
 
-        # close_event fired — drain one last time before returning None.
-        if not self._inbound.empty():
+        # close_task fired (or both fired simultaneously).
+        # Rescue any item that get_task may have dequeued before being
+        # cancelled — dropping it would silently truncate the flow.
+        if not get_task.cancelled():
+            with contextlib.suppress(Exception):
+                item = get_task.result()
+                if item is not None:
+                    return item
+
+        # Drain one final time in case datagrams arrived between the
+        # close signal and the task cancellation.
+        try:
             return self._inbound.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+
         return None
 
     # ── Outbound (local → remote) ─────────────────────────────────────────────
 
     async def send_datagram(self, data: bytes) -> None:
-        """Encode *data* as a UDP_DATA frame and forward it to the remote agent.
+        """Encode *data* as a ``UDP_DATA`` frame and forward it to the agent.
 
-        The frame is placed on the *data* send queue (not the control queue).
-        When the data queue is full ``_ws_send`` drops the frame silently —
+        Uses :func:`~exectunnel.protocol.frames.encode_udp_data_frame` which
+        accepts raw ``bytes`` and applies ``urlsafe_b64encode`` with no padding
+        internally — no manual base64 encoding is performed here.
+
+        The frame is placed on the data send queue (not the control queue).
+        When the data queue is full, ``_ws_send`` drops the frame silently —
         this is intentional UDP semantics (datagrams may be lost).
 
-        Raises
-        ------
-        FrameDecodingError
-            If *data* is not a ``bytes`` instance.
-        WebSocketSendTimeoutError
-            If the WebSocket send stalls beyond the configured timeout.
-        ConnectionClosedError
-            If the connection is closed before the frame can be sent.
-        TransportError
-            For any other transport-level failure during the send.
+        Args:
+            data: Raw datagram bytes to forward to the agent.
+
+        Raises:
+            FrameDecodingError:       If *data* is not a ``bytes`` instance.
+            WebSocketSendTimeoutError: If the WebSocket send stalls beyond the
+                                       configured timeout.
+            ConnectionClosedError:    If the connection is closed before the
+                                       frame can be sent.
+            TransportError:           For any other transport-level failure.
         """
         if not isinstance(data, bytes):
             raise FrameDecodingError(
@@ -246,9 +373,15 @@ class _UdpFlowHandler:
                 },
                 hint="Ensure callers pass raw bytes to send_datagram().",
             )
-        b64 = base64.b64encode(data).decode()
+
+        # encode_udp_data_frame accepts raw bytes and handles urlsafe_b64encode
+        # with no padding — no manual encoding step needed.
+        frame = encode_udp_data_frame(self._id, data)
+
         try:
-            await self._ws_send(encode_udp_data_frame(self._id, b64))
+            await self._ws_send(frame)
+            self._bytes_sent += len(data)
+            metrics_inc("udp.flow.datagram.sent")
         except (WebSocketSendTimeoutError, ConnectionClosedError):
             raise
         except Exception as exc:
@@ -275,6 +408,21 @@ class _UdpFlowHandler:
         return self._drop_count
 
     @property
+    def bytes_sent(self) -> int:
+        """Total bytes successfully forwarded to the agent (outbound direction)."""
+        return self._bytes_sent
+
+    @property
+    def bytes_recv(self) -> int:
+        """Total bytes received from the agent (inbound direction)."""
+        return self._bytes_recv
+
+    @property
     def is_closed(self) -> bool:
-        """``True`` once ``close_remote()`` has been called."""
-        return self._close_remote_requested
+        """``True`` once :meth:`close` or :meth:`close_remote` has been called."""
+        return self._remote_closed.is_set()
+
+    @property
+    def is_opened(self) -> bool:
+        """``True`` once :meth:`open` has been called successfully."""
+        return self._opened
