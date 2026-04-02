@@ -7,35 +7,52 @@ from exectunnel.protocol.frames import (
     FRAME_SUFFIX,
     PIPE_READ_CHUNK_BYTES,
     READY_FRAME,
-    FrameStr,
+    ParsedFrame,
+    decode_data_payload,
+    encode_conn_close_frame,
     encode_conn_open_frame,
     encode_data_frame,
-    encode_frame,
+    encode_error_frame,
+    encode_host_port,
     encode_udp_close_frame,
     encode_udp_data_frame,
     encode_udp_open_frame,
+    is_ready_frame,
     parse_frame,
+    parse_host_port,
 )
 from exectunnel.protocol.ids import new_conn_id, new_flow_id
 
 __all__ = [
+    # ── Constants ──────────────────────────────────────────────────────────
     "BOOTSTRAP_CHUNK_SIZE_CHARS",
     "FRAME_PREFIX",
     "FRAME_SUFFIX",
     "PIPE_READ_CHUNK_BYTES",
     "READY_FRAME",
+    # ── SOCKS5 enums ───────────────────────────────────────────────────────
     "AddrType",
     "AuthMethod",
     "Cmd",
-    "FrameStr",
     "Reply",
+    # ── Frame types ────────────────────────────────────────────────────────
+    "ParsedFrame",
+    # ── Frame encoders ─────────────────────────────────────────────────────
+    "encode_conn_close_frame",
     "encode_conn_open_frame",
     "encode_data_frame",
-    "encode_frame",
+    "encode_error_frame",
     "encode_udp_close_frame",
     "encode_udp_data_frame",
     "encode_udp_open_frame",
+    # ── Frame decoder ──────────────────────────────────────────────────────
+    "parse_frame",
+    "is_ready_frame",
+    # ── Payload helpers ────────────────────────────────────────────────────
+    "decode_data_payload",
+    "encode_host_port",
+    "parse_host_port",
+    # ── ID generators ──────────────────────────────────────────────────────
     "new_conn_id",
     "new_flow_id",
-    "parse_frame",
 ]
