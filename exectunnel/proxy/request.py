@@ -14,13 +14,26 @@ from exectunnel.proxy.relay import UdpRelay
 
 @dataclass
 class Socks5Request:
-    """
-    Represents one completed SOCKS5 handshake.
+    """Represents one completed SOCKS5 handshake.
 
-    The handler must call :meth:`send_reply_success` **or**
+    The handler MUST call :meth:`send_reply_success` **or**
     :meth:`send_reply_error` exactly once before transferring data.
-    The synchronous :meth:`reply_success` / :meth:`reply_error` helpers write
-    to the transport buffer only — the caller is responsible for draining.
+
+    The request is also usable as an async context manager that guarantees
+    cleanup even if the handler raises before sending a reply::
+
+        async with request:
+            await request.send_reply_success()
+            ...  # relay data
+
+    Attributes:
+        cmd:       The SOCKS5 command (:class:`~exectunnel.protocol.enums.Cmd`).
+        host:      Destination hostname or IP address string.
+        port:      Destination port number.
+        reader:    asyncio stream reader for the SOCKS5 client connection.
+        writer:    asyncio stream writer for the SOCKS5 client connection.
+        udp_relay: Bound :class:`UdpRelay` instance for ``UDP_ASSOCIATE``
+                   requests; ``None`` for ``CONNECT``.
     """
 
     cmd: Cmd
@@ -29,6 +42,34 @@ class Socks5Request:
     reader: asyncio.StreamReader
     writer: asyncio.StreamWriter
     udp_relay: UdpRelay | None = field(default=None)
+
+    # Tracks whether a reply has already been sent so double-reply bugs are
+    # caught at runtime rather than silently corrupting the SOCKS5 stream.
+    _replied: bool = field(default=False, init=False, repr=False)
+
+    # ── Async context manager ─────────────────────────────────────────────────
+
+    async def __aenter__(self) -> Socks5Request:
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        """Guarantee writer and relay are closed on exit, regardless of outcome."""
+        await self.close()
+
+    # ── Cleanup ───────────────────────────────────────────────────────────────
+
+    async def close(self) -> None:
+        """Close the writer and any associated UDP relay.
+
+        Idempotent — safe to call multiple times.  All ``OSError`` exceptions
+        are suppressed because the connection may already be half-closed by the
+        time this is called.
+        """
+        if self.udp_relay is not None:
+            self.udp_relay.close()
+        with contextlib.suppress(OSError, RuntimeError):
+            self.writer.close()
+            await self.writer.wait_closed()
 
     # ── Properties ────────────────────────────────────────────────────────────
 
@@ -42,6 +83,36 @@ class Socks5Request:
         """``True`` when the SOCKS5 command is ``UDP_ASSOCIATE``."""
         return self.cmd == Cmd.UDP_ASSOCIATE
 
+    @property
+    def replied(self) -> bool:
+        """``True`` once a reply has been sent to the SOCKS5 client."""
+        return self._replied
+
+    # ── Internal reply guard ──────────────────────────────────────────────────
+
+    def _mark_replied(self) -> None:
+        """Raise :class:`ProtocolError` if a reply has already been sent.
+
+        Raises:
+            ProtocolError: On double-reply attempt.
+        """
+        if self._replied:
+            raise ProtocolError(
+                f"A SOCKS5 reply has already been sent for "
+                f"{self.host}:{self.port} — cannot send a second reply.",
+                error_code="protocol.socks5_double_reply",
+                details={
+                    "host": self.host,
+                    "port": self.port,
+                    "cmd": self.cmd.name,
+                },
+                hint=(
+                    "Ensure the request handler calls send_reply_success() or "
+                    "send_reply_error() exactly once."
+                ),
+            )
+        self._replied = True
+
     # ── Synchronous reply helpers (buffer only — caller must drain) ───────────
 
     def reply_success(
@@ -54,15 +125,20 @@ class Socks5Request:
         The caller is responsible for calling ``await writer.drain()``
         after this method returns.
 
-        Raises
-        ------
-        ConfigurationError
-            If *bind_host* or *bind_port* are invalid (propagated from
-            :func:`_build_reply`).
-        ProtocolError
-            If the writer transport has already been closed, indicating
-            the reply is being sent to a dead connection.
+        Args:
+            bind_host: The ``BND.ADDR`` to advertise.  Defaults to
+                       ``"127.0.0.1"``.
+            bind_port: The ``BND.PORT`` to advertise.  Defaults to ``0``.
+
+        Raises:
+            ProtocolError:
+                * If a reply has already been sent (double-reply guard).
+                * If the writer transport is already closing.
+            ConfigurationError:
+                If *bind_host* or *bind_port* are invalid (propagated from
+                :func:`build_reply`).
         """
+        self._mark_replied()
         if self.writer.is_closing():
             raise ProtocolError(
                 f"Cannot send SUCCESS reply for {self.host}:{self.port} — "
@@ -78,8 +154,6 @@ class Socks5Request:
                     "This is usually benign."
                 ),
             )
-        # ConfigurationError from _build_reply (bad bind_host / bind_port)
-        # propagates as-is — it is a caller bug, not a client error.
         self.writer.write(build_reply(Reply.SUCCESS, bind_host, bind_port))
 
     def reply_error(self, reply: Reply = Reply.GENERAL_FAILURE) -> None:
@@ -88,20 +162,27 @@ class Socks5Request:
         The caller is responsible for calling ``await writer.drain()``
         after this method returns.
 
-        Raises
-        ------
-        ConfigurationError
-            If *reply* is not a valid :class:`Reply` member (propagated from
-            :func:`_build_reply`).
-        """
-        # We intentionally do NOT guard on writer.is_closing() here: error
-        # replies must be attempted even on a half-closed connection so that
-        # the client receives a well-formed SOCKS5 rejection rather than a
-        # bare TCP RST.  The subsequent drain() / close() calls in
-        # send_reply_error() already suppress OSError.
-        self.writer.write(build_reply(reply))
+        Unlike :meth:`reply_success`, this method does **not** guard on
+        ``writer.is_closing()`` — error replies must be attempted even on a
+        half-closed connection so the client receives a well-formed SOCKS5
+        rejection rather than a bare TCP RST.
 
-    # ── Async reply helpers (write + drain) ───────────────────────────────────
+        Args:
+            reply: The :class:`~exectunnel.protocol.enums.Reply` code to send.
+                   Defaults to :attr:`~exectunnel.protocol.enums.Reply.GENERAL_FAILURE`.
+
+        Raises:
+            ProtocolError:
+                If a reply has already been sent (double-reply guard).
+            ConfigurationError:
+                If *reply* is not a valid :class:`Reply` member (propagated
+                from :func:`build_reply`).
+        """
+        self._mark_replied()
+        with contextlib.suppress(RuntimeError, OSError):
+            self.writer.write(build_reply(reply))
+
+    # ── Async reply helpers (write + drain + optional close) ─────────────────
 
     async def send_reply_success(
         self,
@@ -110,18 +191,23 @@ class Socks5Request:
     ) -> None:
         """Write and flush a ``SUCCESS`` reply to the SOCKS5 client.
 
-        Raises
-        ------
-        ConfigurationError
-            If *bind_host* or *bind_port* are invalid (propagated from
-            :meth:`reply_success` → :func:`_build_reply`).
-        ProtocolError
-            If the writer transport is already closing when the reply is
-            attempted (propagated from :meth:`reply_success`).
-        OSError
-            If the underlying socket write or drain fails.  Callers that
-            want to suppress connection-reset errors should wrap this call
-            in ``contextlib.suppress(OSError)``.
+        Does **not** close the writer — the caller owns the connection after a
+        successful reply and is responsible for data relay and teardown.
+
+        Args:
+            bind_host: The ``BND.ADDR`` to advertise.  Defaults to
+                       ``"127.0.0.1"``.
+            bind_port: The ``BND.PORT`` to advertise.  Defaults to ``0``.
+
+        Raises:
+            ProtocolError:
+                * Double-reply guard (propagated from :meth:`reply_success`).
+                * Writer already closing (propagated from :meth:`reply_success`).
+            ConfigurationError:
+                Invalid *bind_host* / *bind_port* (propagated from
+                :func:`build_reply`).
+            OSError:
+                If the underlying socket write or drain fails.
         """
         self.reply_success(bind_host, bind_port)
         await self.writer.drain()
@@ -136,22 +222,22 @@ class Socks5Request:
         torn down regardless and a secondary ``OSError`` must not shadow the
         original failure that caused the error reply.
 
-        Raises
-        ------
-        ConfigurationError
-            If *reply* is not a valid :class:`Reply` member (propagated from
-            :meth:`reply_error` → :func:`_build_reply`).  This is a caller
-            bug and is not suppressed.
+        Args:
+            reply: The :class:`~exectunnel.protocol.enums.Reply` code to send.
+                   Defaults to :attr:`~exectunnel.protocol.enums.Reply.GENERAL_FAILURE`.
+
+        Raises:
+            ProtocolError:
+                Double-reply guard (propagated from :meth:`reply_error`).
+            ConfigurationError:
+                Invalid *reply* code (propagated from :func:`build_reply`).
+                This is a caller bug and is **not** suppressed.
         """
-        # _build_reply / reply_error may raise ConfigurationError — let it
-        # propagate so the caller knows it passed a bad Reply value.
+        # reply_error() may raise ProtocolError (double-reply) or
+        # ConfigurationError (bad Reply value) — both propagate to the caller.
         self.reply_error(reply)
 
         with contextlib.suppress(OSError):
             await self.writer.drain()
-        with contextlib.suppress(OSError):
-            self.writer.close()
-            await self.writer.wait_closed()
 
-        if self.udp_relay is not None:
-            self.udp_relay.close()
+        await self.close()
