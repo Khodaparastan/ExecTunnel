@@ -1,15 +1,51 @@
-"""TcpConnectionWorker and flow ID generation."""
+"""TCP connection and UDP flow ID generation."""
 
 from __future__ import annotations
 
 import secrets
 
+# Prefix characters that namespace IDs by type, preventing any cross-type
+# collision even if the underlying token bytes happen to be identical.
+_TCP_PREFIX = "c"
+_UDP_PREFIX = "u"
+
+# 12 bytes → 96-bit entropy → birthday bound ~2^48 before 50% collision
+# probability; safe for high-concurrency, long-lived tunnel sessions.
+_TOKEN_BYTES = 12
+
+
+def _new_id(prefix: str) -> str:
+    """
+    Generate a cryptographically random, prefix-namespaced tunnel ID.
+
+    The returned string is composed entirely of lowercase hex digits plus the
+    single-character prefix, making it safe to embed in any frame field
+    without escaping.
+
+    Args:
+        prefix: Single ASCII character prepended to the hex token.
+
+    Returns:
+        A string of the form ``<prefix><24 hex chars>``.
+    """
+    return prefix + secrets.token_hex(_TOKEN_BYTES)
+
 
 def new_conn_id() -> str:
-    """Generate a unique TCP connection ID (e.g. ``c3f9a1b2c3d4e5f6``)."""
-    return "c" + secrets.token_hex(8)
+    """
+    Generate a unique TCP connection ID.
+
+    Returns:
+        A string of the form ``c<24 hex chars>``, e.g. ``ca1b2c3d4e5f6a7b8c9d0e1f``.
+    """
+    return _new_id(_TCP_PREFIX)
 
 
 def new_flow_id() -> str:
-    """Generate a unique UDP flow ID (e.g. ``ua1b2c3d4e5f6f7e8``)."""
-    return "u" + secrets.token_hex(8)
+    """
+    Generate a unique UDP flow ID.
+
+    Returns:
+        A string of the form ``u<24 hex chars>``, e.g. ``ua1b2c3d4e5f6a7b8c9d0e1f``.
+    """
+    return _new_id(_UDP_PREFIX)
