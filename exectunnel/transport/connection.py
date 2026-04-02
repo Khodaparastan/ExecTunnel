@@ -842,7 +842,9 @@ class _TcpConnectionHandler:
 
         # Determine whether the peer task should be cancelled.
         # A cleanly-ended task keeps its peer alive (half-close support).
-        task_ended_cleanly = not task.cancelled() and task.exception() is None
+        task_ended_cleanly = (
+            not task.cancelled() and task.exception() is None
+        )
         peer_survives = task_ended_cleanly and (
             (task is self._upstream_task and self._upstream_ended_cleanly)
             or (task is self._downstream_task and self._downstream_ended_cleanly)
@@ -851,17 +853,14 @@ class _TcpConnectionHandler:
         if not peer_survives:
             # Cancel whichever task is not the one that just finished.
             for candidate in (self._upstream_task, self._downstream_task):
-                if (
-                    candidate is not None
-                    and candidate is not task
-                    and not candidate.done()
-                ):
+                if candidate is not None and candidate is not task and not candidate.done():
                     candidate.cancel()
 
         # Only schedule cleanup when both tasks are finished and cleanup has
         # not already started (_closed is the authoritative gate).
-        both_done = (self._upstream_task is None or self._upstream_task.done()) and (
-            self._downstream_task is None or self._downstream_task.done()
+        both_done = (
+            (self._upstream_task is None or self._upstream_task.done())
+            and (self._downstream_task is None or self._downstream_task.done())
         )
         if both_done and not self._closed.is_set():
             self._cleanup_task = asyncio.create_task(
