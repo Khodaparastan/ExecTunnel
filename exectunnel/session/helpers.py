@@ -17,7 +17,7 @@ from exectunnel.exceptions import ConfigurationError
 from exectunnel.protocol.frames import (
     encode_conn_open_frame,
     encode_data_frame,
-    encode_frame,
+    _encode_frame,
     encode_udp_close_frame,
     encode_udp_data_frame,
     encode_udp_open_frame,
