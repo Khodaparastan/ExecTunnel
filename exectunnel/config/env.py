@@ -1,4 +1,5 @@
 """Environment variable parsing helpers."""
+
 from __future__ import annotations
 
 import logging

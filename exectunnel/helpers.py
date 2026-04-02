@@ -5,6 +5,7 @@ All new code should import from exectunnel.protocol.frames,
 exectunnel.protocol.ids, and use load_agent_b64 / is_host_excluded /
 make_udp_socket from here (or the future exectunnel.transport.utils).
 """
+
 from __future__ import annotations
 
 import base64

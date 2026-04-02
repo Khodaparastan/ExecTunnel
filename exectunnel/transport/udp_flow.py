@@ -1,4 +1,5 @@
 """UDP flow handler — local side of a SOCKS5 UDP ASSOCIATE flow."""
+
 from __future__ import annotations
 
 import asyncio
@@ -41,7 +42,9 @@ class _UdpFlowHandler:
         self._port = port
         self._ws_send = ws_send
         self._registry = registry
-        self._inbound: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=TCP_INBOUND_QUEUE_CAP)
+        self._inbound: asyncio.Queue[bytes | None] = asyncio.Queue(
+            maxsize=TCP_INBOUND_QUEUE_CAP
+        )
         self._drop_count = 0
         # Set by close_remote() to signal EOF without evicting queued datagrams.
         self._close_remote_requested = False
@@ -182,12 +185,8 @@ class _UdpFlowHandler:
             return None
 
         # Block until a datagram arrives OR the flow is closed.
-        data_task: asyncio.Task[bytes | None] = asyncio.create_task(
-            self._inbound.get()
-        )
-        close_task: asyncio.Task[None] = asyncio.create_task(
-            self._close_event.wait()
-        )
+        data_task: asyncio.Task[bytes | None] = asyncio.create_task(self._inbound.get())
+        close_task: asyncio.Task[None] = asyncio.create_task(self._close_event.wait())
 
         try:
             done, pending = await asyncio.wait(

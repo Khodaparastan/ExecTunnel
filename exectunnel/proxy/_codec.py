@@ -1,4 +1,5 @@
 """Private low-level SOCKS5 I/O helpers."""
+
 from __future__ import annotations
 
 import asyncio
@@ -10,7 +11,7 @@ from exectunnel.exceptions import ConfigurationError, ProtocolError
 from exectunnel.protocol.enums import AddrType, Reply
 
 
-async def _read_exact(reader: asyncio.StreamReader, n: int) -> bytes:
+async def read_exact(reader: asyncio.StreamReader, n: int) -> bytes:
     """Read exactly *n* bytes from *reader*.
 
     Raises
@@ -22,13 +23,13 @@ async def _read_exact(reader: asyncio.StreamReader, n: int) -> bytes:
     try:
         return await reader.readexactly(n)
     except asyncio.IncompleteReadError as exc:
+        received = len(exc.partial) if exc.partial else 0
         raise ProtocolError(
-            f"Stream ended after {exc.partial and len(exc.partial) or 0} byte(s); "
-            f"expected {n} byte(s).",
+            f"Stream ended after {received} byte(s); expected {n} byte(s).",
             error_code="protocol.socks5_truncated_read",
             details={
                 "expected_bytes": n,
-                "received_bytes": len(exc.partial) if exc.partial else 0,
+                "received_bytes": received,
             },
             hint=(
                 "The SOCKS5 client disconnected or sent a truncated message. "
@@ -37,7 +38,7 @@ async def _read_exact(reader: asyncio.StreamReader, n: int) -> bytes:
         ) from exc
 
 
-async def _read_addr(reader: asyncio.StreamReader) -> tuple[str, int]:
+async def read_addr(reader: asyncio.StreamReader) -> tuple[str, int]:
     """Read ``ATYP + address + port`` from *reader* and return ``(host, port)``.
 
     Raises
@@ -47,11 +48,11 @@ async def _read_addr(reader: asyncio.StreamReader) -> tuple[str, int]:
         domain bytes are not valid UTF-8, or the stream is truncated at any
         point during the read.
     """
-    atyp_byte = await _read_exact(reader, 1)
+    atyp_byte = await read_exact(reader, 1)
     atyp = atyp_byte[0]
 
     if atyp == AddrType.IPV4:
-        raw = await _read_exact(reader, 4)
+        raw = await read_exact(reader, 4)
         try:
             host = socket.inet_ntop(socket.AF_INET, raw)
         except OSError as exc:
@@ -63,7 +64,7 @@ async def _read_addr(reader: asyncio.StreamReader) -> tuple[str, int]:
             ) from exc
 
     elif atyp == AddrType.IPV6:
-        raw = await _read_exact(reader, 16)
+        raw = await read_exact(reader, 16)
         try:
             host = socket.inet_ntop(socket.AF_INET6, raw)
         except OSError as exc:
@@ -75,7 +76,7 @@ async def _read_addr(reader: asyncio.StreamReader) -> tuple[str, int]:
             ) from exc
 
     elif atyp == AddrType.DOMAIN:
-        length_byte = await _read_exact(reader, 1)
+        length_byte = await read_exact(reader, 1)
         length = length_byte[0]
         if length == 0:
             raise ProtocolError(
@@ -87,7 +88,7 @@ async def _read_addr(reader: asyncio.StreamReader) -> tuple[str, int]:
                     "violates RFC 1928 §5."
                 ),
             )
-        raw_host = await _read_exact(reader, length)
+        raw_host = await read_exact(reader, length)
         try:
             host = raw_host.decode()
         except UnicodeDecodeError as exc:
@@ -115,12 +116,12 @@ async def _read_addr(reader: asyncio.StreamReader) -> tuple[str, int]:
             ),
         )
 
-    port_raw = await _read_exact(reader, 2)
+    port_raw = await read_exact(reader, 2)
     port = struct.unpack("!H", port_raw)[0]
     return host, port
 
 
-def _build_reply(
+def build_reply(
     reply: Reply,
     bind_host: str = "0.0.0.0",
     bind_port: int = 0,
@@ -184,3 +185,6 @@ def _build_reply(
         + addr.packed
         + struct.pack("!H", bind_port)
     )
+
+
+__all__ = ["build_reply", "read_addr", "read_exact"]

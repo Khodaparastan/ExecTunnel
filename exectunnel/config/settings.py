@@ -1,4 +1,5 @@
 """Configuration dataclasses and factory functions."""
+
 from __future__ import annotations
 
 import ipaddress
@@ -59,6 +60,7 @@ class AppConfig:
     wss_url: str
     insecure: bool
     bridge: BridgeConfig
+    version: str = "1.0"
 
     def ssl_context(self) -> ssl.SSLContext | None:
         """Return an SSL context for wss:// URLs, or None for plain ws://."""
@@ -108,7 +110,7 @@ TUNNEL_CONFIG: Final[TunnelConfig] = TunnelConfig()
 def get_wss_url() -> str:
     """Return EXECTUNNEL_WSS_URL (or legacy WSS_URL) from the environment or raise ConfigurationError."""
     from exectunnel.exceptions import (
-        ConfigurationError,  # avoid circular import at module level
+        ConfigurationError,
     )
 
     url = os.getenv("EXECTUNNEL_WSS_URL") or os.getenv("WSS_URL")
@@ -121,7 +123,9 @@ def get_wss_url() -> str:
     if parsed.scheme not in {"ws", "wss"}:
         raise ConfigurationError("EXECTUNNEL_WSS_URL must use ws:// or wss:// scheme.")
     if not parsed.netloc:
-        raise ConfigurationError("EXECTUNNEL_WSS_URL must include a host (and optional port).")
+        raise ConfigurationError(
+            "EXECTUNNEL_WSS_URL must include a host (and optional port)."
+        )
     return normalized
 
 
@@ -148,10 +152,18 @@ def get_app_config() -> AppConfig:
         wss_url=get_wss_url(),
         insecure=parse_bool_env("WSS_INSECURE"),
         bridge=BridgeConfig(
-            ping_interval=parse_int_env("WSS_PING_INTERVAL", CONFIG.ping_interval, min_value=1),
-            ping_timeout=parse_int_env("WSS_PING_TIMEOUT", CONFIG.ping_timeout, min_value=1),
-            send_timeout=parse_float_env("WSS_SEND_TIMEOUT", CONFIG.send_timeout, min_value=0.1),
-            send_queue_cap=parse_int_env("WSS_SEND_QUEUE_CAP", CONFIG.send_queue_cap, min_value=1),
+            ping_interval=parse_int_env(
+                "WSS_PING_INTERVAL", CONFIG.ping_interval, min_value=1
+            ),
+            ping_timeout=parse_int_env(
+                "WSS_PING_TIMEOUT", CONFIG.ping_timeout, min_value=1
+            ),
+            send_timeout=parse_float_env(
+                "WSS_SEND_TIMEOUT", CONFIG.send_timeout, min_value=0.1
+            ),
+            send_queue_cap=parse_int_env(
+                "WSS_SEND_QUEUE_CAP", CONFIG.send_queue_cap, min_value=1
+            ),
             reconnect_max_retries=parse_int_env(
                 "WSS_RECONNECT_MAX_RETRIES", CONFIG.reconnect_max_retries, min_value=0
             ),

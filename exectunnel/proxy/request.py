@@ -1,4 +1,5 @@
 """SOCKS5 request data class."""
+
 from __future__ import annotations
 
 import asyncio
@@ -7,7 +8,7 @@ from dataclasses import dataclass, field
 
 from exectunnel.exceptions import ProtocolError
 from exectunnel.protocol.enums import Cmd, Reply
-from exectunnel.proxy._codec import _build_reply
+from exectunnel.proxy._codec import build_reply
 from exectunnel.proxy.relay import UdpRelay
 
 
@@ -79,7 +80,7 @@ class Socks5Request:
             )
         # ConfigurationError from _build_reply (bad bind_host / bind_port)
         # propagates as-is — it is a caller bug, not a client error.
-        self.writer.write(_build_reply(Reply.SUCCESS, bind_host, bind_port))
+        self.writer.write(build_reply(Reply.SUCCESS, bind_host, bind_port))
 
     def reply_error(self, reply: Reply = Reply.GENERAL_FAILURE) -> None:
         """Queue an error reply into the writer buffer.
@@ -98,7 +99,7 @@ class Socks5Request:
         # the client receives a well-formed SOCKS5 rejection rather than a
         # bare TCP RST.  The subsequent drain() / close() calls in
         # send_reply_error() already suppress OSError.
-        self.writer.write(_build_reply(reply))
+        self.writer.write(build_reply(reply))
 
     # ── Async reply helpers (write + drain) ───────────────────────────────────
 

@@ -1,4 +1,5 @@
 """Protocol domain: frame codec, ID generation, SOCKS5 enums."""
+
 from exectunnel.protocol.enums import AddrType, AuthMethod, Cmd, Reply
 from exectunnel.protocol.frames import (
     BOOTSTRAP_CHUNK_SIZE_CHARS,

@@ -1,4 +1,5 @@
 """Frame encode/decode and protocol constants."""
+
 from __future__ import annotations
 
 # ── Frame protocol constants ──────────────────────────────────────────────────

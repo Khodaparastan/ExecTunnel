@@ -1,4 +1,5 @@
 """TcpConnectionWorker and flow ID generation."""
+
 from __future__ import annotations
 
 import secrets

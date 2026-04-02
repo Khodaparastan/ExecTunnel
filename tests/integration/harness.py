@@ -53,12 +53,13 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from typing import Any
 
+from _pytest import config
 from websockets.asyncio.server import ServerConnection, serve
 
-from exectunnel.core.config import AppConfig, BridgeConfig, get_tunnel_config
-from exectunnel.core.consts import FRAME_PREFIX, FRAME_SUFFIX, READY_FRAME
+from exectunnel.config import AppConfig, BridgeConfig, get_tunnel_config
 from exectunnel.helpers import parse_frame
-from exectunnel.tunnel import TunnelSession
+from exectunnel.protocol import FRAME_PREFIX, FRAME_SUFFIX, READY_FRAME
+from exectunnel.transport import TunnelSession
 
 logger = logging.getLogger(__name__)
 

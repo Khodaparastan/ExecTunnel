@@ -8,7 +8,7 @@ import struct
 import pytest
 
 from exectunnel.protocol.enums import AddrType, AuthMethod, Cmd, Reply
-from exectunnel.proxy._codec import _build_reply, _read_addr
+from exectunnel.proxy._codec import build_reply, read_addr
 from exectunnel.proxy.relay import UdpRelay
 from exectunnel.proxy.request import Socks5Request
 from exectunnel.proxy.server import Socks5Server
@@ -18,7 +18,7 @@ from exectunnel.proxy.server import Socks5Server
 
 class TestBuildReply:
     def test_success_ipv4(self) -> None:
-        data = _build_reply(Reply.SUCCESS, "127.0.0.1", 1080)
+        data = build_reply(Reply.SUCCESS, "127.0.0.1", 1080)
         assert data[0] == 0x05
         assert data[1] == int(Reply.SUCCESS)
         assert data[2] == 0x00
@@ -27,24 +27,24 @@ class TestBuildReply:
         assert port == 1080
 
     def test_general_failure(self) -> None:
-        data = _build_reply(Reply.GENERAL_FAILURE)
+        data = build_reply(Reply.GENERAL_FAILURE)
         assert data[1] == int(Reply.GENERAL_FAILURE)
 
     def test_cmd_not_supported(self) -> None:
-        data = _build_reply(Reply.CMD_NOT_SUPPORTED)
+        data = build_reply(Reply.CMD_NOT_SUPPORTED)
         assert data[1] == int(Reply.CMD_NOT_SUPPORTED)
 
     def test_ipv6_address(self) -> None:
-        data = _build_reply(Reply.SUCCESS, "::1", 0)
+        data = build_reply(Reply.SUCCESS, "::1", 0)
         assert data[3] == int(AddrType.IPV6)
 
     def test_invalid_bind_port_raises(self) -> None:
         with pytest.raises(ValueError, match="invalid bind_port"):
-            _build_reply(Reply.SUCCESS, "127.0.0.1", -1)
+            build_reply(Reply.SUCCESS, "127.0.0.1", -1)
 
     def test_domain_bind_host_raises(self) -> None:
         with pytest.raises(ValueError, match="RFC 1928"):
-            _build_reply(Reply.SUCCESS, "example.com", 0)
+            build_reply(Reply.SUCCESS, "example.com", 0)
 
 
 # ── _read_addr ────────────────────────────────────────────────────────────────
@@ -80,38 +80,38 @@ class TestReadAddr:
 
     async def test_ipv4(self) -> None:
         reader = self._make_reader(self._pack_ipv4("10.0.0.1", 8080))
-        host, port = await _read_addr(reader)
+        host, port = await read_addr(reader)
         assert host == "10.0.0.1"
         assert port == 8080
 
     async def test_domain(self) -> None:
         reader = self._make_reader(self._pack_domain("example.com", 443))
-        host, port = await _read_addr(reader)
+        host, port = await read_addr(reader)
         assert host == "example.com"
         assert port == 443
 
     async def test_ipv6(self) -> None:
         reader = self._make_reader(self._pack_ipv6("::1", 9000))
-        host, port = await _read_addr(reader)
+        host, port = await read_addr(reader)
         assert host == "::1"
         assert port == 9000
 
     async def test_unsupported_atyp(self) -> None:
         reader = self._make_reader(bytes([0x02]) + b"\x00" * 6)
         with pytest.raises(ValueError, match="unsupported ATYP"):
-            await _read_addr(reader)
+            await read_addr(reader)
 
     async def test_domain_with_invalid_utf8(self) -> None:
         reader = self._make_reader(
             bytes([AddrType.DOMAIN, 2]) + b"\xff\xff" + struct.pack("!H", 53)
         )
         with pytest.raises(ValueError, match="invalid DOMAIN bytes"):
-            await _read_addr(reader)
+            await read_addr(reader)
 
     async def test_domain_with_empty_length(self) -> None:
         reader = self._make_reader(bytes([AddrType.DOMAIN, 0]) + struct.pack("!H", 53))
         with pytest.raises(ValueError, match="DOMAIN length"):
-            await _read_addr(reader)
+            await read_addr(reader)
 
 
 class TestUdpRelay:
