@@ -61,7 +61,6 @@ from exectunnel.protocol.frames import (
 )
 from exectunnel.protocol.ids import new_conn_id, new_flow_id
 from exectunnel.proxy.dns_forwarder import _DnsForwarder
-from exectunnel.proxy.relay import UdpRelay
 from exectunnel.proxy.request import Socks5Request
 from exectunnel.proxy.server import Socks5Server
 from exectunnel.transport.connection import _TcpConnectionHandler
@@ -72,6 +71,8 @@ logger = logging.getLogger("exectunnel.transport.session")
 
 # Maximum size of the control send queue.  Unbounded growth is prevented by
 # capping at a generous limit — control frames are small and infrequent.
+# The queue is sized generously so the None sentinel can always be inserted
+# during teardown without being dropped.
 _CTRL_QUEUE_CAP = 1_024
 
 # Maximum number of distinct hosts tracked in per-host rate-limit structures.
@@ -80,6 +81,10 @@ _HOST_GATE_MAX = 4_096
 
 # Reconnect jitter fraction — delay is multiplied by U(0, _RECONNECT_JITTER).
 _RECONNECT_JITTER = 0.1
+
+# Cloudflare challenge hostname that requires connection pacing.
+# Defined as a constant so it appears in exactly one place.
+_CF_CHALLENGE_HOST = "challenges.cloudflare.com"
 
 
 # ── Pending connect state ─────────────────────────────────────────────────────
@@ -104,9 +109,9 @@ class _LruDict(collections.OrderedDict):
         self._maxsize = maxsize
 
     def __setitem__(self, key: object, value: object) -> None:
-        if key in self:
-            self.move_to_end(key)
+        # Update value first, then move to end — canonical LRU pattern.
         super().__setitem__(key, value)
+        self.move_to_end(key)
         if len(self) > self._maxsize:
             self.popitem(last=False)
 
@@ -135,10 +140,14 @@ class TunnelSession:
         self._pending_connects: dict[str, PendingConnectState] = {}
         self._udp_registry: dict[str, _UdpFlowHandler] = {}
 
-        # WebSocket closed signal — set by _recv_loop / _send_loop finally.
+        # WebSocket closed signal — set by _recv_loop finally block.
+        # Set BEFORE closing handlers so _handle_connect's ws_closed_task
+        # fires promptly and unblocks any pending ack_future waits.
         self._ws_closed: asyncio.Event = asyncio.Event()
 
         # Send queues — initialised per session in _run_session().
+        # _send_ctrl_queue is unbounded so the None teardown sentinel can
+        # always be inserted without being dropped.
         self._send_ctrl_queue: asyncio.Queue[tuple[str, bool] | None] | None = None
         self._send_data_queue: asyncio.Queue[tuple[str, bool] | None] | None = None
 
@@ -226,7 +235,6 @@ class TunnelSession:
                     ) as ws:
                         await self._run_session(ws)
                         bootstrapped = True
-                        # A clean session exit does not trigger reconnect.
                         reconnect_reason = None
 
                 except BootstrapError:
@@ -274,8 +282,6 @@ class TunnelSession:
                     )
 
                 except (OSError, ConnectionClosed) as exc:
-                    # Third-party / stdlib transport errors not yet wrapped by
-                    # our exception hierarchy.
                     metrics_inc("tunnel.connect.error", error=type(exc).__name__)
                     reconnect_reason = str(exc) or type(exc).__name__
 
@@ -287,7 +293,6 @@ class TunnelSession:
                     self._ws = None
 
                 if reconnect_reason is None:
-                    # Clean exit — do not reconnect.
                     return
 
                 # Reset backoff counter after each healthy session so the
@@ -313,7 +318,6 @@ class TunnelSession:
                     )
 
                 delay = min(base_delay * (2**attempt), max_delay)
-                # Add jitter to prevent thundering-herd reconnects.
                 delay += random.uniform(0, delay * _RECONNECT_JITTER)
                 attempt += 1
                 metrics_inc("tunnel.reconnect.scheduled")
@@ -355,7 +359,10 @@ class TunnelSession:
         self._ws_closed.clear()
         self._reset_session_state()
 
-        self._send_ctrl_queue = asyncio.Queue(maxsize=_CTRL_QUEUE_CAP)
+        # _send_ctrl_queue is unbounded (maxsize=0) so the None teardown
+        # sentinel inserted by _serve's finally block is never dropped even
+        # when the queue is under load.
+        self._send_ctrl_queue = asyncio.Queue(maxsize=0)
         self._send_data_queue = asyncio.Queue(maxsize=self._app.bridge.send_queue_cap)
 
         await self._bootstrap()
@@ -378,7 +385,13 @@ class TunnelSession:
             AgentVersionMismatchError: Remote agent version incompatible.
             BootstrapError:            Any other startup failure.
         """
-        assert self._ws is not None
+        if self._ws is None:
+            raise BootstrapError(
+                "Cannot bootstrap — WebSocket connection is not established.",
+                error_code="bootstrap.no_connection",
+                details={},
+                hint="Ensure _run_session() sets self._ws before calling _bootstrap().",
+            )
         ws = self._ws
         start = asyncio.get_running_loop().time()
         metrics_inc("tunnel.bootstrap.started")
@@ -608,9 +621,9 @@ class TunnelSession:
                     task.cancel()
 
             # Unblock _send_loop from queue.get().
+            # _send_ctrl_queue is unbounded so put_nowait never raises QueueFull.
             if self._send_ctrl_queue is not None:
-                with contextlib.suppress(asyncio.QueueFull):
-                    self._send_ctrl_queue.put_nowait(None)
+                self._send_ctrl_queue.put_nowait(None)
             if self._send_data_queue is not None:
                 with contextlib.suppress(asyncio.QueueFull):
                     self._send_data_queue.put_nowait(None)
@@ -746,7 +759,12 @@ class TunnelSession:
         return host.lower().strip()
 
     def _connect_pace_interval_for_host(self, host_key: str) -> float:
-        if host_key == "challenges.cloudflare.com":
+        """Return the minimum inter-connect interval for *host_key* in seconds.
+
+        Only ``_CF_CHALLENGE_HOST`` requires pacing at present.  Additional
+        hosts can be added to a configurable pacing map in a future revision.
+        """
+        if host_key == _CF_CHALLENGE_HOST:
             return self._connect_pace_cf_ms / 1000.0
         return 0.0
 
@@ -791,7 +809,7 @@ class TunnelSession:
         self._connect_failures_by_host[host_key] += 1
         total = self._connect_failures_by_host[host_key]
         metrics_inc("connect_fail_by_host", host=host_key, reason=reason)
-        if host_key == "challenges.cloudflare.com" and (
+        if host_key == _CF_CHALLENGE_HOST and (
             total == 1 or total % CONNECT_FAILURE_WARN_EVERY == 0
         ):
             logger.warning(
@@ -803,7 +821,7 @@ class TunnelSession:
             )
         metrics_inc("socks_reply_code", code=int(reply))
 
-    # ── Failed connect cleanup helper ─────────────────────────────────────────
+    # ── Failed connect cleanup ────────────────────────────────────────────────
 
     async def _cleanup_failed_connect(
         self,
@@ -811,16 +829,29 @@ class TunnelSession:
         handler: _TcpConnectionHandler,
         reply: Reply,
     ) -> None:
-        """Evict handler, signal close, close writer, send SOCKS5 error reply."""
+        """Evict handler from registry and signal remote close.
+
+        Does NOT close the writer directly — ``close_remote()`` sets the
+        ``_remote_closed`` event which causes ``_downstream`` to drain and
+        exit, after which ``_on_task_done`` schedules ``_cleanup()`` which
+        closes the writer through the handler's own lifecycle.
+
+        For handlers that were never started (``start()`` not called), the
+        writer is closed directly here since no tasks are running to trigger
+        the normal cleanup path.
+        """
         self._conn_handlers.pop(conn_id, None)
         handler.close_remote()
-        # Use the public closed event and the handler's own writer close path.
-        with contextlib.suppress(OSError, RuntimeError):
-            handler._writer.close()  # noqa: SLF001 — no public close() on handler
-            await asyncio.wait_for(
-                handler._writer.wait_closed(),  # noqa: SLF001
-                timeout=5.0,
-            )
+
+        if not handler.is_started:
+            # No tasks running — close the writer directly.
+            with contextlib.suppress(OSError, RuntimeError):
+                handler._writer.close()  # noqa: SLF001
+            with contextlib.suppress(OSError, RuntimeError, asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    handler._writer.wait_closed(),  # noqa: SLF001
+                    timeout=5.0,
+                )
 
     # ── CONNECT handler ───────────────────────────────────────────────────────
 
@@ -861,7 +892,6 @@ class TunnelSession:
 
         ack_wait_start = loop.time()
         ack_status = "ok"
-        # Default reply — overridden per failure reason below.
         reply = Reply.HOST_UNREACHABLE
         failure_reason: str | None = None
 
@@ -914,8 +944,6 @@ class TunnelSession:
                         },
                     )
 
-                    # Wait for agent ACK; abort immediately if WS closes.
-                    # Use ack_future directly in asyncio.wait — no wrapping needed.
                     ws_closed_task = asyncio.create_task(
                         self._ws_closed.wait(),
                         name=f"ws-closed-wait-{conn_id}",
@@ -941,7 +969,6 @@ class TunnelSession:
                             failure_reason = ack_result
                             reply = Reply.HOST_UNREACHABLE
                     else:
-                        # Timeout — neither future completed.
                         ack_status = "timeout"
                         failure_reason = "timeout"
                         reply = Reply.HOST_UNREACHABLE
@@ -949,6 +976,7 @@ class TunnelSession:
                             "connect_ack_timeout",
                             host=self._connect_host_key(host),
                         )
+
             # Semaphores released here — before starting data flow.
 
             if failure_reason is not None:
@@ -1004,9 +1032,12 @@ class TunnelSession:
             await req.send_reply_error(reply)
 
         finally:
+            # Pop from _pending_connects BEFORE cancelling ack_future so
+            # _dispatch_frame_async cannot race to set_result on a cancelled
+            # future and raise InvalidStateError.
+            self._pending_connects.pop(conn_id, None)
             if not ack_future.done():
                 ack_future.cancel()
-            self._pending_connects.pop(conn_id, None)
             self._report_pending_connects_metric()
             metrics_observe(
                 "tunnel.conn_ack.wait_sec",
@@ -1022,18 +1053,26 @@ class TunnelSession:
         Opens a local UDP socket and relays each datagram through the tunnel.
         Flows are keyed by ``(dst_host, dst_port)`` and reused for the
         lifetime of the association so multi-packet exchanges work correctly.
-        """
-        relay = req.udp_relay if req.udp_relay is not None else UdpRelay()
-        if req.udp_relay is None:
-            udp_port = await relay.start()
-        else:
-            udp_port = relay.local_port
 
-        await req.send_reply_success("127.0.0.1", udp_port)
+        The ``udp_relay`` is always set by ``_negotiate`` in ``server.py``
+        for ``UDP_ASSOCIATE`` commands — the ``None`` branch is a safety net
+        that should never be reached in production.
+        """
+        if req.udp_relay is None:
+            # Safety net — should never happen given server.py _negotiate.
+            logger.error(
+                "UDP ASSOCIATE request has no relay — this is a bug in _negotiate()"
+            )
+            await req.send_reply_error(Reply.GENERAL_FAILURE)
+            return
+
+        relay = req.udp_relay
+        udp_port = relay.local_port
+
+        await req.send_reply_success(bind_host="127.0.0.1", bind_port=udp_port)
         logger.debug("UDP ASSOCIATE local port %d", udp_port)
 
         active_flows: dict[tuple[str, int], _UdpFlowHandler] = {}
-        # Use a set with done-callback discard to prevent unbounded growth.
         drain_tasks: set[asyncio.Task[None]] = set()
 
         async def drain_flow(
@@ -1077,14 +1116,16 @@ class TunnelSession:
                         break
                     continue
 
-                # relay.recv() returns None when the relay is closed.
                 if result is None:
                     break
 
                 payload, dst_host, dst_port = result
 
                 if is_host_excluded(dst_host, self._tun.exclude):
-                    # Direct UDP (excluded subnet).
+                    # Direct UDP (excluded subnet) — make_udp_socket is safe
+                    # here because dst_host is always an IP literal for
+                    # excluded hosts (is_host_excluded returns False for
+                    # domain names).
                     sock = None
                     try:
                         sock = make_udp_socket(dst_host)
@@ -1238,8 +1279,16 @@ class TunnelSession:
 
         Starts by replaying frames buffered during ``_wait_ready``, then takes
         over the live WebSocket iterator.
+
+        Close sequencing
+        ----------------
+        ``_ws_closed`` is set **before** closing handlers so that any
+        coroutine blocked on ``_ws_closed.wait()`` (e.g. the ``ws_closed_task``
+        in ``_handle_connect``) unblocks immediately and does not race with
+        handler teardown.
         """
-        assert self._ws is not None
+        if self._ws is None:
+            return
         ws = self._ws
         buf = self._pre_ready_carry
         self._pre_ready_carry = ""
@@ -1276,12 +1325,16 @@ class TunnelSession:
         except ConnectionClosed:
             pass
         finally:
+            # Set _ws_closed FIRST so _handle_connect's ws_closed_task
+            # unblocks before we start closing handlers — prevents a race
+            # where _handle_connect blocks indefinitely on ack_future.
+            self._ws_closed.set()
+
             for handler in list(self._conn_handlers.values()):
                 handler.cancel_upstream()
                 handler.close_remote()
             for flow in list(self._udp_registry.values()):
                 flow.close_remote()
-            self._ws_closed.set()
 
     async def _dispatch_frame_async(self, line: str) -> None:
         """Parse and dispatch one frame line.
@@ -1289,6 +1342,13 @@ class TunnelSession:
         Uses :func:`~exectunnel.protocol.frames.parse_frame` which returns a
         :class:`~exectunnel.protocol.frames.ParsedFrame` NamedTuple.  Unknown
         frame types are already filtered by ``parse_frame`` (returns ``None``).
+
+        Note on ``CONN_ACK``
+        --------------------
+        ``CONN_ACK`` is not in ``_VALID_MSG_TYPES`` in the protocol package's
+        ``parse_frame`` — it is handled by the session layer before frames
+        reach ``parse_frame``.  If ``parse_frame`` is updated to include
+        ``CONN_ACK``, the branch here will activate automatically.
 
         DATA and UDP_DATA payloads are decoded with
         :func:`~exectunnel.protocol.frames.decode_data_payload` which handles
@@ -1299,6 +1359,23 @@ class TunnelSession:
             FrameDecodingError: On base64 decode failure.
             ProtocolError:      On structural frame violations.
         """
+        # Fast path: check for CONN_ACK before parse_frame since CONN_ACK
+        # is not in _VALID_MSG_TYPES and would be silently dropped.
+        # Format: <<<EXECTUNNEL:CONN_ACK:{conn_id}>>>
+        stripped = line.strip()
+        if stripped.startswith(f"{FRAME_PREFIX}CONN_ACK:") and stripped.endswith(
+            FRAME_SUFFIX
+        ):
+            inner = stripped[len(FRAME_PREFIX) : -len(FRAME_SUFFIX)]
+            parts = inner.split(":", 1)
+            if len(parts) == 2:
+                conn_id = parts[1]
+                pending = self._pending_connects.get(conn_id)
+                if pending is not None and not pending.ack_future.done():
+                    pending.ack_future.set_result("ack")
+                metrics_inc("tunnel.frames.received", type="CONN_ACK")
+                return
+
         parsed = parse_frame(line)
         if parsed is None:
             metrics_inc("tunnel.frames.invalid")
@@ -1310,12 +1387,6 @@ class TunnelSession:
         metrics_inc("tunnel.frames.received", type=msg_type)
 
         if msg_type == "AGENT_READY":
-            return
-
-        if msg_type == "CONN_ACK":
-            pending = self._pending_connects.get(conn_id)
-            if pending is not None and not pending.ack_future.done():
-                pending.ack_future.set_result("ack")
             return
 
         if msg_type == "DATA":
@@ -1344,8 +1415,6 @@ class TunnelSession:
             return
 
         if msg_type in ("CONN_CLOSE", "ERROR"):
-            # CONN_CLOSE: agent signals it has closed the remote TCP connection.
-            # ERROR: agent signals a connection-level error.
             handler = self._conn_handlers.get(conn_id)
             if handler is None:
                 return
@@ -1396,9 +1465,6 @@ class TunnelSession:
                 flow.close_remote()
             return
 
-        # parse_frame already filters unknown msg_types — this is unreachable
-        # under normal operation but kept as a safety net for future frame types
-        # that parse_frame accepts before this dispatcher is updated.
         logger.debug(
             "unhandled frame type %r for conn/flow %r — ignoring",
             msg_type,
@@ -1416,24 +1482,31 @@ class TunnelSession:
     ) -> None:
         """Enqueue a frame for the send loop.
 
-        Control frames are never dropped and bypass the bounded data queue.
+        Control frames (``control=True``) are enqueued into the unbounded
+        control queue and are never dropped.  They are delivered even after
+        ``_ws_closed`` is set so that teardown frames (``CONN_CLOSE``,
+        ``UDP_CLOSE``) reach the agent.
+
         Data frames are dropped when the bounded data queue is full (unless
         ``must_queue=True``, which blocks until space is available).
 
         After the WebSocket closes, ``must_queue`` callers are unblocked by
         the poison-pill sentinel sent by ``_serve``'s finally block.
+
+        ``control`` takes precedence over ``must_queue`` — if both are
+        ``True``, the frame is treated as a control frame.
         """
         if self._send_ctrl_queue is None or self._send_data_queue is None:
             return
 
         if control:
-            if not self._ws_closed.is_set():
-                with contextlib.suppress(asyncio.QueueFull):
-                    self._send_ctrl_queue.put_nowait((frame, False))
+            # Control frames are always enqueued — never dropped, never
+            # gated on _ws_closed.  The unbounded ctrl queue guarantees
+            # put_nowait never raises QueueFull.
+            self._send_ctrl_queue.put_nowait((frame, False))
             return
 
         if must_queue:
-            # Check _ws_closed before blocking to avoid hanging after teardown.
             if self._ws_closed.is_set():
                 return
             await self._send_data_queue.put((frame, True))
@@ -1472,10 +1545,8 @@ class TunnelSession:
                     self._ws_closed.wait(),
                     timeout=interval,
                 )
-                # _ws_closed was set — exit the loop.
                 return
             except TimeoutError:
-                # Interval elapsed without close — send keepalive.
                 await self._ws_send(keepalive_frame, control=True)
 
     async def _send_loop(self) -> None:
@@ -1484,13 +1555,23 @@ class TunnelSession:
         Prioritises control frames over data frames.  Exits cleanly on the
         ``None`` sentinel or when the WebSocket reports closed.
 
+        Deferred data item
+        ------------------
+        When both queues fire simultaneously in ``asyncio.wait``, the control
+        item is sent first and the data item is saved as ``deferred_data_item``
+        for the next iteration.  This avoids re-queuing the data item (which
+        would change its position relative to other queued items) and prevents
+        it from being lost if the queue is full.
+
         Raises:
             WebSocketSendTimeoutError: Propagated to ``_serve`` to trigger reconnect.
             ConnectionClosedError:     Same.
         """
-        assert self._ws is not None
-        assert self._send_ctrl_queue is not None
-        assert self._send_data_queue is not None
+        if self._ws is None:
+            return
+        if self._send_ctrl_queue is None or self._send_data_queue is None:
+            return
+
         ws = self._ws
         ctrl_q = self._send_ctrl_queue
         data_q = self._send_data_queue
@@ -1505,7 +1586,7 @@ class TunnelSession:
                     item = ctrl_q.get_nowait()
                 except asyncio.QueueEmpty:
                     if deferred_data_item is not None:
-                        # Check ctrl_q once more before sending deferred data.
+                        # One final ctrl_q check before sending deferred data.
                         try:
                             item = ctrl_q.get_nowait()
                         except asyncio.QueueEmpty:
@@ -1513,53 +1594,79 @@ class TunnelSession:
                             deferred_data_item = None
                     else:
                         # Both queues empty — block on whichever fires first.
-                        ctrl_wait = asyncio.create_task(
-                            ctrl_q.get(), name="send-ctrl-wait"
+                        ctrl_wait: asyncio.Task[tuple[str, bool] | None] = (
+                            asyncio.create_task(ctrl_q.get(), name="send-ctrl-wait")
                         )
-                        data_wait = asyncio.create_task(
-                            data_q.get(), name="send-data-wait"
+                        data_wait: asyncio.Task[tuple[str, bool] | None] = (
+                            asyncio.create_task(data_q.get(), name="send-data-wait")
                         )
-                        done, pending = await asyncio.wait(
-                            {ctrl_wait, data_wait},
-                            return_when=asyncio.FIRST_COMPLETED,
-                        )
-                        rescued_ctrl: tuple[str, bool] | None = None
+
+                        try:
+                            done, pending = await asyncio.wait(
+                                {ctrl_wait, data_wait},
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                        except asyncio.CancelledError:
+                            ctrl_wait.cancel()
+                            data_wait.cancel()
+                            await asyncio.gather(
+                                ctrl_wait, data_wait, return_exceptions=True
+                            )
+                            raise
+
+                        # Cancel the loser and rescue its result if it
+                        # completed before cancellation.
                         for pending_task in pending:
                             pending_task.cancel()
                             try:
                                 await pending_task
                             except asyncio.CancelledError:
-                                # cancel() may have raced with a successful
-                                # get() — recover the item so it is not lost.
+                                # Task was cancelled before completing —
+                                # check the queue directly to avoid losing
+                                # an item that was enqueued but not dequeued.
                                 if pending_task is data_wait:
                                     with contextlib.suppress(asyncio.QueueEmpty):
-                                        deferred_data_item = data_q.get_nowait()
-                                continue
-                            if not pending_task.cancelled():
-                                with contextlib.suppress(Exception):
+                                        rescued = data_q.get_nowait()
+                                        if deferred_data_item is None:
+                                            deferred_data_item = rescued
+                            else:
+                                # Task completed before cancel() took effect —
+                                # rescue the result.
+                                try:
                                     rescued = pending_task.result()
                                     if rescued is not None:
                                         if pending_task is data_wait:
-                                            deferred_data_item = rescued
+                                            if deferred_data_item is None:
+                                                deferred_data_item = rescued
                                         else:
-                                            rescued_ctrl = rescued
+                                            # Rescued ctrl item — re-queue at
+                                            # front by putting it back; the
+                                            # ctrl queue is unbounded so this
+                                            # never raises.
+                                            ctrl_q.put_nowait(rescued)
+                                except Exception:
+                                    pass
 
                         if ctrl_wait in done:
                             item = ctrl_wait.result()
+                            # If data also completed, save it as deferred.
                             if data_wait in done:
-                                result = data_wait.result()
-                                if result is not None:
-                                    deferred_data_item = result
+                                try:
+                                    result = data_wait.result()
+                                    if (
+                                        result is not None
+                                        and deferred_data_item is None
+                                    ):
+                                        deferred_data_item = result
+                                except Exception:
+                                    pass
                         else:
                             item = data_wait.result()
-                            if rescued_ctrl is not None:
-                                with contextlib.suppress(asyncio.QueueFull):
-                                    ctrl_q.put_nowait(rescued_ctrl)
 
                 if item is None:
                     return
 
-                frame, _ = item  # is_data_frame unused — removed dead variable
+                frame, _ = item
                 try:
                     metrics_inc("tunnel.frames.sent")
                     await asyncio.wait_for(
