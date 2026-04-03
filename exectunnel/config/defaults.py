@@ -48,6 +48,9 @@ BOOTSTRAP_RM_DELAY_SECS: float = 0.05
 BOOTSTRAP_DECODE_DELAY_SECS: float = 0.1
 BOOTSTRAP_DIAG_MAX_LINES: int = 20
 
+# -- Session consts
+BOOTSTRAP_CHUNK_SIZE_CHARS: int = 200
+PIPE_READ_CHUNK_BYTES: int = 4_096
 # ── Send / Metrics ────────────────────────────────────────────────────────────
 
 SEND_DROP_LOG_EVERY: int = 100
