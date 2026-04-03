@@ -13,11 +13,6 @@ Utility functions for the exectunnel package.
 ``validate_exclusions``
     Validate a raw exclusion list into typed network objects.
 
-All protocol frame helpers (``encode_conn_open_frame``, ``parse_frame``, etc.)
-and ID generators (``new_conn_id``, ``new_flow_id``) are imported directly
-from ``exectunnel.protocol.frames`` and ``exectunnel.protocol.ids`` — they are
-not re-exported from this module.
-
 Note on ``make_udp_socket``
 ---------------------------
 ``make_udp_socket`` performs a synchronous ``socket.getaddrinfo`` call for
