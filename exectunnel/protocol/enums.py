@@ -42,3 +42,8 @@ class Reply(IntEnum):
     TTL_EXPIRED = 0x06
     CMD_NOT_SUPPORTED = 0x07
     ADDR_NOT_SUPPORTED = 0x08
+
+class UserPassStatus(IntEnum):
+    """RFC 1929 §2 username/password auth reply codes."""
+    SUCCESS = 0x00
+    FAILURE = 0xFF
