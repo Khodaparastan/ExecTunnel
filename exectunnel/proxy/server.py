@@ -1,4 +1,4 @@
-"""SOCKS5 server — asyncio, no auth."""
+"""SOCKS5 server — asyncio, no-auth (RFC 1928)."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from exectunnel.proxy._codec import build_reply, read_addr, read_exact
 from exectunnel.proxy.relay import UdpRelay
 from exectunnel.proxy.request import Socks5Request
 
-logger = logging.getLogger("exectunnel.proxy")
+logger = logging.getLogger("exectunnel.proxy.server")
 
 
 class Socks5Server:
@@ -40,6 +40,12 @@ class Socks5Server:
         async for req in server:
             asyncio.create_task(handle(req))
         await server.stop()
+
+    Or as an async context manager::
+
+        async with Socks5Server("127.0.0.1", 1080) as server:
+            async for req in server:
+                asyncio.create_task(handle(req))
     """
 
     def __init__(
@@ -111,6 +117,7 @@ class Socks5Server:
         """Close the listen socket, cancel in-flight handshakes, drain the queue.
 
         Safe to call before :meth:`start` — a no-op in that case.
+        Idempotent — subsequent calls are no-ops.
         """
         if self._stopped:
             return
@@ -182,7 +189,6 @@ class Socks5Server:
         if task is not None:
             self._handshake_tasks.add(task)
 
-        # Capture start time before span setup to exclude tracing overhead.
         start = asyncio.get_running_loop().time()
 
         with span("socks5.handshake"):
@@ -283,14 +289,19 @@ class Socks5Server:
         Returns ``None`` when the command is valid but not supported (e.g.
         ``BIND``) — the appropriate SOCKS5 error reply has already been sent.
 
+        The ``relay_port`` for ``UDP_ASSOCIATE`` is stored on
+        ``Socks5Request.udp_relay.local_port`` — callers MUST pass it as
+        ``bind_port`` to :meth:`~Socks5Request.send_reply_success` so the
+        SOCKS5 client knows which port to send datagrams to (RFC 1928 §7).
+
         Raises:
             ProtocolError:
                 * Non-SOCKS5 greeting (bad version byte).
+                * Client offers zero authentication methods.
                 * Client does not offer ``NO_AUTH``.
                 * Bad request version byte.
                 * Non-zero RSV byte.
                 * Unsupported ``CMD`` byte.
-                * Zero destination port for ``CONNECT``.
                 * Address parse errors (propagated from :func:`read_addr`).
             TransportError:
                 UDP relay socket cannot be bound during ``UDP_ASSOCIATE``
@@ -313,7 +324,7 @@ class Socks5Server:
             )
 
         nmethods = header[1]
-        # Guard against nmethods=0 before calling read_exact.
+        # Guard against nmethods=0 before calling read_exact (which rejects n<1).
         if nmethods == 0:
             await _write_and_drain_suppress(writer, bytes([0x05, AuthMethod.NO_ACCEPT]))
             raise ProtocolError(
@@ -364,7 +375,10 @@ class Socks5Server:
                 f"SOCKS5 request RSV byte is {req_header[2]:#x}, expected 0x00.",
                 error_code="protocol.socks5_bad_rsv",
                 details={"received_rsv": hex(req_header[2])},
-                hint="The SOCKS5 client sent a non-zero RSV byte, violating RFC 1928 §4.",
+                hint=(
+                    "The SOCKS5 client sent a non-zero RSV byte, "
+                    "violating RFC 1928 §4."
+                ),
             )
 
         try:
@@ -397,13 +411,16 @@ class Socks5Server:
             )
 
         if cmd == Cmd.UDP_ASSOCIATE:
-            # Pass the client's declared address as a hint for source filtering.
-            # RFC 1928 §7: the host/port may be 0.0.0.0:0 if the client does
-            # not know its sending address; UdpRelay.start() handles that case.
+            # RFC 1928 §7: the host/port in the request is the client's
+            # declared sending address.  It may be 0.0.0.0:0 if the client
+            # does not know its sending address; UdpRelay.start() handles that.
             relay = UdpRelay()
-            relay_port = await relay.start(
+            await relay.start(
                 expected_client_addr=(host, port) if port != 0 else None
             )
+            # relay.local_port is the ephemeral port the relay is bound to.
+            # The caller MUST pass it as bind_port to send_reply_success() so
+            # the SOCKS5 client knows where to send datagrams (RFC 1928 §7).
             return Socks5Request(
                 cmd=cmd,
                 host=host,
@@ -413,9 +430,30 @@ class Socks5Server:
                 udp_relay=relay,
             )
 
-        # BIND and any future unknown commands.
+        # BIND — known but explicitly unsupported.
+        if cmd == Cmd.BIND:
+            await _write_and_drain_suppress(
+                writer, build_reply(Reply.CMD_NOT_SUPPORTED)
+            )
+            logger.debug(
+                "socks5 BIND command rejected (not implemented) for %s:%d",
+                host,
+                port,
+            )
+            return None
+
+        # Exhaustive guard — should be unreachable given Cmd enum coverage,
+        # but protects against future enum additions that miss a branch here.
         await _write_and_drain_suppress(writer, build_reply(Reply.CMD_NOT_SUPPORTED))
-        return None
+        raise ProtocolError(
+            f"Unhandled SOCKS5 command: {cmd!r}.",
+            error_code="protocol.socks5_unhandled_cmd",
+            details={"cmd": cmd.name, "cmd_value": int(cmd)},
+            hint=(
+                "This is an exectunnel bug — a new Cmd enum value was added "
+                "without a corresponding handler in _negotiate()."
+            ),
+        )
 
 
 # ── Module-level helpers ──────────────────────────────────────────────────────

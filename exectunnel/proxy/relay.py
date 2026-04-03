@@ -13,16 +13,17 @@ from exectunnel.config.defaults import UDP_SEND_QUEUE_CAP, UDP_WARN_EVERY
 from exectunnel.exceptions import ProtocolError, TransportError
 from exectunnel.observability import metrics_inc
 from exectunnel.protocol.enums import AddrType
+from exectunnel.proxy._codec import _validate_domain
 
-logger = logging.getLogger("exectunnel.proxy")
+logger = logging.getLogger("exectunnel.proxy.relay")
 
-# Maximum UDP payload we will accept from the SOCKS5 client.
-# 65507 = 65535 − 20 (IP) − 8 (UDP); anything larger is physically impossible
-# over standard IPv4 but we cap at a sane application limit.
+# Maximum UDP payload accepted from the SOCKS5 client.
+# 65507 = 65535 − 20 (IP header) − 8 (UDP header).
+# Anything larger is physically impossible over standard IPv4.
 MAX_UDP_PAYLOAD_BYTES: Final[int] = 65_507
 
 
-# ── Datagram protocol (module-level, not recreated per start()) ───────────────
+# ── Datagram protocol ─────────────────────────────────────────────────────────
 
 
 class _RelayDatagramProtocol(asyncio.DatagramProtocol):
@@ -36,9 +37,8 @@ class _RelayDatagramProtocol(asyncio.DatagramProtocol):
 
     def error_received(self, exc: Exception) -> None:
         # OS-level socket errors (e.g. ICMP port-unreachable) are not
-        # actionable per-datagram; count them and log at DEBUG with the
-        # exception type so operators can distinguish ECONNREFUSED from
-        # other errors in dashboards.
+        # actionable per-datagram; count them and log at DEBUG so operators
+        # can distinguish ECONNREFUSED from other errors in dashboards.
         metrics_inc(
             "socks5.udp_relay.socket_error",
             reason=type(exc).__name__,
@@ -62,18 +62,17 @@ class UdpRelay:
 
     Strips/adds SOCKS5 UDP headers (RFC 1928 §7).  The socket is bound to an
     ephemeral port on ``127.0.0.1``; the actual bound port is returned by
-    :meth:`start`.
+    :meth:`start` and also available via :attr:`local_port`.
 
     Lifecycle::
 
         relay = UdpRelay()
-        port = await relay.start()  # bind
-        ...
-        item = await relay.recv()  # (payload, host, port) | None
-        relay.send_to_client(data, h, p)  # wrap + send back
-        relay.close()  # tear down
+        port = await relay.start()          # bind; returns ephemeral port
+        item = await relay.recv()           # (payload, host, port) | None
+        relay.send_to_client(data, h, p)    # wrap + send back to client
+        relay.close()                       # tear down
 
-    The relay is also usable as an async context manager::
+    Async context manager usage::
 
         async with UdpRelay() as relay:
             port = relay.local_port
@@ -82,18 +81,29 @@ class UdpRelay:
 
     def __init__(self) -> None:
         self._transport: asyncio.DatagramTransport | None = None
+
+        # Bounded inbound queue.  The sentinel channel uses a separate
+        # one-slot queue so close() can always deliver None even when the
+        # main queue is full — eliminating the liveness hole that arises
+        # when put_nowait(None) is suppressed on a full queue.
         self._queue: asyncio.Queue[tuple[bytes, str, int] | None] = asyncio.Queue(
             UDP_SEND_QUEUE_CAP
         )
+        self._close_event: asyncio.Event = asyncio.Event()
+
         self._local_port: int = 0
         self._closed: bool = False
         self._started: bool = False
+
         # Address of the first SOCKS5 client that sends a datagram.
         self._client_addr: tuple[str, int] | None = None
         # Optional hint from the UDP_ASSOCIATE request (may be 0.0.0.0:0).
         self._expected_client_addr: tuple[str, int] | None = None
+
+        # Telemetry counters.
         self._drop_count: int = 0
         self._foreign_client_count: int = 0
+        self._accepted_count: int = 0
 
     # ── Async context manager ─────────────────────────────────────────────────
 
@@ -135,7 +145,7 @@ class UdpRelay:
             )
         self._started = True
 
-        # Record the client hint if it carries a meaningful address.
+        # Record the client hint only when it carries a meaningful address.
         if expected_client_addr is not None:
             host, port = expected_client_addr
             try:
@@ -168,19 +178,29 @@ class UdpRelay:
         self._transport = transport
         self._local_port = transport.get_extra_info("sockname")[1]
         metrics_inc("socks5.udp_relay.started")
+        logger.debug("udp relay bound on 127.0.0.1:%d", self._local_port)
         return self._local_port
 
     def close(self) -> None:
-        """Close the relay and unblock any coroutine awaiting :meth:`recv`."""
+        """Close the relay and unblock any coroutine awaiting :meth:`recv`.
+
+        Idempotent — safe to call multiple times.
+
+        The close sentinel is delivered via a dedicated :class:`asyncio.Event`
+        rather than a queue item, so it is guaranteed to unblock :meth:`recv`
+        even when the inbound queue is completely full.
+        """
         if self._closed:
             return
         self._closed = True
         metrics_inc("socks5.udp_relay.closed")
+        logger.debug("udp relay closing (port=%d)", self._local_port)
+
         if self._transport is not None:
             self._transport.close()
-        # Unblock any coroutine awaiting recv() with the None sentinel.
-        with contextlib.suppress(asyncio.QueueFull):
-            self._queue.put_nowait(None)
+
+        # Signal recv() to return None — always succeeds regardless of queue state.
+        self._close_event.set()
 
     # ── Inbound (client → relay) ──────────────────────────────────────────────
 
@@ -207,7 +227,6 @@ class UdpRelay:
 
         # ── Client address binding / filtering ────────────────────────────────
         if self._client_addr is None:
-            # If we have a hint from the UDP_ASSOCIATE request, enforce it.
             if (
                 self._expected_client_addr is not None
                 and addr != self._expected_client_addr
@@ -225,6 +244,12 @@ class UdpRelay:
                 return
             self._client_addr = addr
             metrics_inc("socks5.udp_relay.client_bound")
+            logger.debug(
+                "udp relay client bound to %s:%d (port=%d)",
+                addr[0],
+                addr[1],
+                self._local_port,
+            )
         elif addr != self._client_addr:
             self._foreign_client_count += 1
             metrics_inc("socks5.udp_relay.foreign_client_drop")
@@ -234,7 +259,7 @@ class UdpRelay:
             ):
                 logger.warning(
                     "udp relay dropping datagram from unexpected client %s:%d "
-                    "(expected %s:%d, total_drops=%d)",
+                    "(expected %s:%d, total_foreign_drops=%d)",
                     addr[0],
                     addr[1],
                     self._client_addr[0],
@@ -263,20 +288,29 @@ class UdpRelay:
         # ── Enqueue ───────────────────────────────────────────────────────────
         try:
             self._queue.put_nowait((payload, host, port))
+            self._accepted_count += 1
             metrics_inc("socks5.udp_relay.datagram.accepted")
         except asyncio.QueueFull:
             self._drop_count += 1
             metrics_inc("socks5.udp_relay.queue_drop")
             if self._drop_count == 1 or self._drop_count % UDP_WARN_EVERY == 0:
                 logger.warning(
-                    "udp relay inbound queue full, dropping datagram (total_drops=%d)",
+                    "udp relay inbound queue full, dropping datagram "
+                    "(total_queue_drops=%d, port=%d)",
                     self._drop_count,
+                    self._local_port,
                 )
 
     # ── Outbound (relay → client) ─────────────────────────────────────────────
 
     async def recv(self) -> tuple[bytes, str, int] | None:
         """Return the next ``(payload, host, port)`` from the SOCKS5 client.
+
+        Blocks until a datagram is available or the relay is closed.
+
+        The close sentinel is delivered via an :class:`asyncio.Event` that
+        races against the queue, so this method always returns promptly after
+        :meth:`close` is called — even when the inbound queue is full.
 
         Returns:
             A ``(payload, host, port)`` tuple, or ``None`` when the relay has
@@ -285,16 +319,50 @@ class UdpRelay:
         Raises:
             asyncio.CancelledError: Propagated as-is — never suppressed.
         """
-        # Queue.get() only raises CancelledError; no other exception is
-        # possible, so the broad except-Exception wrapper from the original
-        # implementation is intentionally omitted.
-        return await self._queue.get()
+        if self._closed and self._queue.empty():
+            return None
+
+        # Race the queue against the close event so a full queue never
+        # prevents close() from unblocking this coroutine.
+        queue_task = asyncio.ensure_future(self._queue.get())
+        close_task = asyncio.ensure_future(self._close_event.wait())
+
+        try:
+            done, pending = await asyncio.wait(
+                {queue_task, close_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except asyncio.CancelledError:
+            queue_task.cancel()
+            close_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await queue_task
+            with contextlib.suppress(asyncio.CancelledError):
+                await close_task
+            raise
+
+        # Cancel the loser.
+        for task in pending:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        if close_task in done and queue_task not in done:
+            return None
+
+        # queue_task completed — may have a real item or the relay closed
+        # while we were waiting and the queue drained.
+        result = queue_task.result() if queue_task in done else None
+        return result
 
     def send_to_client(self, payload: bytes, src_host: str, src_port: int) -> None:
         """Wrap *payload* in a SOCKS5 UDP header and send it back to the client.
 
         Non-IP ``src_host`` values are dropped with a debug log — RFC 1928 §7
         requires ``BND.ADDR`` in UDP replies to be an IP address.
+
+        If the client address has not yet been bound (no datagram received),
+        the packet is dropped and logged at DEBUG level.
 
         Args:
             payload:  Raw datagram bytes to wrap and forward.
@@ -319,7 +387,20 @@ class UdpRelay:
                 f"send_to_client() src_port {src_port!r} is out of range [0, 65535]."
             )
 
-        if self._transport is None or self._closed or self._client_addr is None:
+        if self._transport is None or self._closed:
+            return
+
+        if self._client_addr is None:
+            # Tunnel agent sent a response before the SOCKS5 client sent its
+            # first datagram — drop and log so the condition is observable.
+            logger.debug(
+                "udp relay: dropping reply for %s:%d — client address not yet bound "
+                "(port=%d)",
+                src_host,
+                src_port,
+                self._local_port,
+            )
+            metrics_inc("socks5.udp_relay.reply_before_client_bound")
             return
 
         try:
@@ -329,6 +410,7 @@ class UdpRelay:
                 "udp relay: dropping reply with non-IP src_host %r (RFC 1928 §7)",
                 src_host,
             )
+            metrics_inc("socks5.udp_relay.non_ip_src_drop")
             return
 
         atyp = AddrType.IPV4 if addr.version == 4 else AddrType.IPV6
@@ -359,12 +441,22 @@ class UdpRelay:
         return self._foreign_client_count
 
     @property
+    def accepted_count(self) -> int:
+        """Total datagrams successfully enqueued for processing."""
+        return self._accepted_count
+
+    @property
     def is_running(self) -> bool:
         """``True`` once :meth:`start` has completed and before :meth:`close` is called."""
-        return self._transport is not None and not self._closed
+        return (
+            self._started
+            and not self._closed
+            and self._transport is not None
+            and not self._transport.is_closing()
+        )
 
 
-# ── UDP header parser (module-level, not a method) ────────────────────────────
+# ── UDP header parser ─────────────────────────────────────────────────────────
 
 
 def _parse_udp_header(data: bytes) -> tuple[bytes, str, int]:
@@ -385,7 +477,8 @@ def _parse_udp_header(data: bytes) -> tuple[bytes, str, int]:
         ProtocolError:
             If the datagram is too short, uses an unsupported ATYP, carries a
             non-zero FRAG field, has a zero-length domain, contains a domain
-            that is not valid UTF-8, or has port 0.
+            that is not valid UTF-8 or fails RFC 1123 / safety validation,
+            or has port 0.
     """
     # Minimum: RSV(2) + FRAG(1) + ATYP(1) = 4 bytes.
     if len(data) < 4:
@@ -422,15 +515,8 @@ def _parse_udp_header(data: bytes) -> tuple[bytes, str, int]:
                 },
                 hint="The SOCKS5 client sent an incomplete IPv4 address field.",
             )
-        try:
-            host = str(ipaddress.IPv4Address(data[offset : offset + 4]))
-        except ValueError as exc:
-            raise ProtocolError(
-                "Failed to parse IPv4 address bytes in SOCKS5 UDP header.",
-                error_code="protocol.socks5_udp_bad_ipv4",
-                details={"raw_bytes": data[offset : offset + 4].hex()},
-                hint="The SOCKS5 client sent a malformed 4-byte IPv4 address.",
-            ) from exc
+        # IPv4Address(bytes[4]) never raises ValueError.
+        host = str(ipaddress.IPv4Address(data[offset : offset + 4]))
         offset += 4
 
     elif atyp == AddrType.IPV6:
@@ -444,15 +530,8 @@ def _parse_udp_header(data: bytes) -> tuple[bytes, str, int]:
                 },
                 hint="The SOCKS5 client sent an incomplete IPv6 address field.",
             )
-        try:
-            host = str(ipaddress.IPv6Address(data[offset : offset + 16]).compressed)
-        except ValueError as exc:
-            raise ProtocolError(
-                "Failed to parse IPv6 address bytes in SOCKS5 UDP header.",
-                error_code="protocol.socks5_udp_bad_ipv6",
-                details={"raw_bytes": data[offset : offset + 16].hex()},
-                hint="The SOCKS5 client sent a malformed 16-byte IPv6 address.",
-            ) from exc
+        # IPv6Address(bytes[16]) never raises ValueError.
+        host = str(ipaddress.IPv6Address(data[offset : offset + 16]).compressed)
         offset += 16
 
     elif atyp == AddrType.DOMAIN:
@@ -501,6 +580,8 @@ def _parse_udp_header(data: bytes) -> tuple[bytes, str, int]:
                     "as UTF-8. Only ASCII/UTF-8 hostnames are supported."
                 ),
             ) from exc
+        # Validate domain structure and safety — same rules as TCP path.
+        _validate_domain(host)
         offset += dlen
 
     else:
