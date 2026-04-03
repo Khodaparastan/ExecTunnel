@@ -64,9 +64,9 @@ from exectunnel.proxy.dns_forwarder import _DnsForwarder
 from exectunnel.proxy.relay import UdpRelay
 from exectunnel.proxy.request import Socks5Request
 from exectunnel.proxy.server import Socks5Server
-from utils import is_host_excluded, load_agent_b64, make_udp_socket
 from exectunnel.transport.connection import _TcpConnectionHandler
 from exectunnel.transport.udp_flow import _UdpFlowHandler
+from exectunnel.utils import is_host_excluded, load_agent_b64, make_udp_socket
 
 logger = logging.getLogger("exectunnel.transport.session")
 
@@ -409,14 +409,17 @@ class TunnelSession:
         await asyncio.sleep(BOOTSTRAP_RM_DELAY_SECS)
 
         # Upload in chunks — safe under all POSIX shell input-buffer limits.
-        # base64 alphabet ([A-Za-z0-9+/=] or urlsafe [-_]) contains no shell
+        # URL-safe base64 alphabet ([A-Za-z0-9_-]) contains no shell
         # metacharacters so the printf argument is injection-safe.
         for i in range(0, len(agent_b64), BOOTSTRAP_CHUNK_SIZE):
             chunk = agent_b64[i : i + BOOTSTRAP_CHUNK_SIZE]
             await send_cmd(f"printf '%s' '{chunk}' >> '/tmp/exectunnel_agent.b64'")
 
+        # tr converts URL-safe base64 (-_) to standard base64 (+/) before
+        # decoding — `base64 -d` on Linux does not accept URL-safe alphabet.
         await send_cmd(
-            "base64 -d '/tmp/exectunnel_agent.b64' > '/tmp/exectunnel_agent.py'"
+            "tr -- '-_' '+/' < '/tmp/exectunnel_agent.b64'"
+            " | base64 -d > '/tmp/exectunnel_agent.py'"
         )
         await asyncio.sleep(BOOTSTRAP_DECODE_DELAY_SECS)
 
