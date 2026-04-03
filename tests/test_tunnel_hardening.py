@@ -9,13 +9,12 @@ from exectunnel.config import (
     BridgeConfig,
     get_tunnel_config,
 )
-from exectunnel.helpers import encode_frame
+from utils import encode_frame
 from exectunnel.observability import metrics_reset, metrics_snapshot
 from exectunnel.protocol import Cmd
 from exectunnel.proxy.request import Socks5Request
-from exectunnel.transport import TunnelSession
-from exectunnel.transport.models import PendingConnectState
-from exectunnel.transport.session import _TcpConnectionHandler
+from exectunnel.session import TunnelSession,PendingConnectState
+from exectunnel.transport import _TcpConnectionHandler
 
 
 class _Writer:

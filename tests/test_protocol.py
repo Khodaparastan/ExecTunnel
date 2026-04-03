@@ -8,7 +8,7 @@ import ipaddress
 
 import pytest
 
-from exectunnel.helpers import encode_frame, is_host_excluded, parse_frame
+from utils import encode_frame, is_host_excluded, parse_frame
 
 # ── Round-trip ────────────────────────────────────────────────────────────────
 

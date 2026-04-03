@@ -207,8 +207,10 @@ class _FrameWriter:
                                 return
                     except queue.Empty:
                         break
-                with contextlib.suppress(OSError):
+                try:
                     out.flush()
+                except OSError:
+                    pass
                 return
 
             if item is not None:

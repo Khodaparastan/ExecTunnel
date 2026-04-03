@@ -135,13 +135,13 @@ class _DnsForwarder:
         self._stopped: bool = False
 
         # Telemetry — split by drop category for accurate dashboards.
-        self._saturation_drop_count: int = 0   # inflight limit exceeded
-        self._error_drop_count: int = 0         # transport / protocol errors
-        self._total_drop_count: int = 0         # all drops combined
-        self._query_count: int = 0              # total queries attempted
-        self._ok_count: int = 0                 # queries with a response sent
-        self._bytes_in: int = 0                 # query bytes received
-        self._bytes_out: int = 0                # response bytes sent
+        self._saturation_drop_count: int = 0  # inflight limit exceeded
+        self._error_drop_count: int = 0  # transport / protocol errors
+        self._total_drop_count: int = 0  # all drops combined
+        self._query_count: int = 0  # total queries attempted
+        self._ok_count: int = 0  # queries with a response sent
+        self._bytes_in: int = 0  # query bytes received
+        self._bytes_out: int = 0  # response bytes sent
 
     # ── Async context manager ─────────────────────────────────────────────────
 
@@ -281,8 +281,7 @@ class _DnsForwarder:
                 agent_closed = True
                 metrics_inc("dns.query.error", error="agent_closed_no_response")
                 logger.debug(
-                    "dns query for %s:%d — agent closed flow before response "
-                    "(flow=%s)",
+                    "dns query for %s:%d — agent closed flow before response (flow=%s)",
                     client_addr[0],
                     client_addr[1],
                     flow_id,
@@ -290,10 +289,7 @@ class _DnsForwarder:
                 return
 
             # ── Reply to client ───────────────────────────────────────────────
-            if (
-                self._transport is not None
-                and not self._transport.is_closing()
-            ):
+            if self._transport is not None and not self._transport.is_closing():
                 self._transport.sendto(response, client_addr)
                 self._ok_count += 1
                 self._bytes_out += len(response)
@@ -308,14 +304,13 @@ class _DnsForwarder:
                     flow_id,
                 )
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # DNS clients retry naturally — log at DEBUG, not WARNING.
             self._error_drop_count += 1
             self._total_drop_count += 1
             metrics_inc("dns.query.timeout")
             logger.debug(
-                "dns query timed out for %s:%d "
-                "(flow=%s, timeout_s=%s)",
+                "dns query timed out for %s:%d (flow=%s, timeout_s=%s)",
                 client_addr[0],
                 client_addr[1],
                 flow_id,

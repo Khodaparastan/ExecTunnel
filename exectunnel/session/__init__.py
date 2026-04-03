@@ -1,3 +1,3 @@
-from .session import TunnelSession
+from .session import PendingConnectState, TunnelSession
 
-__all__ = ["TunnelSession"]
+__all__ = ["TunnelSession", "PendingConnectState"]
