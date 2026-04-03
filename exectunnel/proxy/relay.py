@@ -1,4 +1,5 @@
 """UDP relay helper for SOCKS5 UDP ASSOCIATE."""
+
 from __future__ import annotations
 
 import asyncio
@@ -7,6 +8,7 @@ import ipaddress
 import logging
 import socket
 import struct
+from typing import override
 
 from exectunnel.config.defaults import UDP_SEND_QUEUE_CAP, UDP_WARN_EVERY
 from exectunnel.exceptions import (
@@ -35,10 +37,10 @@ class UdpRelay:
             UDP_SEND_QUEUE_CAP
         )
         self._local_port: int = 0
-        self._closed = False
+        self._closed: bool = False
         self._client_addr: tuple[str, int] | None = None
-        self._drop_count = 0
-        self._foreign_client_count = 0
+        self._drop_count: int = 0
+        self._foreign_client_count: int = 0
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -57,9 +59,11 @@ class UdpRelay:
             def __init__(self, relay: UdpRelay) -> None:
                 self._r = relay
 
+            @override
             def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
                 self._r._on_datagram(data, addr)
 
+            @override
             def error_received(self, exc: Exception) -> None:
                 # OS-level socket errors are not actionable per-datagram;
                 # count them and log at DEBUG.

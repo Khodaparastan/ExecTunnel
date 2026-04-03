@@ -5,11 +5,11 @@ import ssl
 
 import pytest
 
-from exectunnel.core.config import (
+from exectunnel.config import (
     BridgeConfig,
     TunnelConfig,
     create_ssl_context,
-    get_config,
+    get_app_config,
     get_wss_url,
     parse_bool_env,
     parse_float_env,
@@ -111,14 +111,14 @@ class TestGetWssUrl:
             get_wss_url()
 
 
-# ── get_config ────────────────────────────────────────────────────────────────
+# ── get_app_config ────────────────────────────────────────────────────────────────
 
 
 class TestGetConfig:
     def test_builds_app_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("WSS_URL", "wss://k8s.local/api/v1/exec")
         monkeypatch.delenv("WSS_INSECURE", raising=False)
-        cfg = get_config()
+        cfg = get_app_config()
         assert cfg.wss_url == "wss://k8s.local/api/v1/exec"
         assert cfg.insecure is False
         assert isinstance(cfg.bridge, BridgeConfig)
@@ -126,20 +126,20 @@ class TestGetConfig:
     def test_insecure_flag(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("WSS_URL", "wss://example.com")
         monkeypatch.setenv("WSS_INSECURE", "1")
-        cfg = get_config()
+        cfg = get_app_config()
         assert cfg.insecure is True
 
     def test_custom_ping_interval(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("WSS_URL", "wss://example.com")
         monkeypatch.setenv("WSS_PING_INTERVAL", "60")
-        cfg = get_config()
+        cfg = get_app_config()
         assert cfg.bridge.ping_interval == 60
 
     def test_reconnect_delay_bounds(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("WSS_URL", "wss://example.com")
         monkeypatch.setenv("WSS_RECONNECT_BASE_DELAY", "5")
         monkeypatch.setenv("WSS_RECONNECT_MAX_DELAY", "1")
-        cfg = get_config()
+        cfg = get_app_config()
         assert cfg.bridge.reconnect_base_delay == 5.0
         assert cfg.bridge.reconnect_max_delay == 5.0
 

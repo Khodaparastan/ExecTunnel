@@ -1,4 +1,5 @@
 """SOCKS5 server — asyncio, no auth."""
+
 from __future__ import annotations
 
 import asyncio
@@ -15,7 +16,7 @@ from exectunnel.exceptions import (
 )
 from exectunnel.observability import metrics_inc, metrics_observe, span
 from exectunnel.protocol.enums import AuthMethod, Cmd, Reply
-from exectunnel.proxy._codec import _build_reply, _read_addr, _read_exact
+from exectunnel.proxy._codec import build_reply, read_addr, read_exact
 from exectunnel.proxy.relay import UdpRelay
 from exectunnel.proxy.request import Socks5Request
 
@@ -291,12 +292,15 @@ class Socks5Server:
             (propagated from :meth:`UdpRelay.start`).
         """
         # ── Greeting: VER(1) + NMETHODS(1) + METHODS(N) ──────────────────────
-        header = await _read_exact(reader, 2)
+        header = await read_exact(reader, 2)
         if header[0] != 0x05:
             raise ProtocolError(
                 f"Not a SOCKS5 client: version byte is {header[0]:#x}, expected 0x05.",
                 error_code="protocol.socks5_bad_version",
-                details={"received_version": hex(header[0]), "expected_version": "0x05"},
+                details={
+                    "received_version": hex(header[0]),
+                    "expected_version": "0x05",
+                },
                 hint=(
                     "Ensure the connecting client is configured to use SOCKS5. "
                     "SOCKS4 and HTTP CONNECT proxies are not supported."
@@ -304,7 +308,7 @@ class Socks5Server:
             )
 
         nmethods = header[1]
-        methods = await _read_exact(reader, nmethods)
+        methods = await read_exact(reader, nmethods)
 
         if AuthMethod.NO_AUTH not in methods:
             writer.write(bytes([0x05, AuthMethod.NO_ACCEPT]))
@@ -330,7 +334,7 @@ class Socks5Server:
         await writer.drain()
 
         # ── Request: VER(1) + CMD(1) + RSV(1) + ATYP+addr+port ──────────────
-        req_header = await _read_exact(reader, 3)
+        req_header = await read_exact(reader, 3)
         if req_header[0] != 0x05:
             raise ProtocolError(
                 f"Bad SOCKS5 request version: {req_header[0]:#x}, expected 0x05.",
@@ -344,7 +348,7 @@ class Socks5Server:
 
         if req_header[2] != 0x00:
             # RSV byte must be 0x00 per RFC 1928 §4.
-            await _write_and_drain_suppress(writer, _build_reply(Reply.GENERAL_FAILURE))
+            await _write_and_drain_suppress(writer, build_reply(Reply.GENERAL_FAILURE))
             raise ProtocolError(
                 f"SOCKS5 request RSV byte is {req_header[2]:#x}, expected 0x00.",
                 error_code="protocol.socks5_bad_rsv",
@@ -355,7 +359,9 @@ class Socks5Server:
         try:
             cmd = Cmd(req_header[1])
         except ValueError:
-            await _write_and_drain_suppress(writer, _build_reply(Reply.CMD_NOT_SUPPORTED))
+            await _write_and_drain_suppress(
+                writer, build_reply(Reply.CMD_NOT_SUPPORTED)
+            )
             raise ProtocolError(
                 f"Unsupported SOCKS5 command: {req_header[1]:#x}.",
                 error_code="protocol.socks5_unsupported_cmd",
@@ -367,10 +373,10 @@ class Socks5Server:
             )
 
         # _read_addr raises ProtocolError / FrameDecodingError on bad input.
-        host, port = await _read_addr(reader)
+        host, port = await read_addr(reader)
 
         if cmd == Cmd.CONNECT and port == 0:
-            await _write_and_drain_suppress(writer, _build_reply(Reply.GENERAL_FAILURE))
+            await _write_and_drain_suppress(writer, build_reply(Reply.GENERAL_FAILURE))
             raise ProtocolError(
                 f"SOCKS5 CONNECT request for {host!r} has port 0.",
                 error_code="protocol.socks5_connect_zero_port",
@@ -398,7 +404,7 @@ class Socks5Server:
 
         # BIND and any future commands — send CMD_NOT_SUPPORTED and return None
         # so _handle_client does not enqueue a request it cannot route.
-        await _write_and_drain_suppress(writer, _build_reply(Reply.CMD_NOT_SUPPORTED))
+        await _write_and_drain_suppress(writer, build_reply(Reply.CMD_NOT_SUPPORTED))
         return None
 
 

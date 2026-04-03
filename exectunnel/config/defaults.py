@@ -1,4 +1,5 @@
 """All numeric/string constants, split by domain."""
+
 from __future__ import annotations
 
 # ── WebSocket / Bridge ────────────────────────────────────────────────────────

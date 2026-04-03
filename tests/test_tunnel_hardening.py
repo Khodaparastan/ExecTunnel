@@ -4,18 +4,18 @@ import asyncio
 import base64
 import contextlib
 
-from exectunnel.connection import _ConnHandler
-from exectunnel.core.config import (
+from exectunnel.config import (
     AppConfig,
     BridgeConfig,
     get_tunnel_config,
 )
-from exectunnel.core.consts import Cmd
-from exectunnel.core.models import PendingConnect
 from exectunnel.helpers import encode_frame
 from exectunnel.observability import metrics_reset, metrics_snapshot
-from exectunnel.socks5 import Socks5Request
-from exectunnel.tunnel import TunnelSession
+from exectunnel.protocol import Cmd
+from exectunnel.proxy.request import Socks5Request
+from exectunnel.transport import TunnelSession
+from exectunnel.transport.models import PendingConnectState
+from exectunnel.transport.session import _TcpConnectionHandler
 
 
 class _Writer:
@@ -64,7 +64,7 @@ async def test_dispatch_pre_ack_overflow_marks_pending_failure() -> None:
     )
     loop = asyncio.get_running_loop()
     ack_future: asyncio.Future[str] = loop.create_future()
-    handler = _ConnHandler(
+    handler = _TcpConnectionHandler(
         conn_id,
         req.reader,
         req.writer,  # type: ignore[arg-type]
@@ -73,10 +73,8 @@ async def test_dispatch_pre_ack_overflow_marks_pending_failure() -> None:
         pre_ack_buffer_cap_bytes=8,
     )
     session._conn_handlers[conn_id] = handler  # type: ignore[attr-defined]
-    session._pending_connects[conn_id] = PendingConnect(  # type: ignore[attr-defined]
+    session._pending_connects[conn_id] = PendingConnectState(  # type: ignore[attr-defined]
         host=req.host,
-        request=req,
-        handler=handler,
         ack_future=ack_future,
     )
 
@@ -101,7 +99,7 @@ async def test_dispatch_pre_ack_data_ignored_when_handler_closed() -> None:
     )
     loop = asyncio.get_running_loop()
     ack_future: asyncio.Future[str] = loop.create_future()
-    handler = _ConnHandler(
+    handler = _TcpConnectionHandler(
         conn_id,
         req.reader,
         req.writer,  # type: ignore[arg-type]
@@ -112,10 +110,8 @@ async def test_dispatch_pre_ack_data_ignored_when_handler_closed() -> None:
     # Simulate the handler already being torn down (e.g. from a prior ERROR frame).
     handler._closed.set()  # type: ignore[attr-defined]
     session._conn_handlers[conn_id] = handler  # type: ignore[attr-defined]
-    session._pending_connects[conn_id] = PendingConnect(  # type: ignore[attr-defined]
+    session._pending_connects[conn_id] = PendingConnectState(  # type: ignore[attr-defined]
         host=req.host,
-        request=req,
-        handler=handler,
         ack_future=ack_future,
     )
 
@@ -146,19 +142,6 @@ async def test_handle_connect_timeout_cleans_pending_state() -> None:
     assert any(k.startswith("connect_ack_timeout") for k in metrics)
 
 
-def test_cloudflare_host_gate_uses_dedicated_limit(monkeypatch) -> None:
-    monkeypatch.setenv("EXECTUNNEL_CONNECT_MAX_PENDING_PER_HOST", "16")
-    monkeypatch.setenv("EXECTUNNEL_CONNECT_MAX_PENDING_CF", "3")
-    session = _make_session()
-    gate = session._connect_host_gate("challenges.cloudflare.com")  # type: ignore[attr-defined]
-    assert gate._value == 3  # type: ignore[attr-defined]
-
-
-def test_cloudflare_host_pace_interval_uses_env(monkeypatch) -> None:
-    monkeypatch.setenv("EXECTUNNEL_CONNECT_PACE_CF_MS", "25")
-    session = _make_session()
-    assert session._connect_host_pace_interval("challenges.cloudflare.com") == 0.025  # type: ignore[attr-defined]
-    assert session._connect_host_pace_interval("example.com") == 0.0  # type: ignore[attr-defined]
 
 
 def test_data_send_timeout_removed() -> None:
@@ -169,7 +152,7 @@ def test_data_send_timeout_removed() -> None:
     assert not hasattr(session, "_data_send_timeout")
     # The config field must also be gone so operators don't set
     # EXECTUNNEL_DATA_SEND_TIMEOUT expecting it to have an effect.
-    from exectunnel.core.config import TunnelConfig
+    from exectunnel.config import TunnelConfig
     assert not hasattr(TunnelConfig(), "data_send_timeout")
 
 
@@ -238,7 +221,7 @@ async def test_dispatch_frame_async_data_blocks_on_full_queue() -> None:
         reader=asyncio.StreamReader(),
         writer=_Writer(),  # type: ignore[arg-type]
     )
-    handler = _ConnHandler(
+    handler = _TcpConnectionHandler(
         conn_id,
         req.reader,
         req.writer,  # type: ignore[arg-type]

@@ -308,7 +308,9 @@ class TcpConnectionWorker:
         # in queue.SimpleQueue.put() and keeps the critical section tight.
         if saturated:
             reason = base64.b64encode(b"agent tcp inbound saturated").decode()
-            _write_ctrl_frame(f"{_FRAME_PREFIX}ERROR:{self.conn_id}:{reason}{_FRAME_SUFFIX}")
+            _write_ctrl_frame(
+                f"{_FRAME_PREFIX}ERROR:{self.conn_id}:{reason}{_FRAME_SUFFIX}"
+            )
             _log(
                 "warning",
                 "conn %s inbound saturated; closing connection",
@@ -327,7 +329,9 @@ class TcpConnectionWorker:
     def _run(self) -> None:
         cid = self.conn_id
         try:
-            sock = socket.create_connection((self._host, self._port), timeout=_TCP_CONNECT_TIMEOUT_SECS)
+            sock = socket.create_connection(
+                (self._host, self._port), timeout=_TCP_CONNECT_TIMEOUT_SECS
+            )
             sock.setblocking(False)
         except OSError as exc:
             reason = base64.b64encode(str(exc).encode()).decode()
@@ -425,7 +429,11 @@ class TcpConnectionWorker:
             # Breaking while the remote is still actively sending would silently
             # discard in-flight data and RST a live connection (e.g. an SSH
             # session that is still streaming output after the client sent EOF).
-            if local_shut and local_shut_deadline is not None and time.monotonic() >= local_shut_deadline:
+            if (
+                local_shut
+                and local_shut_deadline is not None
+                and time.monotonic() >= local_shut_deadline
+            ):
                 # Check whether the remote socket still has data to read.
                 readable_now, _, _ = select.select([sock], [], [], 0)
                 if sock in readable_now:

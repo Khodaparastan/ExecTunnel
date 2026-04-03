@@ -20,6 +20,7 @@ WSS_PING_TIMEOUT
 WSS_SEND_TIMEOUT
     Maximum time in seconds to wait for a WebSocket send (default: 30).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -78,7 +79,7 @@ def _positive_float(value: str) -> float:
 
 def _dns_ip(value: str) -> str:
     try:
-        ipaddress.ip_address(value)
+        _ = ipaddress.ip_address(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"invalid DNS IP {value!r}") from exc
     return value
@@ -126,12 +127,12 @@ environment:
   EXECTUNNEL_OBS_HTTP_HEADERS         semicolon header list, e.g. Authorization=Bearer token
         """,
     )
-    parser.add_argument(
+    _= parser.add_argument(
         "--version",
         action="version",
         version=f"exectunnel {__version__}",
     )
-    parser.add_argument(
+    _=parser.add_argument(
         "--log-level",
         choices=["debug", "info", "warning", "error"],
         default="info",
@@ -204,7 +205,7 @@ environment:
         default=TUNNEL_CONFIG.conn_ack_timeout,
         metavar="SECS",
         help=f"seconds to wait for agent CONN_ACK per connection "
-             f"(default: {TUNNEL_CONFIG.conn_ack_timeout:.0f})",
+        f"(default: {TUNNEL_CONFIG.conn_ack_timeout:.0f})",
     )
 
     return parser
@@ -219,6 +220,7 @@ def _parse_tunnel_excludes(
     nets: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
     if not args.no_default_exclude:
         from exectunnel.config.exclusions import get_default_exclusion_networks
+
         nets.extend(get_default_exclusion_networks())
     for cidr in args.exclude:
         try:
@@ -365,9 +367,7 @@ async def run_tunnel_command(cfg: AppConfig, tun_cfg: TunnelConfig) -> None:
                 error=exc.error_code.replace(".", "_"),
             )
             logger.error(
-                "fatal: bootstrap failed [%s]: %s\n"
-                "  hint   : %s\n"
-                "  error_id: %s",
+                "fatal: bootstrap failed [%s]: %s\n  hint   : %s\n  error_id: %s",
                 exc.error_code,
                 exc.message,
                 exc.hint or "—",
@@ -407,9 +407,7 @@ async def run_tunnel_command(cfg: AppConfig, tun_cfg: TunnelConfig) -> None:
                 error=exc.error_code.replace(".", "_"),
             )
             logger.error(
-                "fatal: tunnel error [%s]: %s\n"
-                "  hint   : %s\n"
-                "  error_id: %s",
+                "fatal: tunnel error [%s]: %s\n  hint   : %s\n  error_id: %s",
                 exc.error_code,
                 exc.message,
                 exc.hint or "—",

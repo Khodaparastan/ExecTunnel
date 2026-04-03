@@ -31,6 +31,7 @@ never closes, both the agent thread and the local ``_downstream`` task leak
 for up to 30 s per connection — acceptable for normal traffic but can
 accumulate under high connection churn with misbehaving remote servers.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -72,7 +73,9 @@ class _TcpConnectionHandler:
         self._writer = writer
         self._ws_send = ws_send
         self._registry = registry
-        self._inbound: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=TCP_INBOUND_QUEUE_CAP)
+        self._inbound: asyncio.Queue[bytes | None] = asyncio.Queue(
+            maxsize=TCP_INBOUND_QUEUE_CAP
+        )
         self._tasks: list[asyncio.Task[None]] = []
         self._cleanup_task: asyncio.Task[None] | None = None
         self._closed = asyncio.Event()
@@ -344,7 +347,9 @@ class _TcpConnectionHandler:
                 )
 
             except TransportError as exc:
-                metrics_inc("connection.upstream.error", error=exc.error_code.replace(".", "_"))
+                metrics_inc(
+                    "connection.upstream.error", error=exc.error_code.replace(".", "_")
+                )
                 logger.warning(
                     "conn %s: upstream transport error [%s]: %s "
                     "(bytes_sent=%d, error_id=%s)",
@@ -377,7 +382,9 @@ class _TcpConnectionHandler:
                 )
 
             except ExecTunnelError as exc:
-                metrics_inc("connection.upstream.error", error=exc.error_code.replace(".", "_"))
+                metrics_inc(
+                    "connection.upstream.error", error=exc.error_code.replace(".", "_")
+                )
                 logger.warning(
                     "conn %s: upstream library error [%s]: %s (error_id=%s)",
                     self._id,
@@ -417,7 +424,9 @@ class _TcpConnectionHandler:
                     "connection.upstream.duration_sec",
                     asyncio.get_running_loop().time() - start,
                 )
-                metrics_observe("connection.upstream.bytes", float(self._bytes_upstream))
+                metrics_observe(
+                    "connection.upstream.bytes", float(self._bytes_upstream)
+                )
                 await self._send_close_frame_once()
 
     async def _downstream(self) -> None:
@@ -608,7 +617,9 @@ class _TcpConnectionHandler:
                     "connection.downstream.duration_sec",
                     asyncio.get_running_loop().time() - start,
                 )
-                metrics_observe("connection.downstream.bytes", float(self._bytes_downstream))
+                metrics_observe(
+                    "connection.downstream.bytes", float(self._bytes_downstream)
+                )
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 

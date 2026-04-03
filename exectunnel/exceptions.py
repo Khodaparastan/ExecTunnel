@@ -16,6 +16,7 @@ Design goals
   without pattern-matching on the class name.
 * Backward compat    – legacy aliases are preserved and clearly marked.
 """
+
 from __future__ import annotations
 
 import datetime
@@ -110,7 +111,9 @@ class ExecTunnelError(Exception):
         self.error_code: str = error_code or self.default_error_code
         self.details: dict[str, Any] = details or {}
         self.hint: str | None = hint
-        self.retryable: bool = retryable if retryable is not None else self.default_retryable
+        self.retryable: bool = (
+            retryable if retryable is not None else self.default_retryable
+        )
         self.error_id: str = str(uuid.uuid4())
         self.timestamp: str = _utc_now()
 

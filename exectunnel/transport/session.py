@@ -3,6 +3,7 @@
 Bootstraps ``agent.py`` into the pod and runs a local SOCKS5 proxy that routes
 all connections through the WebSocket tunnel.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -128,7 +129,6 @@ class TunnelSession:
         self._ack_timeout_reconnect_threshold = tun_cfg.ack_timeout_reconnect_threshold
         self._connect_max_pending = tun_cfg.connect_max_pending
         self._connect_max_pending_per_host = tun_cfg.connect_max_pending_per_host
-        self._connect_max_pending_cf = tun_cfg.connect_max_pending_cf
         self._connect_pace_cf_ms = tun_cfg.connect_pace_cf_ms
         self._pre_ack_buffer_cap_bytes = tun_cfg.pre_ack_buffer_cap_bytes
         self._connect_gate = asyncio.Semaphore(self._connect_max_pending)
@@ -140,7 +140,6 @@ class TunnelSession:
             "connect hardening: global=%d per_host=%d cf_host=%d cf_pace_ms=%d",
             self._connect_max_pending,
             self._connect_max_pending_per_host,
-            self._connect_max_pending_cf,
             self._connect_pace_cf_ms,
         )
 
@@ -199,7 +198,9 @@ class TunnelSession:
 
                 except WebSocketSendTimeoutError as exc:
                     metrics_inc("tunnel.connect.error", error="ws_send_timeout")
-                    reconnect_reason = f"ws_send_timeout: {exc.message} (error_id={exc.error_id})"
+                    reconnect_reason = (
+                        f"ws_send_timeout: {exc.message} (error_id={exc.error_id})"
+                    )
                     logger.warning(
                         "WebSocket send timed out [%s] (error_id=%s) — will reconnect",
                         exc.error_code,
@@ -225,7 +226,9 @@ class TunnelSession:
                         "tunnel.connect.error",
                         error=exc.error_code.replace(".", "_"),
                     )
-                    reconnect_reason = f"{exc.error_code}: {exc.message} (error_id={exc.error_id})"
+                    reconnect_reason = (
+                        f"{exc.error_code}: {exc.message} (error_id={exc.error_id})"
+                    )
                     logger.warning(
                         "Transport error [%s]: %s (error_id=%s) — will reconnect",
                         exc.error_code,
@@ -389,7 +392,9 @@ class TunnelSession:
                 error_code="bootstrap.agent_ready_timeout",
                 details={
                     "timeout_s": self._tun.ready_timeout,
-                    "last_output": self._bootstrap_diag[-1] if self._bootstrap_diag else None,
+                    "last_output": self._bootstrap_diag[-1]
+                    if self._bootstrap_diag
+                    else None,
                 },
                 hint=(
                     "Increase EXECTUNNEL_AGENT_TIMEOUT or check the remote Python "
@@ -486,7 +491,9 @@ class TunnelSession:
             f"WebSocket closed before AGENT_READY was received{detail}",
             error_code="bootstrap.ws_closed_before_ready",
             details={
-                "last_output": self._bootstrap_diag[-1] if self._bootstrap_diag else None,
+                "last_output": self._bootstrap_diag[-1]
+                if self._bootstrap_diag
+                else None,
             },
             hint="Check that the remote shell executed the agent script successfully.",
         )
@@ -512,7 +519,9 @@ class TunnelSession:
         recv_task = asyncio.create_task(self._recv_loop(), name="tun-recv-loop")
         send_task = asyncio.create_task(self._send_loop(), name="tun-send-loop")
         socks_task = asyncio.create_task(self._socks_loop(socks), name="tun-socks-loop")
-        keepalive_task = asyncio.create_task(self._keepalive_loop(), name="tun-keepalive")
+        keepalive_task = asyncio.create_task(
+            self._keepalive_loop(), name="tun-keepalive"
+        )
 
         try:
             done, _ = await asyncio.wait(
@@ -553,7 +562,10 @@ class TunnelSession:
                 with contextlib.suppress(asyncio.QueueFull):
                     self._send_data_queue.put_nowait(None)
             await asyncio.gather(
-                recv_task, send_task, socks_task, keepalive_task,
+                recv_task,
+                send_task,
+                socks_task,
+                keepalive_task,
                 return_exceptions=True,
             )
             for task in list(self._request_tasks):
@@ -670,8 +682,6 @@ class TunnelSession:
         return host.lower().strip()
 
     def _connect_host_limit(self, host_key: str) -> int:
-        if host_key == "challenges.cloudflare.com":
-            return min(self._connect_max_pending_per_host, self._connect_max_pending_cf)
         return self._connect_max_pending_per_host
 
     def _connect_pace_interval_for_host(self, host_key: str) -> float:

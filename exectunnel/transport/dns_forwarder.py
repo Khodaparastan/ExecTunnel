@@ -1,4 +1,5 @@
 """DNS forwarder — forwards queries through the tunnel via UDP flows."""
+
 from __future__ import annotations
 
 import asyncio
