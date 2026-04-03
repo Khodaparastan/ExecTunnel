@@ -23,7 +23,7 @@ class Socks5Request:
     cleanup even if the handler raises before sending a reply::
 
         async with request:
-            await request.send_reply_success()
+            await request.send_reply_success(bind_port=request.udp_relay.local_port)
             ...  # relay data
 
     Attributes:
@@ -61,15 +61,28 @@ class Socks5Request:
     async def close(self) -> None:
         """Close the writer and any associated UDP relay.
 
-        Idempotent — safe to call multiple times.  All ``OSError`` exceptions
-        are suppressed because the connection may already be half-closed by the
-        time this is called.
+        Idempotent — safe to call multiple times.  ``OSError`` exceptions are
+        suppressed because the connection may already be half-closed by the
+        time this is called.  ``RuntimeError`` is suppressed only for the
+        specific case of ``"Event loop is closed"`` to avoid masking genuine
+        asyncio internal errors.
         """
         if self.udp_relay is not None:
             self.udp_relay.close()
-        with contextlib.suppress(OSError, RuntimeError):
+
+        if self.writer.is_closing():
+            return
+
+        try:
             self.writer.close()
             await self.writer.wait_closed()
+        except OSError:
+            pass
+        except RuntimeError as exc:
+            # Suppress only the "Event loop is closed" variant that can occur
+            # during interpreter shutdown; re-raise all other RuntimeErrors.
+            if "Event loop is closed" not in str(exc):
+                raise
 
     # ── Properties ────────────────────────────────────────────────────────────
 
@@ -122,6 +135,10 @@ class Socks5Request:
     ) -> None:
         """Queue a ``SUCCESS`` reply into the writer buffer.
 
+        The writer-closing check is performed **before** marking the request
+        as replied so that the caller can still call :meth:`reply_error` if
+        this method raises.
+
         The caller is responsible for calling ``await writer.drain()``
         after this method returns.
 
@@ -129,16 +146,20 @@ class Socks5Request:
             bind_host: The ``BND.ADDR`` to advertise.  Defaults to
                        ``"127.0.0.1"``.
             bind_port: The ``BND.PORT`` to advertise.  Defaults to ``0``.
+                       For ``UDP_ASSOCIATE`` this MUST be
+                       ``request.udp_relay.local_port``.
 
         Raises:
             ProtocolError:
+                * If the writer transport is already closing (checked first,
+                  before the double-reply guard fires).
                 * If a reply has already been sent (double-reply guard).
-                * If the writer transport is already closing.
             ConfigurationError:
                 If *bind_host* or *bind_port* are invalid (propagated from
                 :func:`build_reply`).
         """
-        self._mark_replied()
+        # Check writer state BEFORE marking replied so the caller can still
+        # fall back to reply_error() if this raises.
         if self.writer.is_closing():
             raise ProtocolError(
                 f"Cannot send SUCCESS reply for {self.host}:{self.port} — "
@@ -154,6 +175,7 @@ class Socks5Request:
                     "This is usually benign."
                 ),
             )
+        self._mark_replied()
         self.writer.write(build_reply(Reply.SUCCESS, bind_host, bind_port))
 
     def reply_error(self, reply: Reply = Reply.GENERAL_FAILURE) -> None:
@@ -194,6 +216,9 @@ class Socks5Request:
         Does **not** close the writer — the caller owns the connection after a
         successful reply and is responsible for data relay and teardown.
 
+        For ``UDP_ASSOCIATE`` requests, pass ``bind_port=request.udp_relay.local_port``
+        so the client knows which port to send datagrams to (RFC 1928 §7).
+
         Args:
             bind_host: The ``BND.ADDR`` to advertise.  Defaults to
                        ``"127.0.0.1"``.
@@ -201,8 +226,9 @@ class Socks5Request:
 
         Raises:
             ProtocolError:
+                * Writer already closing (propagated from :meth:`reply_success`,
+                  checked before double-reply guard).
                 * Double-reply guard (propagated from :meth:`reply_success`).
-                * Writer already closing (propagated from :meth:`reply_success`).
             ConfigurationError:
                 Invalid *bind_host* / *bind_port* (propagated from
                 :func:`build_reply`).

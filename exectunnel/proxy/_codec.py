@@ -12,13 +12,20 @@ from exectunnel.protocol.enums import AddrType, Reply
 
 # ── Domain-name validation ────────────────────────────────────────────────────
 
-# RFC 1123 relaxed: labels of 1-63 chars, total ≤ 253, no leading/trailing dot.
+# RFC 1123 relaxed: labels of 1–63 chars, total ≤ 253, no leading/trailing dot.
+# Underscores are intentionally excluded: they are not valid per RFC 1123 and
+# would corrupt tunnel frames if they appeared alongside frame-unsafe chars.
+# Real-world SRV / DMARC labels (_dmarc, _sip) use underscores; if you need
+# them, add a permissive flag to _validate_domain and document the trade-off.
+#
 # We also reject null bytes and the frame-unsafe chars validated by the
 # protocol layer (: < >) so a hostile domain can never corrupt a tunnel frame.
 _DOMAIN_LABEL_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9\-]{0,61}[A-Za-z0-9])?$")
 _DOMAIN_UNSAFE_RE = re.compile(r"[\x00:<>]")
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+# Maximum number of bytes read_exact() will accept in a single call.
+# Protects against a caller accidentally passing a huge length field.
+_MAX_READ_BYTES: int = 65_535
 
 __all__ = ["build_reply", "read_addr", "read_exact"]
 
@@ -30,9 +37,11 @@ def _validate_domain(domain: str) -> None:
     """Raise :class:`ProtocolError` if *domain* is not a safe, well-formed hostname.
 
     Checks performed:
+
     * Total length ≤ 253 characters.
     * No frame-unsafe characters (``\\x00``, ``:``, ``<``, ``>``).
-    * Each dot-separated label matches RFC 1123 rules.
+    * Each dot-separated label matches RFC 1123 rules (1–63 chars,
+      alphanumeric start/end, hyphens allowed in the middle).
 
     Args:
         domain: The decoded domain string to validate.
@@ -66,7 +75,10 @@ def _validate_domain(domain: str) -> None:
                 f"SOCKS5 domain name {domain!r} contains an empty label.",
                 error_code="protocol.socks5_domain_empty_label",
                 details={"domain": domain},
-                hint="Consecutive dots or a leading dot produce empty labels, which are invalid.",
+                hint=(
+                    "Consecutive dots or a leading dot produce empty labels, "
+                    "which are invalid per RFC 1123."
+                ),
             )
         if not _DOMAIN_LABEL_RE.match(label):
             raise ProtocolError(
@@ -88,18 +100,19 @@ async def read_exact(reader: asyncio.StreamReader, n: int) -> bytes:
 
     Args:
         reader: The asyncio stream to read from.
-        n:      Number of bytes to read.  Must be ≥ 1.
+        n:      Number of bytes to read.  Must be in ``[1, 65535]``.
 
     Returns:
         Exactly *n* bytes.
 
     Raises:
-        ValueError:   If *n* is zero — indicates a caller logic bug.
+        ValueError:    If *n* is outside ``[1, 65535]`` — indicates a caller
+                       logic bug; check the SOCKS5 length field before calling.
         ProtocolError: If the stream ends before *n* bytes are available.
     """
-    if n < 1:
+    if not (1 <= n <= _MAX_READ_BYTES):
         raise ValueError(
-            f"read_exact() called with n={n}; must be ≥ 1. "
+            f"read_exact() called with n={n}; must be in [1, {_MAX_READ_BYTES}]. "
             "This is a caller bug — check the SOCKS5 length field before calling."
         )
     try:
@@ -123,8 +136,8 @@ async def read_exact(reader: asyncio.StreamReader, n: int) -> bytes:
 async def read_addr(reader: asyncio.StreamReader) -> tuple[str, int]:
     """Read ``ATYP + address + port`` from *reader* and return ``(host, port)``.
 
-    Uses :mod:`ipaddress` for IP parsing (portable across all platforms,
-    including Windows builds that lack ``socket.inet_ntop``).
+    Uses :mod:`ipaddress` for IP parsing — portable across all platforms,
+    including Windows builds that lack ``socket.inet_ntop``.
 
     Args:
         reader: The asyncio stream positioned immediately before the ATYP byte.
@@ -148,28 +161,14 @@ async def read_addr(reader: asyncio.StreamReader) -> tuple[str, int]:
     atyp = atyp_byte[0]
 
     if atyp == AddrType.IPV4:
+        # IPv4Address(bytes[4]) never raises ValueError — no try/except needed.
         raw = await read_exact(reader, 4)
-        try:
-            host = str(ipaddress.IPv4Address(raw))
-        except ValueError as exc:
-            raise ProtocolError(
-                "Failed to parse IPv4 address bytes from SOCKS5 request.",
-                error_code="protocol.socks5_bad_ipv4",
-                details={"raw_bytes": raw.hex()},
-                hint="The client sent a malformed 4-byte IPv4 address field.",
-            ) from exc
+        host = str(ipaddress.IPv4Address(raw))
 
     elif atyp == AddrType.IPV6:
+        # IPv6Address(bytes[16]) never raises ValueError — no try/except needed.
         raw = await read_exact(reader, 16)
-        try:
-            host = str(ipaddress.IPv6Address(raw).compressed)
-        except ValueError as exc:
-            raise ProtocolError(
-                "Failed to parse IPv6 address bytes from SOCKS5 request.",
-                error_code="protocol.socks5_bad_ipv6",
-                details={"raw_bytes": raw.hex()},
-                hint="The client sent a malformed 16-byte IPv6 address field.",
-            ) from exc
+        host = str(ipaddress.IPv6Address(raw).compressed)
 
     elif atyp == AddrType.DOMAIN:
         length_byte = await read_exact(reader, 1)
@@ -254,7 +253,6 @@ def build_reply(
             * *bind_port* is outside ``[0, 65535]``.
             * *bind_host* is not a valid IP address string.
     """
-    # Coerce and validate reply code — rejects arbitrary ints early.
     try:
         reply = Reply(reply)
     except ValueError as exc:
