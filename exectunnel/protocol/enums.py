@@ -4,14 +4,35 @@ from __future__ import annotations
 
 from enum import IntEnum
 
+__all__ = [
+    "AddrType",
+    "AuthMethod",
+    "Cmd",
+    "Reply",
+    "UserPassStatus",
+]
+
 
 class AuthMethod(IntEnum):
-    """SOCKS5 authentication method codes (RFC 1928 §3)."""
+    """SOCKS5 authentication method codes (RFC 1928 §3).
+
+    Note:
+        ``GSSAPI`` is defined for wire-format completeness only.
+        This tunnel implementation does **not** support GSSAPI negotiation;
+        peers advertising only GSSAPI will receive ``NO_ACCEPT``.
+    """
 
     NO_AUTH = 0x00
     GSSAPI = 0x01
     USERNAME_PASSWORD = 0x02
     NO_ACCEPT = 0xFF
+
+    @classmethod
+    def _missing_(cls, value: object) -> None:  # type: ignore[override]
+        raise ValueError(
+            f"{value!r} is not a valid {cls.__name__} "
+            f"(expected one of {[m.value for m in cls]})"
+        )
 
 
 class Cmd(IntEnum):
@@ -21,6 +42,13 @@ class Cmd(IntEnum):
     BIND = 0x02
     UDP_ASSOCIATE = 0x03
 
+    @classmethod
+    def _missing_(cls, value: object) -> None:  # type: ignore[override]
+        raise ValueError(
+            f"{value!r} is not a valid {cls.__name__} "
+            f"(expected one of {[m.value for m in cls]})"
+        )
+
 
 class AddrType(IntEnum):
     """SOCKS5 address type codes (RFC 1928 §4)."""
@@ -28,6 +56,13 @@ class AddrType(IntEnum):
     IPV4 = 0x01
     DOMAIN = 0x03
     IPV6 = 0x04
+
+    @classmethod
+    def _missing_(cls, value: object) -> None:  # type: ignore[override]
+        raise ValueError(
+            f"{value!r} is not a valid {cls.__name__} "
+            f"(expected one of {[m.value for m in cls]})"
+        )
 
 
 class Reply(IntEnum):
@@ -43,7 +78,23 @@ class Reply(IntEnum):
     CMD_NOT_SUPPORTED = 0x07
     ADDR_NOT_SUPPORTED = 0x08
 
+    @classmethod
+    def _missing_(cls, value: object) -> None:  # type: ignore[override]
+        raise ValueError(
+            f"{value!r} is not a valid {cls.__name__} "
+            f"(expected one of {[m.value for m in cls]})"
+        )
+
+
 class UserPassStatus(IntEnum):
-    """RFC 1929 §2 username/password auth reply codes."""
+    """RFC 1929 §2 username/password authentication reply codes."""
+
     SUCCESS = 0x00
     FAILURE = 0xFF
+
+    @classmethod
+    def _missing_(cls, value: object) -> None:  # type: ignore[override]
+        raise ValueError(
+            f"{value!r} is not a valid {cls.__name__} "
+            f"(expected one of {[m.value for m in cls]})"
+        )

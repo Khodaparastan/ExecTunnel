@@ -7,7 +7,7 @@ Wire format (newline-terminated)
 Rules
 ─────
 * ``msg_type`` and ``conn_id`` MUST NOT contain ``:``, ``<``, or ``>``.
-* ``payload`` is always base64url (no padding) for DATA/UDP_DATA frames,
+* ``payload`` is always base64url (no padding) for DATA/UDP_DATA/ERROR frames,
   and ``{host}:{port}`` for OPEN frames (IPv6 hosts are bracket-quoted).
 * ``parse_frame`` splits on ``:`` at most twice so base64 payloads that
   contain ``:`` are never truncated.
@@ -28,12 +28,45 @@ Frame catalogue
 """
 
 from __future__ import annotations
-import binascii
+
 import base64
+import binascii
 import ipaddress
+import logging
 import re
 from typing import NamedTuple
+
 from .ids import ID_RE
+
+__all__ = [
+    # Constants
+    "BOOTSTRAP_CHUNK_SIZE_CHARS",
+    "FRAME_PREFIX",
+    "FRAME_SUFFIX",
+    "MAX_FRAME_LEN",
+    "PIPE_READ_CHUNK_BYTES",
+    "READY_FRAME",
+    "SESSION_CONN_ID",
+    # Types
+    "ParsedFrame",
+    # Encoders
+    "encode_conn_close_frame",
+    "encode_conn_open_frame",
+    "encode_data_frame",
+    "encode_error_frame",
+    "encode_udp_close_frame",
+    "encode_udp_data_frame",
+    "encode_udp_open_frame",
+    # Decoders / helpers
+    "decode_data_payload",
+    "encode_host_port",
+    "is_ready_frame",
+    "parse_frame",
+    "parse_host_port",
+]
+
+log = logging.getLogger(__name__)
+
 # ── Frame protocol constants ──────────────────────────────────────────────────
 
 FRAME_PREFIX: str = "<<<EXECTUNNEL:"
@@ -41,6 +74,11 @@ FRAME_SUFFIX: str = ">>>"
 
 # Sentinel emitted by the agent once it is ready to accept tunnel frames.
 READY_FRAME: str = "<<<EXECTUNNEL:AGENT_READY>>>"
+
+# Session-level error sentinel: a valid conn_id-shaped value that is
+# deliberately outside the random space (all-zero token) so callers can
+# distinguish session errors from per-connection errors.
+SESSION_CONN_ID: str = "c" + "0" * 24
 
 # Size of base64-encoded chunks sent during bootstrap.
 # 200 chars is safely under most shell input-buffer limits (512 bytes POSIX
@@ -50,8 +88,9 @@ BOOTSTRAP_CHUNK_SIZE_CHARS: int = 200
 # Read chunk size used when piping raw TCP streams (CONNECT relay).
 PIPE_READ_CHUNK_BYTES: int = 4_096
 
-# session-level error sentinel constant
-SESSION_CONN_ID: str = "c" + "0" * 24
+# Maximum accepted frame length (bytes). Frames longer than this are dropped
+# by parse_frame to guard against memory exhaustion from malformed input.
+MAX_FRAME_LEN: int = 8_192
 
 # ── Allowed message types ─────────────────────────────────────────────────────
 
@@ -68,10 +107,15 @@ _VALID_MSG_TYPES: frozenset[str] = frozenset({
 
 # ── Validation helpers ────────────────────────────────────────────────────────
 
-
 # Characters that are structurally significant in the frame wire format.
-_FRAME_UNSAFE_RE = re.compile(r"[:<>]")
-MAX_FRAME_LEN: int = 8_192
+_FRAME_UNSAFE_RE: re.Pattern[str] = re.compile(r"[:<>]", re.ASCII)
+
+# Minimal domain-name sanity check: at least one non-empty label.
+# This is intentionally loose — full RFC 1123 validation is the resolver's job.
+_DOMAIN_RE: re.Pattern[str] = re.compile(
+    r"^[A-Za-z0-9]([A-Za-z0-9\-\.]*[A-Za-z0-9])?$", re.ASCII
+)
+
 
 def _validate_id(value: str, name: str = "id") -> None:
     """Raise ``ValueError`` if *value* is not a well-formed tunnel ID."""
@@ -85,7 +129,8 @@ def _validate_msg_type(msg_type: str) -> None:
     """Raise ``ValueError`` if *msg_type* is not in the allowed catalogue."""
     if msg_type not in _VALID_MSG_TYPES:
         raise ValueError(
-            f"Unknown msg_type {msg_type!r}. Allowed: {sorted(_VALID_MSG_TYPES)}"
+            f"Unknown msg_type {msg_type!r}. "
+            f"Allowed: {sorted(_VALID_MSG_TYPES)}"
         )
 
 
@@ -100,7 +145,8 @@ def encode_host_port(host: str, port: int) -> str:
     * IPv6 addresses are bracket-quoted: ``[2001:db8::1]:8080``
     * IPv4 addresses and domain names are left bare: ``example.com:8080``
     * The port is validated to be in ``[1, 65535]``.
-    * Domain names are checked for frame-unsafe characters (``:``, ``<``, ``>``).
+    * Domain names are checked for frame-unsafe characters and basic
+      structural validity.
 
     Args:
         host: Destination hostname or IP address string.
@@ -111,9 +157,12 @@ def encode_host_port(host: str, port: int) -> str:
         ``UDP_OPEN`` frame.
 
     Raises:
-        ValueError: If *port* is out of range or *host* contains characters
-            that would corrupt the frame wire format.
+        ValueError: If *port* is out of range, *host* is empty, or *host*
+            contains characters that would corrupt the frame wire format.
     """
+    if not host:
+        raise ValueError("host must not be empty")
+
     if not (1 <= port <= 65_535):
         raise ValueError(f"Port {port} is out of range [1, 65535]")
 
@@ -127,13 +176,19 @@ def encode_host_port(host: str, port: int) -> str:
     except ValueError:
         pass  # Not an IP literal — treat as domain name.
 
-    # Domain name: reject any character that is structurally significant in
-    # the frame format.  A legitimate FQDN will never contain these.
+    # Domain name: reject frame-unsafe characters first (fast path).
     if _FRAME_UNSAFE_RE.search(host):
         raise ValueError(
             f"Host {host!r} contains frame-unsafe characters "
             f"(':', '<', '>').  Possible injection attempt."
         )
+
+    # Basic structural check: must look like a plausible hostname.
+    if not _DOMAIN_RE.match(host):
+        raise ValueError(
+            f"Host {host!r} is not a valid hostname or IP address."
+        )
+
     return f"{host}:{port}"
 
 
@@ -156,32 +211,42 @@ def parse_host_port(payload: str) -> tuple[str, int]:
         and *port* is an integer.
 
     Raises:
-        ValueError: If the payload is malformed or the port is non-numeric /
-            out of range.
+        ValueError: If the payload is malformed, the host is empty, or the
+            port is non-numeric / out of range.
     """
     if payload.startswith("["):
         # Bracket-quoted IPv6: [addr]:port
         bracket_end = payload.find("]")
         if bracket_end == -1 or payload[bracket_end + 1 : bracket_end + 2] != ":":
-            raise ValueError(f"Malformed bracketed host in payload: {payload!r}")
+            raise ValueError(
+                f"Malformed bracketed host in payload: {payload!r}"
+            )
         host = payload[1:bracket_end]
         port_str = payload[bracket_end + 2 :]
     else:
-        # IPv4 or domain — use rpartition so bare IPv6 literals (legacy, no
-        # brackets) still split on the *last* colon.
+        # IPv4 or domain — rpartition splits on the *last* colon so that
+        # bare (non-bracketed) IPv6 literals still work, though callers
+        # should always bracket-quote IPv6 via encode_host_port.
         host, sep, port_str = payload.rpartition(":")
         if not sep:
-            raise ValueError(f"Missing port separator in payload: {payload!r}")
+            raise ValueError(
+                f"Missing port separator in payload: {payload!r}"
+            )
+
+    if not host:
+        raise ValueError(f"Empty host in payload: {payload!r}")
 
     try:
         port = int(port_str)
-    except (binascii.Error, ValueError) as exc:
+    except ValueError as exc:
         raise ValueError(
             f"Non-numeric port {port_str!r} in payload: {payload!r}"
         ) from exc
 
     if not (1 <= port <= 65_535):
-        raise ValueError(f"Port {port} out of range in payload: {payload!r}")
+        raise ValueError(
+            f"Port {port} out of range in payload: {payload!r}"
+        )
 
     return host, port
 
@@ -218,13 +283,15 @@ def _encode_frame(msg_type: str, conn_id: str, payload: str = "") -> str:
     Args:
         msg_type: Must be a member of ``_VALID_MSG_TYPES``.
         conn_id:  Must match ``ID_RE``, or be ``""`` for ``AGENT_READY``.
-        payload:  Optional payload string.  Must not contain ``FRAME_SUFFIX``.
+        payload:  Optional payload string.  Must not contain ``FRAME_SUFFIX``
+                  or ``FRAME_PREFIX``.
 
     Returns:
         A newline-terminated frame string.
 
     Raises:
-        ValueError: On any validation failure.
+        ValueError: On any validation failure or if the encoded frame would
+            exceed ``MAX_FRAME_LEN``.
     """
     _validate_msg_type(msg_type)
 
@@ -232,21 +299,36 @@ def _encode_frame(msg_type: str, conn_id: str, payload: str = "") -> str:
     if conn_id:
         _validate_id(conn_id)
 
-    # Guard against payload accidentally containing the frame suffix, which
-    # would allow a crafted payload to terminate the frame early and inject
-    # a second frame on the same line.
+    # Guard against payload containing the frame suffix or prefix, which
+    # would allow a crafted payload to terminate or inject frames.
     if FRAME_SUFFIX in payload:
         raise ValueError(
             f"Payload contains the frame suffix {FRAME_SUFFIX!r}, "
             "which would corrupt the wire format."
         )
+    if FRAME_PREFIX in payload:
+        raise ValueError(
+            f"Payload contains the frame prefix {FRAME_PREFIX!r}, "
+            "which would corrupt the wire format."
+        )
 
     if conn_id and payload:
-        return f"{FRAME_PREFIX}{msg_type}:{conn_id}:{payload}{FRAME_SUFFIX}\n"
-    if conn_id:
-        return f"{FRAME_PREFIX}{msg_type}:{conn_id}{FRAME_SUFFIX}\n"
-    # No conn_id (AGENT_READY).
-    return f"{FRAME_PREFIX}{msg_type}{FRAME_SUFFIX}\n"
+        frame = f"{FRAME_PREFIX}{msg_type}:{conn_id}:{payload}{FRAME_SUFFIX}\n"
+    elif conn_id:
+        frame = f"{FRAME_PREFIX}{msg_type}:{conn_id}{FRAME_SUFFIX}\n"
+    else:
+        # No conn_id (AGENT_READY).
+        frame = f"{FRAME_PREFIX}{msg_type}{FRAME_SUFFIX}\n"
+
+    # Enforce the same length limit on encoding as on parsing.
+    # Subtract 1 for the trailing newline which parse_frame strips.
+    if len(frame) - 1 > MAX_FRAME_LEN:
+        raise ValueError(
+            f"Encoded frame length {len(frame) - 1} exceeds "
+            f"MAX_FRAME_LEN={MAX_FRAME_LEN}."
+        )
+
+    return frame
 
 
 def encode_conn_open_frame(conn_id: str, host: str, port: int) -> str:
@@ -257,7 +339,8 @@ def encode_conn_open_frame(conn_id: str, host: str, port: int) -> str:
     bracket-quotes IPv6 addresses and rejects frame-unsafe characters.
 
     Args:
-        conn_id: TCP connection ID produced by :func:`~exectunnel.protocol.ids.new_conn_id`.
+        conn_id: TCP connection ID produced by
+            :func:`~exectunnel.protocol.ids.new_conn_id`.
         host:    Destination hostname or IP address.
         port:    Destination TCP port.
 
@@ -309,7 +392,8 @@ def encode_udp_open_frame(flow_id: str, host: str, port: int) -> str:
     Same host/port normalisation rules as :func:`encode_conn_open_frame`.
 
     Args:
-        flow_id: UDP flow ID produced by :func:`~exectunnel.protocol.ids.new_flow_id`.
+        flow_id: UDP flow ID produced by
+            :func:`~exectunnel.protocol.ids.new_flow_id`.
         host:    Destination hostname or IP address.
         port:    Destination UDP port.
 
@@ -356,15 +440,17 @@ def encode_error_frame(conn_id: str, message: str) -> str:
     can be transmitted without corrupting the frame stream.
 
     Args:
-        conn_id: The connection / flow ID associated with the error, or a
-            sentinel such as ``"c" + "0" * 24`` for session-level errors.
+        conn_id: The connection / flow ID associated with the error, or
+            ``SESSION_CONN_ID`` for session-level errors.
         message: Human-readable error description.
 
     Returns:
         A newline-terminated ``ERROR`` frame string.
     """
     payload_b64 = (
-        base64.urlsafe_b64encode(message.encode("utf-8")).rstrip(b"=").decode("ascii")
+        base64.urlsafe_b64encode(message.encode("utf-8"))
+        .rstrip(b"=")
+        .decode("ascii")
     )
     return _encode_frame("ERROR", conn_id, payload_b64)
 
@@ -385,12 +471,13 @@ def decode_data_payload(payload: str) -> bytes:
     Raises:
         ValueError: If *payload* is not valid base64url.
     """
-    # Re-add stripped padding.
     padding = (4 - len(payload) % 4) % 4
     try:
         return base64.urlsafe_b64decode(payload + "=" * padding)
-    except Exception as exc:
-        raise ValueError(f"Invalid base64url payload: {payload!r}") from exc
+    except binascii.Error as exc:
+        raise ValueError(
+            f"Invalid base64url payload: {payload!r}"
+        ) from exc
 
 
 def parse_frame(line: str) -> ParsedFrame | None:
@@ -401,6 +488,9 @@ def parse_frame(line: str) -> ParsedFrame | None:
     ``None``) but strict about *structurally valid* frames that carry an
     unknown ``msg_type`` — those are also returned as ``None`` so callers can
     safely ignore them without special-casing.
+
+    Unknown ``msg_type`` values and malformed frames are logged at DEBUG level
+    to aid production diagnostics without flooding logs under normal operation.
 
     Splitting strategy
     ──────────────────
@@ -415,8 +505,11 @@ def parse_frame(line: str) -> ParsedFrame | None:
         A :class:`ParsedFrame` on success, ``None`` otherwise.
     """
     line = line.strip()
+
     if len(line) > MAX_FRAME_LEN:
+        log.debug("parse_frame: dropping oversized line (%d chars)", len(line))
         return None
+
     if not (line.startswith(FRAME_PREFIX) and line.endswith(FRAME_SUFFIX)):
         return None
 
@@ -425,9 +518,8 @@ def parse_frame(line: str) -> ParsedFrame | None:
 
     msg_type = parts[0]
 
-    # Silently drop frames with unknown message types so that future protocol
-    # versions can add new frame types without breaking older peers.
     if msg_type not in _VALID_MSG_TYPES:
+        log.debug("parse_frame: dropping frame with unknown msg_type %r", msg_type)
         return None
 
     conn_id = parts[1] if len(parts) > 1 else ""
@@ -435,6 +527,11 @@ def parse_frame(line: str) -> ParsedFrame | None:
 
     # Validate conn_id format for frames that carry one.
     if conn_id and not ID_RE.match(conn_id):
+        log.debug(
+            "parse_frame: dropping frame with malformed conn_id %r (msg_type=%r)",
+            conn_id,
+            msg_type,
+        )
         return None
 
     return ParsedFrame(msg_type=msg_type, conn_id=conn_id, payload=payload)
@@ -444,8 +541,8 @@ def is_ready_frame(line: str) -> bool:
     """
     Return ``True`` if *line* is the agent-ready sentinel frame.
 
-    Prefer this helper over comparing against ``READY_FRAME`` directly so
-    that the check is robust to trailing whitespace and future format changes.
+    Delegates to :func:`parse_frame` so that whitespace stripping and all
+    structural validation are applied consistently.
 
     Args:
         line: A single line of text from the tunnel channel.
