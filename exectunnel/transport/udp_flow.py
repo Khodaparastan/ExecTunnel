@@ -12,7 +12,7 @@ Lifecycle
 3. Call :meth:`send_datagram` / :meth:`recv_datagram` to relay datagrams.
 4. Call :meth:`close` for local teardown (sends ``UDP_CLOSE`` to agent).
    OR the agent signals closure → recv_loop calls :meth:`close_remote`.
-5. Both paths set ``_remote_closed`` so :meth:`recv_datagram` unblocks.
+5. Both paths set ``_closed`` so :meth:`recv_datagram` unblocks.
 
 Protocol alignment
 ------------------
@@ -33,7 +33,7 @@ import asyncio
 import contextlib
 import logging
 
-from exectunnel.config.defaults import TCP_INBOUND_QUEUE_CAP, UDP_WARN_EVERY
+from exectunnel.config.defaults import UDP_INBOUND_QUEUE_CAP, UDP_WARN_EVERY
 from exectunnel.exceptions import (
     ConnectionClosedError,
     FrameDecodingError,
@@ -48,10 +48,12 @@ from exectunnel.protocol.frames import (
 )
 from exectunnel.transport.connection import WsSendCallable
 
-logger = logging.getLogger("exectunnel.transport.udp_flow")
+__all__ = ["UdpFlowHandler"]
+
+logger = logging.getLogger(__name__)
 
 
-class _UdpFlowHandler:
+class UdpFlowHandler:
     """Bridges one SOCKS5 UDP ASSOCIATE flow through the tunnel.
 
     Args:
@@ -71,7 +73,7 @@ class _UdpFlowHandler:
         host: str,
         port: int,
         ws_send: WsSendCallable,
-        registry: dict[str, _UdpFlowHandler],
+        registry: dict[str, UdpFlowHandler],
     ) -> None:
         self._id = flow_id
         self._host = host
@@ -81,18 +83,17 @@ class _UdpFlowHandler:
 
         # Inbound queue: agent → local relay.
         self._inbound: asyncio.Queue[bytes] = asyncio.Queue(
-            maxsize=TCP_INBOUND_QUEUE_CAP
+            maxsize=UDP_INBOUND_QUEUE_CAP
         )
 
-        # Close event — set by both close_remote() (agent-initiated) and
-        # close() (local-initiated).  recv_datagram() races this against the
-        # inbound queue so it always unblocks promptly on closure.
-        self._remote_closed: asyncio.Event = asyncio.Event()
+        # Unified close event — set by both close() (local) and
+        # close_remote() (agent-initiated).  recv_datagram() races this
+        # against the inbound queue so it always unblocks promptly on closure.
+        self._closed_event: asyncio.Event = asyncio.Event()
 
         # Lifecycle guards.
-        # _open_attempted: set at the start of open() to prevent concurrent
-        #   open calls from racing.
-        # _opened: set only after the UDP_OPEN frame is successfully sent.
+        # _open_attempted: set only AFTER the UDP_OPEN frame is successfully
+        #   sent so that a failed open can be retried.
         # _closed: set at the start of close() to prevent concurrent teardown.
         self._open_attempted: bool = False
         self._opened: bool = False
@@ -108,10 +109,9 @@ class _UdpFlowHandler:
     async def open(self) -> None:
         """Send the ``UDP_OPEN`` control frame to the remote agent.
 
-        Idempotent — subsequent calls are no-ops.
-
-        ``_opened`` is set only after the frame is successfully sent so that
-        a failed open does not silently suppress a retry.
+        Idempotent after a **successful** open — subsequent calls are no-ops.
+        A failed open (e.g. invalid host, send timeout) does **not** set
+        ``_open_attempted``, so the caller may retry with corrected arguments.
 
         Raises:
             TransportError:
@@ -128,12 +128,12 @@ class _UdpFlowHandler:
         """
         if self._open_attempted:
             return
-        self._open_attempted = True
 
         try:
             frame = encode_udp_open_frame(self._id, self._host, self._port)
         except ValueError as exc:
             # encode_host_port raises ValueError for frame-unsafe host strings.
+            # Do NOT set _open_attempted — the caller may retry with a valid host.
             raise TransportError(
                 f"UDP flow {self._id!r}: invalid host {self._host!r} for UDP_OPEN frame.",
                 error_code="transport.udp_open_invalid_host",
@@ -151,6 +151,7 @@ class _UdpFlowHandler:
         try:
             await self._ws_send(frame, control=True)
         except (WebSocketSendTimeoutError, ConnectionClosedError):
+            # Do NOT set _open_attempted — allow retry after transient failure.
             raise
         except Exception as exc:
             raise TransportError(
@@ -165,6 +166,7 @@ class _UdpFlowHandler:
             ) from exc
 
         # Mark as opened only after successful send.
+        self._open_attempted = True
         self._opened = True
         metrics_inc("udp.flow.opened")
         logger.debug(
@@ -179,7 +181,7 @@ class _UdpFlowHandler:
 
         Idempotent — subsequent calls are no-ops.
 
-        Also sets ``_remote_closed`` so any coroutine blocked in
+        Also sets the closed event so any coroutine blocked in
         :meth:`recv_datagram` unblocks immediately.
 
         Any datagrams still queued in ``_inbound`` at close time are silently
@@ -198,15 +200,16 @@ class _UdpFlowHandler:
 
         # Wake recv_datagram() before touching the network so the caller's
         # receive loop exits cleanly even if ws_send raises.
-        self._remote_closed.set()
+        self._closed_event.set()
         self._registry.pop(self._id, None)
         metrics_inc("udp.flow.closed")
-        logger.debug("udp flow %s closing", self._id)
+        logger.debug("udp flow %s closing (local)", self._id)
 
         try:
             await self._ws_send(encode_udp_close_frame(self._id), control=True)
         except ConnectionClosedError:
             # Remote is already gone; the flow is effectively closed.
+            metrics_inc("udp.flow.close.connection_already_closed")
             logger.debug(
                 "udp flow %s: connection already closed while sending UDP_CLOSE "
                 "(remote will time-out the flow independently)",
@@ -241,7 +244,7 @@ class _UdpFlowHandler:
         if not isinstance(data, bytes):
             raise FrameDecodingError(
                 f"UDP flow {self._id!r}: feed() received a non-bytes payload.",
-                error_code="protocol.udp_feed_bad_type",
+                error_code="transport.udp_feed_bad_type",
                 details={
                     "flow_id": self._id,
                     "received_type": type(data).__name__,
@@ -273,13 +276,18 @@ class _UdpFlowHandler:
     def close_remote(self) -> None:
         """Signal that the agent has closed its side of the flow.
 
-        Sets ``_remote_closed`` so :meth:`recv_datagram` drains remaining
+        Sets the closed event so :meth:`recv_datagram` drains remaining
         queued datagrams and then returns ``None``.
 
         Idempotent — subsequent calls are no-ops.
         Safe to call before :meth:`open` or after :meth:`close`.
         """
-        self._remote_closed.set()
+        if not self._closed:
+            self._closed = True
+            self._registry.pop(self._id, None)
+            metrics_inc("udp.flow.closed_remote")
+            logger.debug("udp flow %s closed by remote", self._id)
+        self._closed_event.set()
 
     async def recv_datagram(self) -> bytes | None:
         """Return the next inbound datagram, or ``None`` when the flow is closed.
@@ -301,17 +309,16 @@ class _UdpFlowHandler:
             pass
 
         # If already closed and queue is empty, signal EOF.
-        if self._remote_closed.is_set():
+        if self._closed_event.is_set():
             return None
 
         # Block until a datagram arrives OR the flow is closed.
-        # Tasks are created once per blocking wait — not per loop iteration.
         get_task: asyncio.Task[bytes] = asyncio.create_task(
             self._inbound.get(),
             name=f"udp-flow-get-{self._id}",
         )
         close_task: asyncio.Task[None] = asyncio.create_task(
-            self._remote_closed.wait(),
+            self._closed_event.wait(),
             name=f"udp-flow-close-{self._id}",
         )
 
@@ -323,8 +330,6 @@ class _UdpFlowHandler:
         except asyncio.CancelledError:
             get_task.cancel()
             close_task.cancel()
-            # return_exceptions=True means gather never raises — suppress is
-            # redundant but kept for clarity.
             await asyncio.gather(get_task, close_task, return_exceptions=True)
             raise
 
@@ -334,23 +339,12 @@ class _UdpFlowHandler:
             with contextlib.suppress(asyncio.CancelledError):
                 await t
 
+        # get_task won — data arrived.
         if get_task in done and not get_task.cancelled():
-            # Data arrived — return it.
             return get_task.result()
 
-        # close_task fired (or both fired simultaneously).
-        # Rescue any item that get_task may have dequeued before being
-        # cancelled — dropping it would silently truncate the flow.
-        if not get_task.cancelled():
-            try:
-                item = get_task.result()
-                # Queue.get() always returns bytes; result is never None.
-                return item
-            except Exception:
-                pass
-
-        # Drain one final time in case a datagram arrived between the
-        # close signal and the task cancellation.
+        # close_task won — drain one final time in case a datagram arrived
+        # between the close signal and the task cancellation.
         try:
             return self._inbound.get_nowait()
         except asyncio.QueueEmpty:
@@ -381,7 +375,7 @@ class _UdpFlowHandler:
         if not isinstance(data, bytes):
             raise FrameDecodingError(
                 f"UDP flow {self._id!r}: send_datagram() received a non-bytes payload.",
-                error_code="protocol.udp_send_bad_type",
+                error_code="transport.udp_send_bad_type",
                 details={
                     "flow_id": self._id,
                     "received_type": type(data).__name__,
@@ -422,18 +416,18 @@ class _UdpFlowHandler:
 
     @property
     def bytes_sent(self) -> int:
-        """Total bytes successfully forwarded to the agent (outbound direction)."""
+        """Total raw bytes successfully forwarded to the agent (outbound)."""
         return self._bytes_sent
 
     @property
     def bytes_recv(self) -> int:
-        """Total bytes received from the agent (inbound direction)."""
+        """Total raw bytes received from the agent (inbound)."""
         return self._bytes_recv
 
     @property
     def is_closed(self) -> bool:
         """``True`` once :meth:`close` or :meth:`close_remote` has been called."""
-        return self._remote_closed.is_set()
+        return self._closed
 
     @property
     def is_opened(self) -> bool:
