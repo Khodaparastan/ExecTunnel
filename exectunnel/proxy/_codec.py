@@ -1,25 +1,107 @@
-"""Private low-level SOCKS5 I/O helpers."""
+"""Private low-level SOCKS5 wire I/O helpers."""
 
 from __future__ import annotations
 
 import asyncio
 import ipaddress
-import socket
+import re
 import struct
 
 from exectunnel.exceptions import ConfigurationError, ProtocolError
 from exectunnel.protocol.enums import AddrType, Reply
 
+# ── Domain-name validation ────────────────────────────────────────────────────
+
+# RFC 1123 relaxed: labels of 1-63 chars, total ≤ 253, no leading/trailing dot.
+# We also reject null bytes and the frame-unsafe chars validated by the
+# protocol layer (: < >) so a hostile domain can never corrupt a tunnel frame.
+_DOMAIN_LABEL_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9\-]{0,61}[A-Za-z0-9])?$")
+_DOMAIN_UNSAFE_RE = re.compile(r"[\x00:<>]")
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+__all__ = ["build_reply", "read_addr", "read_exact"]
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _validate_domain(domain: str) -> None:
+    """Raise :class:`ProtocolError` if *domain* is not a safe, well-formed hostname.
+
+    Checks performed:
+    * Total length ≤ 253 characters.
+    * No frame-unsafe characters (``\\x00``, ``:``, ``<``, ``>``).
+    * Each dot-separated label matches RFC 1123 rules.
+
+    Args:
+        domain: The decoded domain string to validate.
+
+    Raises:
+        ProtocolError: If any check fails.
+    """
+    if len(domain) > 253:
+        raise ProtocolError(
+            f"SOCKS5 domain name is too long: {len(domain)} chars (max 253).",
+            error_code="protocol.socks5_domain_too_long",
+            details={"length": len(domain), "max_length": 253},
+            hint="The SOCKS5 client sent a domain name exceeding the 253-character DNS limit.",
+        )
+
+    if _DOMAIN_UNSAFE_RE.search(domain):
+        raise ProtocolError(
+            f"SOCKS5 domain name {domain!r} contains unsafe characters.",
+            error_code="protocol.socks5_domain_unsafe_chars",
+            details={"domain": domain},
+            hint=(
+                "The domain name contains null bytes or frame-unsafe characters "
+                "(':', '<', '>'). This may indicate a protocol injection attempt."
+            ),
+        )
+
+    labels = domain.rstrip(".").split(".")
+    for label in labels:
+        if not label:
+            raise ProtocolError(
+                f"SOCKS5 domain name {domain!r} contains an empty label.",
+                error_code="protocol.socks5_domain_empty_label",
+                details={"domain": domain},
+                hint="Consecutive dots or a leading dot produce empty labels, which are invalid.",
+            )
+        if not _DOMAIN_LABEL_RE.match(label):
+            raise ProtocolError(
+                f"SOCKS5 domain label {label!r} in {domain!r} is not RFC 1123 compliant.",
+                error_code="protocol.socks5_domain_bad_label",
+                details={"domain": domain, "label": label},
+                hint=(
+                    "Each DNS label must start and end with an alphanumeric character "
+                    "and contain only letters, digits, and hyphens."
+                ),
+            )
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
 
 async def read_exact(reader: asyncio.StreamReader, n: int) -> bytes:
     """Read exactly *n* bytes from *reader*.
 
-    Raises
-    ------
-    ProtocolError
-        If the stream ends before *n* bytes are available (client disconnected
-        mid-handshake or sent a truncated SOCKS5 message).
+    Args:
+        reader: The asyncio stream to read from.
+        n:      Number of bytes to read.  Must be ≥ 1.
+
+    Returns:
+        Exactly *n* bytes.
+
+    Raises:
+        ValueError:   If *n* is zero — indicates a caller logic bug.
+        ProtocolError: If the stream ends before *n* bytes are available.
     """
+    if n < 1:
+        raise ValueError(
+            f"read_exact() called with n={n}; must be ≥ 1. "
+            "This is a caller bug — check the SOCKS5 length field before calling."
+        )
     try:
         return await reader.readexactly(n)
     except asyncio.IncompleteReadError as exc:
@@ -41,12 +123,26 @@ async def read_exact(reader: asyncio.StreamReader, n: int) -> bytes:
 async def read_addr(reader: asyncio.StreamReader) -> tuple[str, int]:
     """Read ``ATYP + address + port`` from *reader* and return ``(host, port)``.
 
-    Raises
-    ------
-    ProtocolError
-        If the address type is unsupported, the domain length is zero, the
-        domain bytes are not valid UTF-8, or the stream is truncated at any
-        point during the read.
+    Uses :mod:`ipaddress` for IP parsing (portable across all platforms,
+    including Windows builds that lack ``socket.inet_ntop``).
+
+    Args:
+        reader: The asyncio stream positioned immediately before the ATYP byte.
+
+    Returns:
+        A ``(host, port)`` tuple.  *host* is a normalised string:
+        compressed IPv6 notation for IPv6 addresses, dotted-decimal for IPv4,
+        and the raw decoded string for domain names.
+
+    Raises:
+        ProtocolError:
+            * Unsupported address type.
+            * Zero-length domain.
+            * Domain fails RFC 1123 / safety validation.
+            * Domain bytes are not valid UTF-8.
+            * Port is zero (not a valid destination port).
+        ProtocolError (via :func:`read_exact`):
+            Stream truncated at any point during the read.
     """
     atyp_byte = await read_exact(reader, 1)
     atyp = atyp_byte[0]
@@ -54,8 +150,8 @@ async def read_addr(reader: asyncio.StreamReader) -> tuple[str, int]:
     if atyp == AddrType.IPV4:
         raw = await read_exact(reader, 4)
         try:
-            host = socket.inet_ntop(socket.AF_INET, raw)
-        except OSError as exc:
+            host = str(ipaddress.IPv4Address(raw))
+        except ValueError as exc:
             raise ProtocolError(
                 "Failed to parse IPv4 address bytes from SOCKS5 request.",
                 error_code="protocol.socks5_bad_ipv4",
@@ -66,8 +162,8 @@ async def read_addr(reader: asyncio.StreamReader) -> tuple[str, int]:
     elif atyp == AddrType.IPV6:
         raw = await read_exact(reader, 16)
         try:
-            host = socket.inet_ntop(socket.AF_INET6, raw)
-        except OSError as exc:
+            host = str(ipaddress.IPv6Address(raw).compressed)
+        except ValueError as exc:
             raise ProtocolError(
                 "Failed to parse IPv6 address bytes from SOCKS5 request.",
                 error_code="protocol.socks5_bad_ipv6",
@@ -90,7 +186,7 @@ async def read_addr(reader: asyncio.StreamReader) -> tuple[str, int]:
             )
         raw_host = await read_exact(reader, length)
         try:
-            host = raw_host.decode()
+            host = raw_host.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise ProtocolError(
                 "SOCKS5 DOMAIN address bytes are not valid UTF-8.",
@@ -104,6 +200,8 @@ async def read_addr(reader: asyncio.StreamReader) -> tuple[str, int]:
                     "as UTF-8. Only ASCII/UTF-8 hostnames are supported."
                 ),
             ) from exc
+        # Validate domain structure and safety before it touches any frame.
+        _validate_domain(host)
 
     else:
         raise ProtocolError(
@@ -118,34 +216,62 @@ async def read_addr(reader: asyncio.StreamReader) -> tuple[str, int]:
 
     port_raw = await read_exact(reader, 2)
     port = struct.unpack("!H", port_raw)[0]
+
+    if port == 0:
+        raise ProtocolError(
+            f"SOCKS5 request destination port is 0 for host {host!r}.",
+            error_code="protocol.socks5_zero_port",
+            details={"host": host, "atyp": hex(atyp)},
+            hint="Port 0 is not a valid destination port in a SOCKS5 request.",
+        )
+
     return host, port
 
 
 def build_reply(
-    reply: Reply,
+    reply: Reply | int,
     bind_host: str = "0.0.0.0",
     bind_port: int = 0,
 ) -> bytes:
     """Serialise a SOCKS5 reply packet.
 
-    Parameters
-    ----------
-    reply:
-        The SOCKS5 reply code to include in the response.
-    bind_host:
-        The ``BND.ADDR`` field value.  Must be a valid IPv4 or IPv6 address
-        string — RFC 1928 §6 prohibits domain names in replies.
-    bind_port:
-        The ``BND.PORT`` field value.  Must be in the range ``[0, 65535]``.
+    Args:
+        reply:     The SOCKS5 reply code.  Accepts a :class:`Reply` member or
+                   a raw ``int`` — the value is coerced to :class:`Reply` so
+                   unknown codes are rejected early.
+        bind_host: The ``BND.ADDR`` field.  Must be a valid IPv4 or IPv6
+                   address string — RFC 1928 §6 prohibits domain names in
+                   replies.  Defaults to ``"0.0.0.0"``.
+        bind_port: The ``BND.PORT`` field.  Must be in ``[0, 65535]``.
+                   Defaults to ``0``.
 
-    Raises
-    ------
-    ConfigurationError
-        If *bind_port* is outside ``[0, 65535]`` or *bind_host* is not a
-        valid IP address string.  Both indicate a programming error in the
-        caller rather than a client-side protocol violation.
+    Returns:
+        A serialised SOCKS5 reply packet as :class:`bytes`.
+
+    Raises:
+        ConfigurationError:
+            * *reply* is not a valid :class:`Reply` code.
+            * *bind_port* is outside ``[0, 65535]``.
+            * *bind_host* is not a valid IP address string.
     """
-    if not (0 <= bind_port <= 65535):
+    # Coerce and validate reply code — rejects arbitrary ints early.
+    try:
+        reply = Reply(reply)
+    except ValueError as exc:
+        raise ConfigurationError(
+            f"reply {reply!r} is not a valid SOCKS5 Reply code.",
+            error_code="config.socks5_invalid_reply_code",
+            details={
+                "reply": reply,
+                "valid_codes": [r.value for r in Reply],
+            },
+            hint=(
+                "Pass a member of exectunnel.protocol.enums.Reply. "
+                "This is a caller bug, not a client error."
+            ),
+        ) from exc
+
+    if not (0 <= bind_port <= 65_535):
         raise ConfigurationError(
             f"bind_port {bind_port!r} is out of the valid range [0, 65535].",
             error_code="config.socks5_invalid_bind_port",
@@ -154,7 +280,7 @@ def build_reply(
                 "valid_range": "0–65535",
             },
             hint=(
-                "Ensure the bind_port passed to _build_reply() is a valid "
+                "Ensure the bind_port passed to build_reply() is a valid "
                 "TCP/UDP port number. This is a caller bug, not a client error."
             ),
         )
@@ -162,8 +288,6 @@ def build_reply(
     try:
         addr = ipaddress.ip_address(bind_host)
     except ValueError as exc:
-        # RFC 1928 §6: BND.ADDR in a reply MUST be an IP address.
-        # DOMAIN address type is only valid in requests, not replies.
         raise ConfigurationError(
             f"bind_host {bind_host!r} is not a valid IP address; "
             "SOCKS5 replies must use an IP address for BND.ADDR (RFC 1928 §6).",
@@ -185,6 +309,3 @@ def build_reply(
         + addr.packed
         + struct.pack("!H", bind_port)
     )
-
-
-__all__ = ["build_reply", "read_addr", "read_exact"]

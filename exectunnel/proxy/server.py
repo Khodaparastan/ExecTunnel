@@ -5,12 +5,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 
 from exectunnel.config.defaults import HANDSHAKE_TIMEOUT_SECS
 from exectunnel.exceptions import (
     ExecTunnelError,
-    FrameDecodingError,
     ProtocolError,
     TransportError,
 )
@@ -24,13 +23,15 @@ logger = logging.getLogger("exectunnel.proxy")
 
 
 class Socks5Server:
-    """
-    Async SOCKS5 server.  Yields :class:`Socks5Request` objects via
-    ``async for``.
+    """Async SOCKS5 server.  Yields :class:`Socks5Request` objects via ``async for``.
 
     The server owns the accept loop; each accepted connection is negotiated
     asynchronously.  If negotiation fails (bad version, unsupported auth, …)
     the connection is silently closed and logged at DEBUG level.
+
+    Only one consumer of the async iterator is supported.  Calling
+    ``async for`` twice on the same server instance produces undefined
+    behaviour.
 
     Example::
 
@@ -47,24 +48,33 @@ class Socks5Server:
         port: int = 1080,
         handshake_timeout: float = HANDSHAKE_TIMEOUT_SECS,
     ) -> None:
-        self._host = host
-        self._port = port
-        self._handshake_timeout = handshake_timeout
+        self._host: str = host
+        self._port: int = port
+        self._handshake_timeout: float = handshake_timeout
         self._queue: asyncio.Queue[Socks5Request | None] = asyncio.Queue()
         self._server: asyncio.Server | None = None
-        self._stopped = False
+        self._stopped: bool = False
+        self._started: bool = False
+        # Track in-flight handshake tasks so stop() can cancel them.
+        self._handshake_tasks: set[asyncio.Task[None]] = set()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
         """Bind the SOCKS5 listen socket and begin accepting connections.
 
-        Raises
-        ------
-        TransportError
-            If the OS refuses to bind the listen socket (e.g. port already in
-            use, insufficient permissions).
+        Raises:
+            RuntimeError:   If :meth:`start` has already been called.
+            TransportError: If the OS refuses to bind the listen socket
+                            (e.g. port already in use, insufficient permissions).
         """
+        if self._started:
+            raise RuntimeError(
+                "Socks5Server.start() has already been called. "
+                "Create a new Socks5Server instance to rebind."
+            )
+        self._started = True
+
         try:
             self._server = await asyncio.start_server(
                 self._handle_client, self._host, self._port
@@ -87,6 +97,7 @@ class Socks5Server:
 
         logger.info("SOCKS5 listening on %s:%d", self._host, self._port)
         metrics_inc("socks5.server.started")
+
         if self._host not in ("127.0.0.1", "::1", "localhost"):
             logger.warning(
                 "SOCKS5 server bound to non-loopback address %s:%d — "
@@ -97,38 +108,57 @@ class Socks5Server:
             )
 
     async def stop(self) -> None:
-        """Close the listen socket, drain unconsumed requests, and signal the iterator."""
+        """Close the listen socket, cancel in-flight handshakes, drain the queue.
+
+        Safe to call before :meth:`start` — a no-op in that case.
+        """
+        if self._stopped:
+            return
         self._stopped = True
         metrics_inc("socks5.server.stopped")
-        # Close the server socket first so no new connections are accepted
-        # before we enqueue the sentinel — prevents late _handle_client
-        # completions from enqueuing requests after the sentinel.
-        if self._server:
+
+        # Stop accepting new connections first so no new _handle_client
+        # coroutines are spawned after we cancel existing ones.
+        if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
-        # Unblock any task waiting on _queue.get() so it can observe _stopped.
+
+        # Cancel all in-flight handshake tasks and wait for them to finish
+        # so their writers are properly closed before we drain the queue.
+        if self._handshake_tasks:
+            for task in list(self._handshake_tasks):
+                task.cancel()
+            await asyncio.gather(*self._handshake_tasks, return_exceptions=True)
+            self._handshake_tasks.clear()
+
+        # Signal the async iterator to stop.
         await self._queue.put(None)
+
         # Drain any requests that were queued but never consumed.
         while not self._queue.empty():
             try:
                 req = self._queue.get_nowait()
-                if not isinstance(req, Socks5Request):
-                    continue
-                if req.udp_relay is not None:
-                    req.udp_relay.close()
-                with contextlib.suppress(OSError):
-                    req.writer.close()
-                with contextlib.suppress(OSError):
-                    await req.writer.wait_closed()
             except asyncio.QueueEmpty:
                 break
+            if isinstance(req, Socks5Request):
+                await req.close()
+
+    # ── Async context manager ─────────────────────────────────────────────────
+
+    async def __aenter__(self) -> Socks5Server:
+        await self.start()
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        await self.stop()
 
     # ── Async iteration ───────────────────────────────────────────────────────
 
-    def __aiter__(self) -> AsyncIterator[Socks5Request]:
+    def __aiter__(self) -> AsyncGenerator[Socks5Request]:
         return self._iter()
 
-    async def _iter(self) -> AsyncIterator[Socks5Request]:
+    async def _iter(self) -> AsyncGenerator[Socks5Request]:
+        """Yield :class:`Socks5Request` objects until :meth:`stop` is called."""
         while True:
             req = await self._queue.get()
             if req is None or self._stopped:
@@ -144,23 +174,18 @@ class Socks5Server:
     ) -> None:
         """Accept one TCP connection and run the SOCKS5 handshake.
 
-        All failures are caught here and converted to metrics + log entries so
-        that a single bad client never tears down the server.  The exception
-        hierarchy drives distinct handling per failure domain:
-
-        * :class:`ProtocolError`     – client sent a malformed or unsupported
-          SOCKS5 message; log at DEBUG (very common, not actionable).
-        * :class:`FrameDecodingError`– stream truncated or address bytes
-          corrupt; log at DEBUG (subset of protocol errors).
-        * :class:`TransportError`    – UDP relay bind failed during
-          ``UDP_ASSOCIATE``; log at WARNING (operator-actionable).
-        * :class:`ExecTunnelError`   – any other library error; log at WARNING.
-        * ``asyncio.TimeoutError``   – handshake exceeded the configured limit.
-        * ``OSError``                – socket I/O error during handshake.
-        * ``Exception``              – truly unexpected; log at WARNING with traceback.
+        Registers itself as a tracked task so :meth:`stop` can cancel it.
+        All failures are caught here so a single bad client never tears down
+        the server.
         """
+        task = asyncio.current_task()
+        if task is not None:
+            self._handshake_tasks.add(task)
+
+        # Capture start time before span setup to exclude tracing overhead.
+        start = asyncio.get_running_loop().time()
+
         with span("socks5.handshake"):
-            start = asyncio.get_running_loop().time()
             metrics_inc("socks5.handshake.started")
             try:
                 req = await asyncio.wait_for(
@@ -177,29 +202,9 @@ class Socks5Server:
                     "socks5 handshake timed out after %.1fs",
                     self._handshake_timeout,
                 )
-                with contextlib.suppress(OSError):
-                    writer.close()
-                    await writer.wait_closed()
-
-            except FrameDecodingError as exc:
-                # Stream truncated or address bytes corrupt — very common when
-                # clients disconnect mid-handshake; log at DEBUG.
-                metrics_inc(
-                    "socks5.handshake.error",
-                    error=exc.error_code.replace(".", "_"),
-                )
-                logger.debug(
-                    "socks5 handshake frame error [%s]: %s (error_id=%s)",
-                    exc.error_code,
-                    exc.message,
-                    exc.error_id,
-                )
-                with contextlib.suppress(OSError):
-                    writer.close()
-                    await writer.wait_closed()
+                await _close_writer(writer)
 
             except ProtocolError as exc:
-                # Client sent a malformed or unsupported SOCKS5 message.
                 metrics_inc(
                     "socks5.handshake.error",
                     error=exc.error_code.replace(".", "_"),
@@ -210,12 +215,9 @@ class Socks5Server:
                     exc.message,
                     exc.error_id,
                 )
-                with contextlib.suppress(OSError):
-                    writer.close()
-                    await writer.wait_closed()
+                await _close_writer(writer)
 
             except TransportError as exc:
-                # UDP relay bind failed — operator-actionable; log at WARNING.
                 metrics_inc(
                     "socks5.handshake.error",
                     error=exc.error_code.replace(".", "_"),
@@ -226,12 +228,9 @@ class Socks5Server:
                     exc.message,
                     exc.error_id,
                 )
-                with contextlib.suppress(OSError):
-                    writer.close()
-                    await writer.wait_closed()
+                await _close_writer(writer)
 
             except ExecTunnelError as exc:
-                # Catch-all for any other library error.
                 metrics_inc(
                     "socks5.handshake.error",
                     error=exc.error_code.replace(".", "_"),
@@ -242,30 +241,35 @@ class Socks5Server:
                     exc.message,
                     exc.error_id,
                 )
-                with contextlib.suppress(OSError):
-                    writer.close()
-                    await writer.wait_closed()
+                await _close_writer(writer)
 
             except OSError as exc:
-                metrics_inc("socks5.handshake.error", error="OSError")
+                metrics_inc("socks5.handshake.error", error="os_error")
                 logger.debug("socks5 handshake I/O error: %s", exc)
-                with contextlib.suppress(OSError):
-                    writer.close()
-                    await writer.wait_closed()
+                await _close_writer(writer)
+
+            except asyncio.CancelledError:
+                # stop() cancelled this task — close the writer and re-raise
+                # so the task exits cleanly.
+                await _close_writer(writer)
+                raise
 
             except Exception as exc:
-                metrics_inc("socks5.handshake.error", error=exc.__class__.__name__)
+                metrics_inc(
+                    "socks5.handshake.error",
+                    error=type(exc).__name__,
+                )
                 logger.warning("socks5 handshake unexpected failure: %s", exc)
                 logger.debug("socks5 handshake traceback", exc_info=True)
-                with contextlib.suppress(OSError):
-                    writer.close()
-                    await writer.wait_closed()
+                await _close_writer(writer)
 
             finally:
                 metrics_observe(
                     "socks5.handshake.duration_sec",
                     asyncio.get_running_loop().time() - start,
                 )
+                if task is not None:
+                    self._handshake_tasks.discard(task)
 
     # ── SOCKS5 negotiation ────────────────────────────────────────────────────
 
@@ -279,17 +283,18 @@ class Socks5Server:
         Returns ``None`` when the command is valid but not supported (e.g.
         ``BIND``) — the appropriate SOCKS5 error reply has already been sent.
 
-        Raises
-        ------
-        ProtocolError
-            If the client sends a non-SOCKS5 greeting, a bad request version,
-            an unsupported ``CMD``, or a zero port for ``CONNECT``.
-        FrameDecodingError
-            If the stream is truncated or the address bytes are corrupt
-            (propagated from :func:`_read_exact` and :func:`_read_addr`).
-        TransportError
-            If the UDP relay socket cannot be bound during ``UDP_ASSOCIATE``
-            (propagated from :meth:`UdpRelay.start`).
+        Raises:
+            ProtocolError:
+                * Non-SOCKS5 greeting (bad version byte).
+                * Client does not offer ``NO_AUTH``.
+                * Bad request version byte.
+                * Non-zero RSV byte.
+                * Unsupported ``CMD`` byte.
+                * Zero destination port for ``CONNECT``.
+                * Address parse errors (propagated from :func:`read_addr`).
+            TransportError:
+                UDP relay socket cannot be bound during ``UDP_ASSOCIATE``
+                (propagated from :meth:`UdpRelay.start`).
         """
         # ── Greeting: VER(1) + NMETHODS(1) + METHODS(N) ──────────────────────
         header = await read_exact(reader, 2)
@@ -308,21 +313,29 @@ class Socks5Server:
             )
 
         nmethods = header[1]
+        # Guard against nmethods=0 before calling read_exact.
+        if nmethods == 0:
+            await _write_and_drain_suppress(writer, bytes([0x05, AuthMethod.NO_ACCEPT]))
+            raise ProtocolError(
+                "SOCKS5 greeting lists zero authentication methods.",
+                error_code="protocol.socks5_no_methods",
+                details={"nmethods": nmethods},
+                hint="The SOCKS5 client sent a greeting with no authentication methods.",
+            )
+
         methods = await read_exact(reader, nmethods)
 
-        if AuthMethod.NO_AUTH not in methods:
-            writer.write(bytes([0x05, AuthMethod.NO_ACCEPT]))
-            with contextlib.suppress(OSError):
-                await writer.drain()
-            with contextlib.suppress(OSError):
-                writer.close()
-                await writer.wait_closed()
+        # Check for NO_AUTH using integer membership on bytes (IntEnum-safe).
+        if int(AuthMethod.NO_AUTH) not in methods:
+            await _write_and_drain_suppress(
+                writer, bytes([0x05, int(AuthMethod.NO_ACCEPT)])
+            )
             raise ProtocolError(
                 "SOCKS5 client does not support NO_AUTH (method 0x00).",
                 error_code="protocol.socks5_no_auth_not_offered",
                 details={
                     "offered_methods": list(methods),
-                    "required_method": AuthMethod.NO_AUTH,
+                    "required_method": int(AuthMethod.NO_AUTH),
                 },
                 hint=(
                     "Configure the SOCKS5 client to use no-authentication mode. "
@@ -330,8 +343,7 @@ class Socks5Server:
                 ),
             )
 
-        writer.write(bytes([0x05, AuthMethod.NO_AUTH]))
-        await writer.drain()
+        await _write_and_drain_suppress(writer, bytes([0x05, int(AuthMethod.NO_AUTH)]))
 
         # ── Request: VER(1) + CMD(1) + RSV(1) + ATYP+addr+port ──────────────
         req_header = await read_exact(reader, 3)
@@ -347,7 +359,6 @@ class Socks5Server:
             )
 
         if req_header[2] != 0x00:
-            # RSV byte must be 0x00 per RFC 1928 §4.
             await _write_and_drain_suppress(writer, build_reply(Reply.GENERAL_FAILURE))
             raise ProtocolError(
                 f"SOCKS5 request RSV byte is {req_header[2]:#x}, expected 0x00.",
@@ -372,27 +383,27 @@ class Socks5Server:
                 ),
             )
 
-        # _read_addr raises ProtocolError / FrameDecodingError on bad input.
+        # read_addr validates port != 0 internally; raises ProtocolError on
+        # any malformed address field.
         host, port = await read_addr(reader)
-
-        if cmd == Cmd.CONNECT and port == 0:
-            await _write_and_drain_suppress(writer, build_reply(Reply.GENERAL_FAILURE))
-            raise ProtocolError(
-                f"SOCKS5 CONNECT request for {host!r} has port 0.",
-                error_code="protocol.socks5_connect_zero_port",
-                details={"host": host, "port": port},
-                hint="Port 0 is not a valid destination for a CONNECT request.",
-            )
 
         if cmd == Cmd.CONNECT:
             return Socks5Request(
-                cmd=cmd, host=host, port=port, reader=reader, writer=writer
+                cmd=cmd,
+                host=host,
+                port=port,
+                reader=reader,
+                writer=writer,
             )
 
         if cmd == Cmd.UDP_ASSOCIATE:
-            # TransportError propagates to _handle_client if relay bind fails.
+            # Pass the client's declared address as a hint for source filtering.
+            # RFC 1928 §7: the host/port may be 0.0.0.0:0 if the client does
+            # not know its sending address; UdpRelay.start() handles that case.
             relay = UdpRelay()
-            await relay.start()
+            relay_port = await relay.start(
+                expected_client_addr=(host, port) if port != 0 else None
+            )
             return Socks5Request(
                 cmd=cmd,
                 host=host,
@@ -402,8 +413,7 @@ class Socks5Server:
                 udp_relay=relay,
             )
 
-        # BIND and any future commands — send CMD_NOT_SUPPORTED and return None
-        # so _handle_client does not enqueue a request it cannot route.
+        # BIND and any future unknown commands.
         await _write_and_drain_suppress(writer, build_reply(Reply.CMD_NOT_SUPPORTED))
         return None
 
@@ -411,27 +421,34 @@ class Socks5Server:
 # ── Module-level helpers ──────────────────────────────────────────────────────
 
 
-def _write_and_suppress(writer: asyncio.StreamWriter, data: bytes) -> None:
-    """Write *data* to *writer*, suppressing any ``OSError``.
+async def _close_writer(writer: asyncio.StreamWriter) -> None:
+    """Close *writer*, suppressing ``OSError`` and ``RuntimeError``.
+
+    Centralised so the identical close pattern is not repeated in every
+    ``except`` branch of :meth:`Socks5Server._handle_client`.
+
+    Args:
+        writer: The asyncio stream writer to close.
+    """
+    with contextlib.suppress(OSError, RuntimeError):
+        writer.close()
+        await writer.wait_closed()
+
+
+async def _write_and_drain_suppress(
+    writer: asyncio.StreamWriter,
+    data: bytes,
+) -> None:
+    """Write *data* and drain, suppressing ``OSError`` and ``RuntimeError``.
 
     Used for best-effort error-reply writes inside ``_negotiate`` where the
-    connection may already be half-closed.  ``drain()`` is called to flush the
-    kernel write buffer so the SOCKS5 error reply reaches the client before the
-    socket is closed by the caller.  Both the write and drain are suppressed on
-    ``OSError`` because the connection may already be half-closed.
+    connection may already be half-closed.
+
+    Args:
+        writer: The asyncio stream writer to write to.
+        data:   Raw bytes to write.
     """
-    with contextlib.suppress(OSError):
+    with contextlib.suppress(OSError, RuntimeError):
         writer.write(data)
-
-
-async def _write_and_drain_suppress(writer: asyncio.StreamWriter, data: bytes) -> None:
-    """Write *data* and drain, suppressing ``OSError`` on either operation.
-
-    Async variant of :func:`_write_and_suppress` that also flushes the kernel
-    write buffer so the SOCKS5 error reply actually reaches the client before
-    the caller closes the socket.
-    """
-    with contextlib.suppress(OSError):
-        writer.write(data)
-    with contextlib.suppress(OSError):
+    with contextlib.suppress(OSError, RuntimeError):
         await writer.drain()
