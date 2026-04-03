@@ -79,18 +79,22 @@ class _UdpFlowHandler:
         self._ws_send = ws_send
         self._registry = registry
 
-        # Inbound queue: agent → local relay.  No None sentinel — closure is
-        # signalled exclusively via _remote_closed.
+        # Inbound queue: agent → local relay.
         self._inbound: asyncio.Queue[bytes] = asyncio.Queue(
             maxsize=TCP_INBOUND_QUEUE_CAP
         )
 
-        # Single event replaces both _close_remote_requested bool and
-        # _close_event asyncio.Event — one piece of state, one source of truth.
-        # Set by both close_remote() (agent-initiated) and close() (local).
-        self._remote_closed = asyncio.Event()
+        # Close event — set by both close_remote() (agent-initiated) and
+        # close() (local-initiated).  recv_datagram() races this against the
+        # inbound queue so it always unblocks promptly on closure.
+        self._remote_closed: asyncio.Event = asyncio.Event()
 
         # Lifecycle guards.
+        # _open_attempted: set at the start of open() to prevent concurrent
+        #   open calls from racing.
+        # _opened: set only after the UDP_OPEN frame is successfully sent.
+        # _closed: set at the start of close() to prevent concurrent teardown.
+        self._open_attempted: bool = False
         self._opened: bool = False
         self._closed: bool = False
 
@@ -106,6 +110,9 @@ class _UdpFlowHandler:
 
         Idempotent — subsequent calls are no-ops.
 
+        ``_opened`` is set only after the frame is successfully sent so that
+        a failed open does not silently suppress a retry.
+
         Raises:
             TransportError:
                 * If *host* contains frame-unsafe characters (propagated from
@@ -119,9 +126,9 @@ class _UdpFlowHandler:
             ConnectionClosedError:
                 If the underlying WebSocket connection is already closed.
         """
-        if self._opened:
+        if self._open_attempted:
             return
-        self._opened = True
+        self._open_attempted = True
 
         try:
             frame = encode_udp_open_frame(self._id, self._host, self._port)
@@ -143,7 +150,6 @@ class _UdpFlowHandler:
 
         try:
             await self._ws_send(frame, control=True)
-            metrics_inc("udp.flow.opened")
         except (WebSocketSendTimeoutError, ConnectionClosedError):
             raise
         except Exception as exc:
@@ -157,6 +163,16 @@ class _UdpFlowHandler:
                 },
                 hint="Check WebSocket connectivity to the remote agent.",
             ) from exc
+
+        # Mark as opened only after successful send.
+        self._opened = True
+        metrics_inc("udp.flow.opened")
+        logger.debug(
+            "udp flow %s opened → %s:%d",
+            self._id,
+            self._host,
+            self._port,
+        )
 
     async def close(self) -> None:
         """Evict this flow from the registry and send the ``UDP_CLOSE`` frame.
@@ -185,6 +201,7 @@ class _UdpFlowHandler:
         self._remote_closed.set()
         self._registry.pop(self._id, None)
         metrics_inc("udp.flow.closed")
+        logger.debug("udp flow %s closing", self._id)
 
         try:
             await self._ws_send(encode_udp_close_frame(self._id), control=True)
@@ -288,7 +305,7 @@ class _UdpFlowHandler:
             return None
 
         # Block until a datagram arrives OR the flow is closed.
-        # Create tasks once per blocking wait — not per loop iteration.
+        # Tasks are created once per blocking wait — not per loop iteration.
         get_task: asyncio.Task[bytes] = asyncio.create_task(
             self._inbound.get(),
             name=f"udp-flow-get-{self._id}",
@@ -304,14 +321,14 @@ class _UdpFlowHandler:
                 return_when=asyncio.FIRST_COMPLETED,
             )
         except asyncio.CancelledError:
-            # Task was cancelled externally — clean up and propagate.
             get_task.cancel()
             close_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await asyncio.gather(get_task, close_task, return_exceptions=True)
+            # return_exceptions=True means gather never raises — suppress is
+            # redundant but kept for clarity.
+            await asyncio.gather(get_task, close_task, return_exceptions=True)
             raise
 
-        # Cancel and await all pending tasks to release resources.
+        # Cancel and await the loser to release its resources.
         for t in pending:
             t.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -325,12 +342,14 @@ class _UdpFlowHandler:
         # Rescue any item that get_task may have dequeued before being
         # cancelled — dropping it would silently truncate the flow.
         if not get_task.cancelled():
-            with contextlib.suppress(Exception):
+            try:
                 item = get_task.result()
-                if item is not None:
-                    return item
+                # Queue.get() always returns bytes; result is never None.
+                return item
+            except Exception:
+                pass
 
-        # Drain one final time in case datagrams arrived between the
+        # Drain one final time in case a datagram arrived between the
         # close signal and the task cancellation.
         try:
             return self._inbound.get_nowait()
@@ -348,20 +367,16 @@ class _UdpFlowHandler:
         accepts raw ``bytes`` and applies ``urlsafe_b64encode`` with no padding
         internally — no manual base64 encoding is performed here.
 
-        The frame is placed on the data send queue (not the control queue).
-        When the data queue is full, ``_ws_send`` drops the frame silently —
-        this is intentional UDP semantics (datagrams may be lost).
-
         Args:
             data: Raw datagram bytes to forward to the agent.
 
         Raises:
-            FrameDecodingError:       If *data* is not a ``bytes`` instance.
+            FrameDecodingError:        If *data* is not a ``bytes`` instance.
             WebSocketSendTimeoutError: If the WebSocket send stalls beyond the
                                        configured timeout.
-            ConnectionClosedError:    If the connection is closed before the
+            ConnectionClosedError:     If the connection is closed before the
                                        frame can be sent.
-            TransportError:           For any other transport-level failure.
+            TransportError:            For any other transport-level failure.
         """
         if not isinstance(data, bytes):
             raise FrameDecodingError(
@@ -374,8 +389,6 @@ class _UdpFlowHandler:
                 hint="Ensure callers pass raw bytes to send_datagram().",
             )
 
-        # encode_udp_data_frame accepts raw bytes and handles urlsafe_b64encode
-        # with no padding — no manual encoding step needed.
         frame = encode_udp_data_frame(self._id, data)
 
         try:
@@ -424,5 +437,5 @@ class _UdpFlowHandler:
 
     @property
     def is_opened(self) -> bool:
-        """``True`` once :meth:`open` has been called successfully."""
+        """``True`` once :meth:`open` has completed successfully."""
         return self._opened

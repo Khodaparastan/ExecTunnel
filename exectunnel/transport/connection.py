@@ -13,22 +13,20 @@ Lifecycle
 2. Call :meth:`start` once the agent ACKs the connection.
 3. The agent signals close via ``CONN_CLOSE`` or ``ERROR`` →
    recv_loop calls :meth:`close_remote`, which sets ``_remote_closed``
-   and wakes ``_downstream`` via ``_remote_closed_event``.
+   and wakes ``_downstream`` via the close event.
 4. ``_downstream`` drains all queued data, writes EOF, then exits.
 5. Either direction finishing triggers :meth:`_on_task_done`, which
-   cancels the sibling task and schedules :meth:`_cleanup`.
+   cancels the sibling task (unless half-close applies) and schedules
+   :meth:`_cleanup`.
 6. :meth:`_cleanup` awaits both tasks, evicts from registry, closes writer.
 
-Half-close note
----------------
-When the local client sends EOF, ``_upstream`` finishes cleanly and sends
-``CONN_CLOSE`` to the agent.  The agent does ``SHUT_WR`` on the remote socket
-and waits up to 30 s for the remote to close its side before emitting
-``CONN_CLOSED_ACK``.  During that window ``_downstream`` is blocked on
-``_inbound.get()`` and the writer is held open.  If the remote never closes,
-both the agent thread and the local ``_downstream`` task leak for up to 30 s
-per connection — acceptable for normal traffic but can accumulate under high
-connection churn with misbehaving remote servers.
+Half-close semantics
+--------------------
+When the local client sends EOF, ``_upstream`` finishes cleanly
+(``_upstream_ended_cleanly = True``) and sends ``CONN_CLOSE`` to the agent.
+``_on_task_done`` detects this and keeps ``_downstream`` alive so the remote
+server's response can still be delivered.  The peer task is only cancelled
+when the finishing task ended with an error or cancellation.
 
 Protocol alignment
 ------------------
@@ -76,7 +74,7 @@ _WRITER_CLOSE_TIMEOUT_SECS: float = 5.0
 _DOWNSTREAM_BATCH_SIZE: int = 16
 
 
-# ── ws_send callable type ─────────────────────────────────────────────────────
+# ── WsSendCallable ────────────────────────────────────────────────────────────
 
 
 @runtime_checkable
@@ -85,11 +83,15 @@ class WsSendCallable(Protocol):
 
     Implementations must accept:
 
-    * ``frame``       — the newline-terminated frame string to send.
-    * ``must_queue``  — if ``True``, block until the frame is enqueued even
-                        when the send queue is under backpressure.
-    * ``control``     — if ``True``, the frame is a control/priority frame
-                        that bypasses normal flow-control ordering.
+    * ``frame``      — the newline-terminated frame string to send.
+    * ``must_queue`` — if ``True``, block until the frame is enqueued even
+                       when the send queue is under backpressure.  Mutually
+                       exclusive with ``control=True``; if both are ``True``
+                       the implementation MUST treat ``control`` as dominant
+                       (i.e. bypass flow control and enqueue immediately).
+    * ``control``    — if ``True``, the frame is a priority control frame
+                       that bypasses normal flow-control ordering.
+                       ``must_queue`` is ignored when ``control=True``.
     """
 
     def __call__(
@@ -128,7 +130,7 @@ def _require_bytes(data: object, conn_id: str, method: str) -> bytes:
             },
             hint=f"Ensure the frame decoder always passes raw bytes to {method}().",
         )
-    return data
+    return data  # type: ignore[return-value]
 
 
 # ── Handler ───────────────────────────────────────────────────────────────────
@@ -138,17 +140,17 @@ class _TcpConnectionHandler:
     """Bridges one local TCP connection to one agent-side TCP connection.
 
     Args:
-        conn_id:               Stable identifier for this connection.
-        reader:                asyncio stream reader for the local TCP client.
-        writer:                asyncio stream writer for the local TCP client.
-        ws_send:               Coroutine callable that sends a frame string over
-                               the WebSocket / exec channel.  Must conform to
-                               :class:`WsSendCallable`.
-        registry:              Shared mapping of ``conn_id → handler``; the
-                               handler removes itself on cleanup.
+        conn_id:                  Stable identifier for this connection.
+        reader:                   asyncio stream reader for the local TCP client.
+        writer:                   asyncio stream writer for the local TCP client.
+        ws_send:                  Coroutine callable that sends a frame string
+                                  over the WebSocket / exec channel.  Must
+                                  conform to :class:`WsSendCallable`.
+        registry:                 Shared mapping of ``conn_id → handler``; the
+                                  handler removes itself on cleanup.
         pre_ack_buffer_cap_bytes: Maximum bytes to buffer before the agent ACKs
-                               the connection.  Defaults to
-                               :data:`~exectunnel.config.defaults.PRE_ACK_BUFFER_CAP_BYTES`.
+                                  the connection.  Defaults to
+                                  :data:`~exectunnel.config.defaults.PRE_ACK_BUFFER_CAP_BYTES`.
     """
 
     def __init__(
@@ -172,33 +174,33 @@ class _TcpConnectionHandler:
             maxsize=TCP_INBOUND_QUEUE_CAP
         )
 
-        # Named task references — single source of truth; no parallel list.
+        # Named task references — single source of truth.
         self._upstream_task: asyncio.Task[None] | None = None
         self._downstream_task: asyncio.Task[None] | None = None
-
-        # Cleanup task reference kept so we can log unexpected failures.
         self._cleanup_task: asyncio.Task[None] | None = None
 
         # Lifecycle flags.
-        self._closed = asyncio.Event()
-        self._started = False
-        self._conn_close_sent = False
+        self._closed: asyncio.Event = asyncio.Event()
+        self._started: bool = False
+        self._conn_close_sent: bool = False
 
-        # Single event replaces both _close_remote_requested bool and
-        # _close_event asyncio.Event — one piece of state, one source of truth.
-        self._remote_closed = asyncio.Event()
+        # Remote-close event: set by close_remote() to signal _downstream.
+        self._remote_closed: asyncio.Event = asyncio.Event()
+
+        # Half-close flags: set inside the respective task coroutine when
+        # the task exits via the normal (non-error, non-cancel) code path.
+        self._upstream_ended_cleanly: bool = False
+        self._downstream_ended_cleanly: bool = False
 
         # Telemetry.
-        self._drop_count = 0
-        self._bytes_upstream = 0
-        self._bytes_downstream = 0
-        self._upstream_ended_cleanly = False
-        self._downstream_ended_cleanly = False
+        self._drop_count: int = 0
+        self._bytes_upstream: int = 0
+        self._bytes_downstream: int = 0
 
         # Pre-ACK buffer: holds data that arrives before start() is called.
-        self._pre_ack_buffer_cap_bytes = max(1, pre_ack_buffer_cap_bytes)
+        self._pre_ack_buffer_cap_bytes: int = max(1, pre_ack_buffer_cap_bytes)
         self._pre_ack_buffer: list[bytes] = []
-        self._pre_ack_buffer_bytes = 0
+        self._pre_ack_buffer_bytes: int = 0
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -212,9 +214,14 @@ class _TcpConnectionHandler:
         already set and ``_downstream`` will drain any buffered data then exit
         cleanly on its first iteration.
 
-        Raises:
-            FrameDecodingError: If any pre-ACK buffered chunk is not a
-                ``bytes`` instance — indicates a protocol-layer bug.
+        Pre-ACK buffer flushing
+        -----------------------
+        Buffered chunks are enqueued into ``_inbound`` before the tasks start
+        so ``_downstream`` sees them immediately.  If the queue is full (which
+        should not happen in practice since the buffer cap is smaller than the
+        queue cap), excess chunks are dropped and counted — writing directly to
+        the transport is avoided because ``_downstream`` has not started yet
+        and there is no concurrent drain loop to prevent buffer growth.
         """
         if self._started:
             logger.debug(
@@ -233,22 +240,20 @@ class _TcpConnectionHandler:
                 try:
                     self._inbound.put_nowait(chunk)
                 except asyncio.QueueFull:
-                    # Queue is full — write directly to the transport.
-                    # _downstream has not started yet so there is no concurrent
-                    # reader; this is safe.  Schedule a drain after task start
-                    # via the normal downstream path — the writer's internal
-                    # buffer will be flushed on the first drain() call.
+                    # Drop rather than write directly to the transport —
+                    # _downstream has not started yet so there is no drain
+                    # loop running, and unbuffered writes could grow the
+                    # writer's internal buffer without bound.
                     self._drop_count += 1
-                    metrics_inc("connection.inbound_queue.drop")
-                    logger.debug(
+                    metrics_inc("connection.pre_ack_buffer.overflow")
+                    logger.warning(
                         "conn %s: pre-ACK queue full during flush, "
-                        "writing %d bytes directly to transport buffer",
+                        "dropping %d bytes (total_drops=%d)",
                         self._id,
                         len(chunk),
+                        self._drop_count,
                         extra={"conn_id": self._id},
                     )
-                    with contextlib.suppress(OSError):
-                        self._writer.write(chunk)
             self._pre_ack_buffer.clear()
             self._pre_ack_buffer_bytes = 0
 
@@ -272,9 +277,9 @@ class _TcpConnectionHandler:
     def feed(self, data: bytes) -> bool:
         """Enqueue *data* received from the agent for the downstream task.
 
-        Use only before ACK (pre-start path) or in contexts where backpressure
-        is not required.  After ACK, prefer :meth:`feed_async` so the recv_loop
-        applies proper backpressure.
+        Prefer :meth:`feed_async` post-ACK so the recv_loop applies proper
+        backpressure.  This synchronous variant is provided for pre-ACK
+        buffering and for callers that cannot await.
 
         Args:
             data: Raw bytes decoded from a ``DATA`` frame payload.
@@ -300,7 +305,7 @@ class _TcpConnectionHandler:
             self._pre_ack_buffer_bytes = pending
             return True
 
-        # Post-ACK non-blocking path — caller should use feed_async instead.
+        # Post-ACK non-blocking path.
         try:
             self._inbound.put_nowait(data)
             return True
@@ -316,6 +321,8 @@ class _TcpConnectionHandler:
         enqueued.  Re-checks ``_closed`` after the await so that data is never
         enqueued after cleanup has already run.
 
+        Ordering guarantee
+        ------------------
         The enqueued item is intentionally not rolled back when
         ``_remote_closed`` is set after the ``put()`` completes.  Rolling back
         had a TOCTOU race: if ``_downstream`` had already exited its drain loop
@@ -334,8 +341,8 @@ class _TcpConnectionHandler:
             closed while waiting.
 
         Raises:
-            FrameDecodingError:      If *data* is not a ``bytes`` instance.
-            asyncio.CancelledError:  Propagated as-is — never suppressed.
+            FrameDecodingError:     If *data* is not a ``bytes`` instance.
+            asyncio.CancelledError: Propagated as-is — never suppressed.
         """
         _require_bytes(data, self._id, "feed_async")
 
@@ -398,10 +405,9 @@ class _TcpConnectionHandler:
                 while True:
                     chunk = await self._reader.read(PIPE_READ_CHUNK_BYTES)
                     if not chunk:
+                        # Local client sent EOF.
                         break
 
-                    # encode_data_frame accepts raw bytes and applies
-                    # urlsafe_b64encode with no padding — no manual encoding.
                     frame = encode_data_frame(self._id, chunk)
                     await self._ws_send(frame, must_queue=True)
 
@@ -549,6 +555,20 @@ class _TcpConnectionHandler:
         queue is empty, then writes EOF and exits.  This guarantees every byte
         the agent sent is delivered before the local socket is half-closed.
 
+        Task creation strategy
+        ----------------------
+        The ``close_task`` (waiting on ``_remote_closed``) is created **once**
+        outside the blocking-wait branch and reused across iterations.  This
+        avoids creating a new ``asyncio.Event.wait()`` coroutine on every
+        blocking iteration, which would generate significant task churn on
+        high-throughput connections.
+
+        CancelledError handling
+        -----------------------
+        When the outer task is cancelled while blocked in ``asyncio.wait``,
+        both inner tasks are cancelled and awaited before re-raising so no
+        tasks leak.
+
         Exception handling
         ------------------
         ``asyncio.CancelledError``
@@ -567,12 +587,18 @@ class _TcpConnectionHandler:
         with span("connection.downstream"):
             start = asyncio.get_running_loop().time()
             metrics_inc("connection.downstream.started")
+
+            # Create the close_task once and reuse it across all blocking waits
+            # to avoid spawning a new Event.wait() coroutine per iteration.
+            close_task: asyncio.Task[None] = asyncio.create_task(
+                self._remote_closed.wait(),
+                name=f"conn-down-close-{self._id}",
+            )
+
             try:
                 while True:
                     # ── Batch-drain available items ───────────────────────────
                     batch: list[bytes] = []
-
-                    # Collect all immediately available items up to batch limit.
                     while len(batch) < _DOWNSTREAM_BATCH_SIZE:
                         try:
                             batch.append(self._inbound.get_nowait())
@@ -580,7 +606,6 @@ class _TcpConnectionHandler:
                             break
 
                     if batch:
-                        # Write the whole batch then drain once.
                         for chunk in batch:
                             self._bytes_downstream += len(chunk)
                             self._writer.write(chunk)
@@ -598,31 +623,35 @@ class _TcpConnectionHandler:
                         break
 
                     # ── Block until data arrives OR remote closes ──────────────
-                    # Use asyncio.wait on two awaitables so we wake on whichever
-                    # fires first without creating tasks on every iteration.
-                    # asyncio.wait requires a set of awaitables; we wrap the
-                    # coroutines in tasks once and reuse them across the wait.
+                    # Reuse close_task across iterations; create get_task fresh
+                    # each time since Queue.get() is consumed on completion.
                     get_task: asyncio.Task[bytes] = asyncio.create_task(
-                        self._inbound.get(), name=f"conn-down-get-{self._id}"
-                    )
-                    close_task: asyncio.Task[None] = asyncio.create_task(
-                        self._remote_closed.wait(),
-                        name=f"conn-down-close-{self._id}",
+                        self._inbound.get(),
+                        name=f"conn-down-get-{self._id}",
                     )
 
-                    done, pending = await asyncio.wait(
-                        {get_task, close_task},
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
+                    try:
+                        done, pending = await asyncio.wait(
+                            {get_task, close_task},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    except asyncio.CancelledError:
+                        # Outer task cancelled — clean up both inner tasks.
+                        get_task.cancel()
+                        close_task.cancel()
+                        await asyncio.gather(
+                            get_task, close_task, return_exceptions=True
+                        )
+                        raise
 
-                    # Cancel and await pending tasks to avoid resource leaks.
-                    for t in pending:
-                        t.cancel()
+                    # Cancel and await the loser (get_task only — close_task
+                    # is reused and must not be cancelled here).
+                    if get_task in pending:
+                        get_task.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
-                            await t
+                            await get_task
 
                     if get_task in done and not get_task.cancelled():
-                        # Data arrived — write it and loop to drain more.
                         chunk = get_task.result()
                         self._bytes_downstream += len(chunk)
                         self._writer.write(chunk)
@@ -733,6 +762,13 @@ class _TcpConnectionHandler:
                 )
 
             finally:
+                # Always cancel the reused close_task on exit so it does not
+                # leak if _downstream exits via an exception path.
+                if not close_task.done():
+                    close_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await close_task
+
                 elapsed = asyncio.get_running_loop().time() - start
                 metrics_observe("connection.downstream.duration_sec", elapsed)
                 metrics_observe(
@@ -808,17 +844,21 @@ class _TcpConnectionHandler:
 
         Half-close logic
         ----------------
-        When a task exits **cleanly** (no exception, not cancelled), the peer
-        task is kept alive to avoid truncating in-flight data.  For example,
-        when ``_upstream`` finishes because the local client sent EOF, we keep
-        ``_downstream`` running so the remote server's response can still be
-        delivered.
+        When ``_upstream`` exits **cleanly** (local client sent EOF, no error,
+        not cancelled), ``_downstream`` is kept alive so the remote server's
+        response can still be delivered to the local client.
+
+        When ``_downstream`` exits cleanly (remote server sent EOF and all
+        data was drained), ``_upstream`` is cancelled — there is no more data
+        to receive so the local→agent direction can be torn down.
+
+        When either task exits with an error or is cancelled, the peer task is
+        cancelled immediately.
 
         Cleanup scheduling
         ------------------
-        Cleanup is scheduled only when **both** tasks are done.  The
-        ``_closed`` event is used as the gate — if it is already set, a second
-        cleanup task is never created.
+        Cleanup is scheduled only when **both** tasks are done and the
+        ``_closed`` event has not yet been set (the authoritative gate).
         """
         if not task.cancelled():
             exc = task.exception()
@@ -840,16 +880,28 @@ class _TcpConnectionHandler:
                         exc,
                     )
 
-        # Determine whether the peer task should be cancelled.
-        # A cleanly-ended task keeps its peer alive (half-close support).
-        task_ended_cleanly = not task.cancelled() and task.exception() is None
-        peer_survives = task_ended_cleanly and (
-            (task is self._upstream_task and self._upstream_ended_cleanly)
-            or (task is self._downstream_task and self._downstream_ended_cleanly)
+        # Half-close: keep the peer alive only when the finishing task ended
+        # cleanly (no exception, not cancelled).
+        #
+        # _upstream ended cleanly  → keep _downstream alive (server may reply)
+        # _downstream ended cleanly → cancel _upstream (no more data to relay)
+        # Either ended with error/cancel → cancel the peer immediately
+        task_ended_cleanly = (
+            not task.cancelled() and task.exception() is None
         )
 
-        if not peer_survives:
-            # Cancel whichever task is not the one that just finished.
+        should_cancel_peer: bool
+        if task is self._upstream_task:
+            # Keep downstream alive only when upstream ended cleanly.
+            should_cancel_peer = not (task_ended_cleanly and self._upstream_ended_cleanly)
+        elif task is self._downstream_task:
+            # Downstream ended cleanly → cancel upstream (half-close complete).
+            # Downstream ended with error → also cancel upstream.
+            should_cancel_peer = True
+        else:
+            should_cancel_peer = True
+
+        if should_cancel_peer:
             for candidate in (self._upstream_task, self._downstream_task):
                 if (
                     candidate is not None
@@ -858,9 +910,11 @@ class _TcpConnectionHandler:
                 ):
                     candidate.cancel()
 
-        # Only schedule cleanup when both tasks are finished and cleanup has
-        # not already started (_closed is the authoritative gate).
-        both_done = (self._upstream_task is None or self._upstream_task.done()) and (
+        # Schedule cleanup only when both tasks are finished and cleanup has
+        # not already started.
+        both_done = (
+            self._upstream_task is None or self._upstream_task.done()
+        ) and (
             self._downstream_task is None or self._downstream_task.done()
         )
         if both_done and not self._closed.is_set():
@@ -899,7 +953,8 @@ class _TcpConnectionHandler:
                 continue
             if not task.done():
                 task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, OSError):
+            # Suppress CancelledError only — tasks do not raise OSError directly.
+            with contextlib.suppress(asyncio.CancelledError):
                 await task
 
         self._registry.pop(self._id, None)
@@ -912,6 +967,15 @@ class _TcpConnectionHandler:
                 self._writer.wait_closed(),
                 timeout=_WRITER_CLOSE_TIMEOUT_SECS,
             )
+
+        logger.debug(
+            "conn %s cleaned up (bytes_up=%d, bytes_down=%d, drops=%d)",
+            self._id,
+            self._bytes_upstream,
+            self._bytes_downstream,
+            self._drop_count,
+            extra={"conn_id": self._id},
+        )
 
     # ── Public control ────────────────────────────────────────────────────────
 
