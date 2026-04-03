@@ -10,10 +10,21 @@ Utility functions for the exectunnel package.
 ``make_udp_socket``
     Create a UDP socket with the correct address family for a given host.
 
+``validate_exclusions``
+    Validate a raw exclusion list into typed network objects.
+
 All protocol frame helpers (``encode_conn_open_frame``, ``parse_frame``, etc.)
 and ID generators (``new_conn_id``, ``new_flow_id``) are imported directly
 from ``exectunnel.protocol.frames`` and ``exectunnel.protocol.ids`` — they are
-no longer re-exported from this module.
+not re-exported from this module.
+
+Note on ``make_udp_socket``
+---------------------------
+``make_udp_socket`` performs a synchronous ``socket.getaddrinfo`` call for
+domain name inputs.  It must **not** be called from the asyncio event loop
+thread for domain names — wrap the call in ``asyncio.to_thread()`` or resolve
+the address family before entering the async context.  For IP literal inputs
+the function is safe to call from any thread.
 """
 
 from __future__ import annotations
@@ -31,6 +42,7 @@ __all__ = [
     "is_host_excluded",
     "load_agent_b64",
     "make_udp_socket",
+    "validate_exclusions",
 ]
 
 
@@ -60,8 +72,8 @@ def load_agent_b64() -> str:
     """
     try:
         pkg = importlib.resources.files("exectunnel")
-        # Use two separate / joins — the API contract does not guarantee
-        # that a single string with "/" is treated as a path separator.
+        # Two separate / joins — the API contract does not guarantee that a
+        # single string with "/" is treated as a path separator.
         agent_bytes = (pkg / "payload" / "agent.py").read_bytes()
     except FileNotFoundError as exc:
         raise ConfigurationError(
@@ -70,9 +82,9 @@ def load_agent_b64() -> str:
             error_code="config.agent_payload_missing",
             details={"resource_path": "exectunnel/payload/agent.py"},
             hint=(
-                "Reinstall the package with "
-                "`pip install --force-reinstall exectunnel` "
-                "and verify that payload/agent.py is included in the wheel."
+                "Reinstall the package and verify that payload/agent.py is "
+                "included in the distribution. If using an editable install, "
+                "ensure the source tree is intact."
             ),
         ) from exc
     except PermissionError as exc:
@@ -101,44 +113,6 @@ def load_agent_b64() -> str:
 
     # urlsafe_b64encode never raises on bytes input — no try/except needed.
     return base64.urlsafe_b64encode(agent_bytes).rstrip(b"=").decode("ascii")
-
-
-def is_host_excluded(
-    host: str,
-    exclusions: Sequence[ipaddress.IPv4Network | ipaddress.IPv6Network],
-) -> bool:
-    """Return ``True`` if *host* falls within any configured exclusion network.
-
-    Domain names are never excluded — they are resolved remotely by the agent
-    and their IP addresses are not known at routing time.
-
-    The exclusion list is assumed to be pre-validated (all entries are
-    ``IPv4Network`` or ``IPv6Network`` instances).  Validation at
-    configuration load time rather than per-call avoids O(n) ``isinstance``
-    checks on every connection attempt.
-
-    The membership test is O(n) in the number of exclusion networks.  For
-    typical deployments (< 20 networks) this is negligible.  If the exclusion
-    list grows to hundreds of entries, consider a prefix-tree structure.
-
-    Args:
-        host:       An IPv4 or IPv6 address string, or a domain name.
-        exclusions: Pre-validated sequence of networks to test against.
-
-    Returns:
-        ``True`` if *host* is an IP address that falls within any exclusion
-        network; ``False`` for domain names and non-matching addresses.
-    """
-    if not exclusions:
-        return False
-
-    try:
-        addr = ipaddress.ip_address(host)
-    except ValueError:
-        # Domain names are never excluded.
-        return False
-
-    return any(addr in net for net in exclusions)
 
 
 def validate_exclusions(
@@ -179,13 +153,51 @@ def validate_exclusions(
     return validated
 
 
+def is_host_excluded(
+    host: str,
+    exclusions: Sequence[ipaddress.IPv4Network | ipaddress.IPv6Network],
+) -> bool:
+    """Return ``True`` if *host* falls within any configured exclusion network.
+
+    Domain names are never excluded — they are resolved remotely by the agent
+    and their IP addresses are not known at routing time.
+
+    The exclusion list is assumed to be pre-validated (all entries are
+    ``IPv4Network`` or ``IPv6Network`` instances).  Validation at
+    configuration load time rather than per-call avoids repeated
+    ``isinstance`` checks on every connection attempt.
+
+    The membership test is O(n) in the number of exclusion networks.  For
+    typical deployments (< 20 networks) this is negligible.  If the exclusion
+    list grows to hundreds of entries, consider a prefix-tree structure.
+
+    Args:
+        host:       An IPv4 or IPv6 address string, or a domain name.
+        exclusions: Pre-validated sequence of networks to test against.
+
+    Returns:
+        ``True`` if *host* is an IP address that falls within any exclusion
+        network; ``False`` for domain names and non-matching addresses.
+    """
+    if not exclusions:
+        return False
+
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        # Domain names are never excluded.
+        return False
+
+    return any(addr in net for net in exclusions)
+
+
 def make_udp_socket(host: str) -> socket.socket:
     """Create a UDP socket with the correct address family for *host*.
 
     Resolves the address family from the IP literal.  For domain names,
-    performs a lightweight ``getaddrinfo`` lookup to determine the correct
-    family rather than defaulting to ``AF_INET`` (which would fail for
-    IPv6-only domains).
+    performs a synchronous ``getaddrinfo`` lookup — **do not call this
+    function from the asyncio event loop thread for domain name inputs**.
+    For IP literal inputs the function is safe to call from any thread.
 
     The caller is responsible for closing the returned socket.
 
@@ -201,13 +213,14 @@ def make_udp_socket(host: str) -> socket.socket:
               address family (e.g. IPv6 disabled at the kernel level).
             * If ``getaddrinfo`` fails to resolve a domain name.
     """
-    # Determine address family from IP literal first (fast path).
+    # Determine address family from IP literal first (fast path, no I/O).
     try:
         addr = ipaddress.ip_address(host)
         family = socket.AF_INET6 if addr.version == 6 else socket.AF_INET
     except ValueError:
         # Domain name — resolve to determine the correct address family.
-        # Use SOCK_DGRAM so the result is appropriate for UDP.
+        # This is a blocking syscall; callers must not invoke this from the
+        # event loop thread for domain name inputs.
         try:
             infos = socket.getaddrinfo(host, None, type=socket.SOCK_DGRAM)
             if not infos:
@@ -240,6 +253,7 @@ def make_udp_socket(host: str) -> socket.socket:
             hint=(
                 f"Ensure {family_name} is supported and enabled on this host. "
                 "For IPv6, check that the kernel has IPv6 support compiled in "
-                "and that it is not disabled via sysctl net.ipv6.conf.all.disable_ipv6."
+                "and that it is not disabled via "
+                "sysctl net.ipv6.conf.all.disable_ipv6."
             ),
         ) from exc
