@@ -11,8 +11,10 @@ from exectunnel.protocol.enums import Cmd, Reply
 from exectunnel.proxy._codec import build_reply
 from exectunnel.proxy.relay import UdpRelay
 
+__all__ = ["Socks5Request"]
 
-@dataclass
+
+@dataclass(eq=False)
 class Socks5Request:
     """Represents one completed SOCKS5 handshake.
 
@@ -34,6 +36,11 @@ class Socks5Request:
         writer:    asyncio stream writer for the SOCKS5 client connection.
         udp_relay: Bound :class:`UdpRelay` instance for ``UDP_ASSOCIATE``
                    requests; ``None`` for ``CONNECT``.
+
+    Note:
+        ``eq=False`` is set on the dataclass to prevent auto-generated
+        ``__eq__`` / ``__hash__`` from comparing ``StreamReader`` /
+        ``StreamWriter`` instances, which are not safely comparable by value.
     """
 
     cmd: Cmd
@@ -43,9 +50,10 @@ class Socks5Request:
     writer: asyncio.StreamWriter
     udp_relay: UdpRelay | None = field(default=None)
 
-    # Tracks whether a reply has already been sent so double-reply bugs are
-    # caught at runtime rather than silently corrupting the SOCKS5 stream.
-    _replied: bool = field(default=False, init=False, repr=False)
+    def __post_init__(self) -> None:
+        # Tracks whether a reply has already been sent so double-reply bugs
+        # are caught at runtime rather than silently corrupting the SOCKS5 stream.
+        self._replied: bool = False
 
     # ── Async context manager ─────────────────────────────────────────────────
 
@@ -63,14 +71,16 @@ class Socks5Request:
 
         Idempotent — safe to call multiple times.  ``OSError`` exceptions are
         suppressed because the connection may already be half-closed by the
-        time this is called.  ``RuntimeError`` is suppressed only for the
-        specific case of ``"Event loop is closed"`` to avoid masking genuine
-        asyncio internal errors.
+        time this is called.
         """
         if self.udp_relay is not None:
             self.udp_relay.close()
 
         if self.writer.is_closing():
+            # Writer is already closing — wait for it to finish so callers
+            # can rely on the connection being fully torn down after close().
+            with contextlib.suppress(OSError):
+                await self.writer.wait_closed()
             return
 
         try:
@@ -78,11 +88,6 @@ class Socks5Request:
             await self.writer.wait_closed()
         except OSError:
             pass
-        except RuntimeError as exc:
-            # Suppress only the "Event loop is closed" variant that can occur
-            # during interpreter shutdown; re-raise all other RuntimeErrors.
-            if "Event loop is closed" not in str(exc):
-                raise
 
     # ── Properties ────────────────────────────────────────────────────────────
 
@@ -90,6 +95,11 @@ class Socks5Request:
     def is_connect(self) -> bool:
         """``True`` when the SOCKS5 command is ``CONNECT``."""
         return self.cmd == Cmd.CONNECT
+
+    @property
+    def is_bind(self) -> bool:
+        """``True`` when the SOCKS5 command is ``BIND``."""
+        return self.cmd == Cmd.BIND
 
     @property
     def is_udp(self) -> bool:
@@ -158,8 +168,6 @@ class Socks5Request:
                 If *bind_host* or *bind_port* are invalid (propagated from
                 :func:`build_reply`).
         """
-        # Check writer state BEFORE marking replied so the caller can still
-        # fall back to reply_error() if this raises.
         if self.writer.is_closing():
             raise ProtocolError(
                 f"Cannot send SUCCESS reply for {self.host}:{self.port} — "
@@ -201,8 +209,11 @@ class Socks5Request:
                 from :func:`build_reply`).
         """
         self._mark_replied()
+        # build_reply() is called first and may raise ConfigurationError —
+        # that propagates to the caller before writer.write() is attempted.
+        packet = build_reply(reply)
         with contextlib.suppress(RuntimeError, OSError):
-            self.writer.write(build_reply(reply))
+            self.writer.write(packet)
 
     # ── Async reply helpers (write + drain + optional close) ─────────────────
 
@@ -248,6 +259,9 @@ class Socks5Request:
         torn down regardless and a secondary ``OSError`` must not shadow the
         original failure that caused the error reply.
 
+        If :meth:`reply_error` raises (double-reply or invalid reply code),
+        the writer is still closed via :meth:`close` to prevent resource leaks.
+
         Args:
             reply: The :class:`~exectunnel.protocol.enums.Reply` code to send.
                    Defaults to :attr:`~exectunnel.protocol.enums.Reply.GENERAL_FAILURE`.
@@ -259,11 +273,11 @@ class Socks5Request:
                 Invalid *reply* code (propagated from :func:`build_reply`).
                 This is a caller bug and is **not** suppressed.
         """
-        # reply_error() may raise ProtocolError (double-reply) or
-        # ConfigurationError (bad Reply value) — both propagate to the caller.
-        self.reply_error(reply)
-
-        with contextlib.suppress(OSError):
-            await self.writer.drain()
-
-        await self.close()
+        try:
+            self.reply_error(reply)
+        finally:
+            # Always close — even if reply_error() raised (double-reply /
+            # bad reply code), the writer must not be left open.
+            with contextlib.suppress(OSError):
+                await self.writer.drain()
+            await self.close()

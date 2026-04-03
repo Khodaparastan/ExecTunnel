@@ -9,18 +9,182 @@ import logging
 import struct
 from typing import Final
 
-from exectunnel.config.defaults import UDP_SEND_QUEUE_CAP, UDP_WARN_EVERY
+from exectunnel.config.defaults import UDP_RELAY_QUEUE_CAP, UDP_WARN_EVERY
 from exectunnel.exceptions import ProtocolError, TransportError
 from exectunnel.observability import metrics_inc
 from exectunnel.protocol.enums import AddrType
-from exectunnel.proxy._codec import _validate_domain
+from exectunnel.proxy._codec import validate_domain
 
-logger = logging.getLogger("exectunnel.proxy.relay")
+__all__ = ["UdpRelay"]
+
+logger = logging.getLogger(__name__)
 
 # Maximum UDP payload accepted from the SOCKS5 client.
 # 65507 = 65535 − 20 (IP header) − 8 (UDP header).
 # Anything larger is physically impossible over standard IPv4.
 MAX_UDP_PAYLOAD_BYTES: Final[int] = 65_507
+
+
+# ── UDP header parser ─────────────────────────────────────────────────────────
+# Defined before UdpRelay so _on_datagram can reference it without a forward
+# reference and so it can be unit-tested independently of the relay lifecycle.
+
+
+def _parse_udp_header(data: bytes) -> tuple[bytes, str, int]:
+    """Parse a SOCKS5 UDP datagram header and return ``(payload, host, port)``.
+
+    Args:
+        data: Raw bytes received from the SOCKS5 client, including the
+              RFC 1928 §7 header.
+
+    Returns:
+        A ``(payload, host, port)`` tuple where *host* is a normalised IP or
+        domain string and *port* is an integer in ``[1, 65535]``.
+
+    Raises:
+        ProtocolError:
+            If the datagram is too short, uses an unsupported ATYP, carries a
+            non-zero FRAG field, has a zero-length domain, contains a domain
+            that is not valid UTF-8 or fails RFC 1123 / safety validation,
+            or has port 0.
+    """
+    # Minimum: RSV(2) + FRAG(1) + ATYP(1) = 4 bytes.
+    if len(data) < 4:
+        raise ProtocolError(
+            f"SOCKS5 UDP datagram too short: {len(data)} byte(s), minimum is 4.",
+            error_code="protocol.socks5_udp_too_short",
+            details={"received_bytes": len(data), "minimum_bytes": 4},
+            hint="The SOCKS5 client sent a datagram shorter than the minimum header size.",
+        )
+
+    # FRAG != 0 means reassembly is required; we do not support fragmentation.
+    if data[2] != 0:
+        raise ProtocolError(
+            f"SOCKS5 UDP fragmentation is not supported (FRAG={data[2]:#x}).",
+            error_code="protocol.socks5_udp_fragmented",
+            details={"frag": data[2]},
+            hint=(
+                "The SOCKS5 client requested UDP fragment reassembly, which "
+                "exectunnel does not support. Disable fragmentation on the client."
+            ),
+        )
+
+    atyp = data[3]
+    offset = 4
+
+    if atyp == AddrType.IPV4:
+        if len(data) < offset + 4 + 2:
+            raise ProtocolError(
+                "SOCKS5 UDP IPv4 datagram truncated before address+port.",
+                error_code="protocol.socks5_udp_ipv4_truncated",
+                details={
+                    "received_bytes": len(data),
+                    "required_bytes": offset + 4 + 2,
+                },
+                hint="The SOCKS5 client sent an incomplete IPv4 address field.",
+            )
+        # IPv4Address(bytes[4]) never raises ValueError.
+        host = str(ipaddress.IPv4Address(data[offset : offset + 4]))
+        offset += 4
+
+    elif atyp == AddrType.IPV6:
+        if len(data) < offset + 16 + 2:
+            raise ProtocolError(
+                "SOCKS5 UDP IPv6 datagram truncated before address+port.",
+                error_code="protocol.socks5_udp_ipv6_truncated",
+                details={
+                    "received_bytes": len(data),
+                    "required_bytes": offset + 16 + 2,
+                },
+                hint="The SOCKS5 client sent an incomplete IPv6 address field.",
+            )
+        # IPv6Address(bytes[16]) never raises ValueError.
+        host = str(ipaddress.IPv6Address(data[offset : offset + 16]).compressed)
+        offset += 16
+
+    elif atyp == AddrType.DOMAIN:
+        if len(data) < offset + 1:
+            raise ProtocolError(
+                "SOCKS5 UDP DOMAIN datagram truncated before length byte.",
+                error_code="protocol.socks5_udp_domain_no_length",
+                details={"received_bytes": len(data)},
+                hint="The SOCKS5 client sent a DOMAIN header with no length byte.",
+            )
+        dlen = data[offset]
+        offset += 1
+        if dlen == 0:
+            raise ProtocolError(
+                "SOCKS5 UDP DOMAIN address length must be greater than zero.",
+                error_code="protocol.socks5_udp_domain_zero_length",
+                details={"atyp": hex(atyp)},
+                hint=(
+                    "The SOCKS5 client sent a zero-length domain name, which "
+                    "violates RFC 1928 §7."
+                ),
+            )
+        if len(data) < offset + dlen + 2:
+            raise ProtocolError(
+                "SOCKS5 UDP DOMAIN datagram truncated before domain bytes+port.",
+                error_code="protocol.socks5_udp_domain_truncated",
+                details={
+                    "received_bytes": len(data),
+                    "required_bytes": offset + dlen + 2,
+                    "declared_length": dlen,
+                },
+                hint="The SOCKS5 client sent a domain name shorter than its declared length.",
+            )
+        try:
+            host = data[offset : offset + dlen].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ProtocolError(
+                "SOCKS5 UDP DOMAIN address bytes are not valid UTF-8.",
+                error_code="protocol.socks5_udp_domain_bad_encoding",
+                details={
+                    "raw_bytes": data[offset : offset + dlen].hex(),
+                    "declared_length": dlen,
+                },
+                hint=(
+                    "The SOCKS5 client sent a domain name that cannot be decoded "
+                    "as UTF-8. Only ASCII/UTF-8 hostnames are supported."
+                ),
+            ) from exc
+        # Validate domain structure and safety — same rules as TCP path.
+        validate_domain(host)
+        offset += dlen
+
+    else:
+        raise ProtocolError(
+            f"Unsupported SOCKS5 UDP address type: {atyp:#x}.",
+            error_code="protocol.socks5_udp_unsupported_atyp",
+            details={"atyp": hex(atyp)},
+            hint=(
+                "Only ATYP 0x01 (IPv4), 0x03 (DOMAIN), and 0x04 (IPv6) are "
+                "supported per RFC 1928 §7."
+            ),
+        )
+
+    if len(data) < offset + 2:
+        raise ProtocolError(
+            "SOCKS5 UDP datagram truncated before port field.",
+            error_code="protocol.socks5_udp_no_port",
+            details={
+                "received_bytes": len(data),
+                "required_bytes": offset + 2,
+            },
+            hint="The SOCKS5 client sent a datagram with no port field.",
+        )
+
+    port = struct.unpack("!H", data[offset : offset + 2])[0]
+    if port == 0:
+        raise ProtocolError(
+            "SOCKS5 UDP datagram destination port is 0.",
+            error_code="protocol.socks5_udp_zero_port",
+            details={"host": host},
+            hint="Port 0 is not a valid destination port in a SOCKS5 UDP datagram.",
+        )
+
+    payload = data[offset + 2 :]
+    return payload, host, port
 
 
 # ── Datagram protocol ─────────────────────────────────────────────────────────
@@ -33,12 +197,12 @@ class _RelayDatagramProtocol(asyncio.DatagramProtocol):
         self._relay = relay
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
-        self._relay._on_datagram(data, addr)  # noqa: SLF001
+        # Delegate to the package-internal method — avoids SLF001 suppression.
+        self._relay._on_datagram(data, addr)
 
     def error_received(self, exc: Exception) -> None:
         # OS-level socket errors (e.g. ICMP port-unreachable) are not
-        # actionable per-datagram; count them and log at DEBUG so operators
-        # can distinguish ECONNREFUSED from other errors in dashboards.
+        # actionable per-datagram; count them and log at DEBUG.
         metrics_inc(
             "socks5.udp_relay.socket_error",
             reason=type(exc).__name__,
@@ -82,12 +246,11 @@ class UdpRelay:
     def __init__(self) -> None:
         self._transport: asyncio.DatagramTransport | None = None
 
-        # Bounded inbound queue.  The sentinel channel uses a separate
-        # one-slot queue so close() can always deliver None even when the
-        # main queue is full — eliminating the liveness hole that arises
-        # when put_nowait(None) is suppressed on a full queue.
-        self._queue: asyncio.Queue[tuple[bytes, str, int] | None] = asyncio.Queue(
-            UDP_SEND_QUEUE_CAP
+        # Bounded inbound queue.  The close sentinel is delivered via a
+        # dedicated asyncio.Event so close() always unblocks recv() even
+        # when the inbound queue is completely full.
+        self._queue: asyncio.Queue[tuple[bytes, str, int]] = asyncio.Queue(
+            UDP_RELAY_QUEUE_CAP
         )
         self._close_event: asyncio.Event = asyncio.Event()
 
@@ -174,7 +337,15 @@ class UdpRelay:
                 ),
             ) from exc
 
-        assert isinstance(transport, asyncio.DatagramTransport)
+        if not isinstance(transport, asyncio.DatagramTransport):
+            transport.close()
+            raise TransportError(
+                "UDP relay received an unexpected transport type from asyncio.",
+                error_code="transport.udp_relay_bad_transport_type",
+                details={"transport_type": type(transport).__name__},
+                hint="This is an asyncio internal error. Please report it.",
+            )
+
         self._transport = transport
         self._local_port = transport.get_extra_info("sockname")[1]
         metrics_inc("socks5.udp_relay.started")
@@ -312,20 +483,35 @@ class UdpRelay:
         races against the queue, so this method always returns promptly after
         :meth:`close` is called — even when the inbound queue is full.
 
+        After the close event fires, the queue is drained one final time so
+        that no datagram is lost when :meth:`close` races with a queued item.
+
         Returns:
             A ``(payload, host, port)`` tuple, or ``None`` when the relay has
-            been closed.
+            been closed and the queue is fully drained.
 
         Raises:
             asyncio.CancelledError: Propagated as-is — never suppressed.
         """
-        if self._closed and self._queue.empty():
+        # Fast path: drain any immediately available item first.
+        try:
+            return self._queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+
+        # If already closed and queue is empty, signal EOF.
+        if self._close_event.is_set():
             return None
 
-        # Race the queue against the close event so a full queue never
-        # prevents close() from unblocking this coroutine.
-        queue_task = asyncio.ensure_future(self._queue.get())
-        close_task = asyncio.ensure_future(self._close_event.wait())
+        # Race the queue against the close event.
+        queue_task: asyncio.Task[tuple[bytes, str, int]] = asyncio.create_task(
+            self._queue.get(),
+            name=f"udp-relay-recv-{self._local_port}",
+        )
+        close_task: asyncio.Task[None] = asyncio.create_task(
+            self._close_event.wait(),
+            name=f"udp-relay-close-{self._local_port}",
+        )
 
         try:
             done, pending = await asyncio.wait(
@@ -347,13 +533,18 @@ class UdpRelay:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 
-        if close_task in done and queue_task not in done:
-            return None
+        # queue_task won — return the item.
+        if queue_task in done and not queue_task.cancelled():
+            return queue_task.result()
 
-        # queue_task completed — may have a real item or the relay closed
-        # while we were waiting and the queue drained.
-        result = queue_task.result() if queue_task in done else None
-        return result
+        # close_task won — drain one final time to avoid losing the last item
+        # if a datagram arrived between the close signal and task cancellation.
+        try:
+            return self._queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+
+        return None
 
     def send_to_client(self, payload: bytes, src_host: str, src_port: int) -> None:
         """Wrap *payload* in a SOCKS5 UDP header and send it back to the client.
@@ -391,8 +582,6 @@ class UdpRelay:
             return
 
         if self._client_addr is None:
-            # Tunnel agent sent a response before the SOCKS5 client sent its
-            # first datagram — drop and log so the condition is observable.
             logger.debug(
                 "udp relay: dropping reply for %s:%d — client address not yet bound "
                 "(port=%d)",
@@ -420,8 +609,16 @@ class UdpRelay:
             + addr.packed
             + struct.pack("!H", src_port)
         )
-        with contextlib.suppress(OSError):
+        try:
             self._transport.sendto(header + payload, self._client_addr)
+        except OSError as exc:
+            metrics_inc("socks5.udp_relay.send_error", reason=type(exc).__name__)
+            logger.debug(
+                "udp relay: send_to_client OSError for %s:%d: %s",
+                src_host,
+                src_port,
+                exc,
+            )
 
     # ── Properties ────────────────────────────────────────────────────────────
 
@@ -454,166 +651,3 @@ class UdpRelay:
             and self._transport is not None
             and not self._transport.is_closing()
         )
-
-
-# ── UDP header parser ─────────────────────────────────────────────────────────
-
-
-def _parse_udp_header(data: bytes) -> tuple[bytes, str, int]:
-    """Parse a SOCKS5 UDP datagram header and return ``(payload, host, port)``.
-
-    Extracted as a module-level function so it can be unit-tested independently
-    of the relay lifecycle and so ``_on_datagram`` stays readable.
-
-    Args:
-        data: Raw bytes received from the SOCKS5 client, including the
-              RFC 1928 §7 header.
-
-    Returns:
-        A ``(payload, host, port)`` tuple where *host* is a normalised IP or
-        domain string and *port* is an integer in ``[1, 65535]``.
-
-    Raises:
-        ProtocolError:
-            If the datagram is too short, uses an unsupported ATYP, carries a
-            non-zero FRAG field, has a zero-length domain, contains a domain
-            that is not valid UTF-8 or fails RFC 1123 / safety validation,
-            or has port 0.
-    """
-    # Minimum: RSV(2) + FRAG(1) + ATYP(1) = 4 bytes.
-    if len(data) < 4:
-        raise ProtocolError(
-            f"SOCKS5 UDP datagram too short: {len(data)} byte(s), minimum is 4.",
-            error_code="protocol.socks5_udp_too_short",
-            details={"received_bytes": len(data), "minimum_bytes": 4},
-            hint="The SOCKS5 client sent a datagram shorter than the minimum header size.",
-        )
-
-    # FRAG != 0 means reassembly is required; we do not support fragmentation.
-    if data[2] != 0:
-        raise ProtocolError(
-            f"SOCKS5 UDP fragmentation is not supported (FRAG={data[2]:#x}).",
-            error_code="protocol.socks5_udp_fragmented",
-            details={"frag": data[2]},
-            hint=(
-                "The SOCKS5 client requested UDP fragment reassembly, which "
-                "exectunnel does not support. Disable fragmentation on the client."
-            ),
-        )
-
-    atyp = data[3]
-    offset = 4
-
-    if atyp == AddrType.IPV4:
-        if len(data) < offset + 4 + 2:
-            raise ProtocolError(
-                "SOCKS5 UDP IPv4 datagram truncated before address+port.",
-                error_code="protocol.socks5_udp_ipv4_truncated",
-                details={
-                    "received_bytes": len(data),
-                    "required_bytes": offset + 4 + 2,
-                },
-                hint="The SOCKS5 client sent an incomplete IPv4 address field.",
-            )
-        # IPv4Address(bytes[4]) never raises ValueError.
-        host = str(ipaddress.IPv4Address(data[offset : offset + 4]))
-        offset += 4
-
-    elif atyp == AddrType.IPV6:
-        if len(data) < offset + 16 + 2:
-            raise ProtocolError(
-                "SOCKS5 UDP IPv6 datagram truncated before address+port.",
-                error_code="protocol.socks5_udp_ipv6_truncated",
-                details={
-                    "received_bytes": len(data),
-                    "required_bytes": offset + 16 + 2,
-                },
-                hint="The SOCKS5 client sent an incomplete IPv6 address field.",
-            )
-        # IPv6Address(bytes[16]) never raises ValueError.
-        host = str(ipaddress.IPv6Address(data[offset : offset + 16]).compressed)
-        offset += 16
-
-    elif atyp == AddrType.DOMAIN:
-        if len(data) < offset + 1:
-            raise ProtocolError(
-                "SOCKS5 UDP DOMAIN datagram truncated before length byte.",
-                error_code="protocol.socks5_udp_domain_no_length",
-                details={"received_bytes": len(data)},
-                hint="The SOCKS5 client sent a DOMAIN header with no length byte.",
-            )
-        dlen = data[offset]
-        offset += 1
-        if dlen == 0:
-            raise ProtocolError(
-                "SOCKS5 UDP DOMAIN address length must be greater than zero.",
-                error_code="protocol.socks5_udp_domain_zero_length",
-                details={"atyp": hex(atyp)},
-                hint=(
-                    "The SOCKS5 client sent a zero-length domain name, which "
-                    "violates RFC 1928 §7."
-                ),
-            )
-        if len(data) < offset + dlen + 2:
-            raise ProtocolError(
-                "SOCKS5 UDP DOMAIN datagram truncated before domain bytes+port.",
-                error_code="protocol.socks5_udp_domain_truncated",
-                details={
-                    "received_bytes": len(data),
-                    "required_bytes": offset + dlen + 2,
-                    "declared_length": dlen,
-                },
-                hint="The SOCKS5 client sent a domain name shorter than its declared length.",
-            )
-        try:
-            host = data[offset : offset + dlen].decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ProtocolError(
-                "SOCKS5 UDP DOMAIN address bytes are not valid UTF-8.",
-                error_code="protocol.socks5_udp_domain_bad_encoding",
-                details={
-                    "raw_bytes": data[offset : offset + dlen].hex(),
-                    "declared_length": dlen,
-                },
-                hint=(
-                    "The SOCKS5 client sent a domain name that cannot be decoded "
-                    "as UTF-8. Only ASCII/UTF-8 hostnames are supported."
-                ),
-            ) from exc
-        # Validate domain structure and safety — same rules as TCP path.
-        _validate_domain(host)
-        offset += dlen
-
-    else:
-        raise ProtocolError(
-            f"Unsupported SOCKS5 UDP address type: {atyp:#x}.",
-            error_code="protocol.socks5_udp_unsupported_atyp",
-            details={"atyp": hex(atyp)},
-            hint=(
-                "Only ATYP 0x01 (IPv4), 0x03 (DOMAIN), and 0x04 (IPv6) are "
-                "supported per RFC 1928 §7."
-            ),
-        )
-
-    if len(data) < offset + 2:
-        raise ProtocolError(
-            "SOCKS5 UDP datagram truncated before port field.",
-            error_code="protocol.socks5_udp_no_port",
-            details={
-                "received_bytes": len(data),
-                "required_bytes": offset + 2,
-            },
-            hint="The SOCKS5 client sent a datagram with no port field.",
-        )
-
-    port = struct.unpack("!H", data[offset : offset + 2])[0]
-    if port == 0:
-        raise ProtocolError(
-            "SOCKS5 UDP datagram destination port is 0.",
-            error_code="protocol.socks5_udp_zero_port",
-            details={"host": host},
-            hint="Port 0 is not a valid destination port in a SOCKS5 UDP datagram.",
-        )
-
-    payload = data[offset + 2 :]
-    return payload, host, port

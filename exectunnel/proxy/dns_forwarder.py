@@ -20,10 +20,12 @@ from exectunnel.exceptions import (
 )
 from exectunnel.observability import metrics_inc, metrics_observe
 from exectunnel.protocol.ids import new_flow_id
-from exectunnel.transport.connection import WsSendCallable
-from exectunnel.transport.udp_flow import _UdpFlowHandler
+from exectunnel.transport import WsSendCallable
+from exectunnel.transport import UdpFlow
 
-logger = logging.getLogger("exectunnel.proxy.dns_forwarder")
+__all__ = ["DnsForwarder"]
+
+logger = logging.getLogger(__name__)
 
 
 # ── Datagram protocol ─────────────────────────────────────────────────────────
@@ -31,48 +33,28 @@ logger = logging.getLogger("exectunnel.proxy.dns_forwarder")
 
 class _DnsDatagramProtocol(asyncio.DatagramProtocol):
     """asyncio datagram protocol that dispatches received DNS queries to
-    :class:`_DnsForwarder`.
+    :class:`DnsForwarder`.
     """
 
-    def __init__(self, forwarder: _DnsForwarder) -> None:
+    def __init__(self, forwarder: DnsForwarder) -> None:
         self._fwd = forwarder
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        # Validate transport type without raising — raising from connection_made
+        # is not safe; asyncio may not handle it gracefully.
         if not isinstance(transport, asyncio.DatagramTransport):
-            raise TypeError(
-                f"Expected DatagramTransport, got {type(transport).__name__}. "
-                "This is an asyncio internal error."
+            logger.error(
+                "dns forwarder: expected DatagramTransport, got %s — "
+                "forwarder will not function correctly.",
+                type(transport).__name__,
             )
-        self._fwd._transport = transport  # noqa: SLF001
+            metrics_inc("dns.forwarder.bad_transport_type")
+            transport.close()
+            return
+        self._fwd._on_transport_ready(transport)
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
-        metrics_inc("dns.query.received")
-
-        if len(self._fwd._tasks) >= self._fwd._max_inflight:  # noqa: SLF001
-            self._fwd._saturation_drop_count += 1  # noqa: SLF001
-            self._fwd._total_drop_count += 1  # noqa: SLF001
-            metrics_inc("dns.query.drop.saturated")
-            if (
-                self._fwd._saturation_drop_count == 1  # noqa: SLF001
-                or self._fwd._saturation_drop_count % UDP_WARN_EVERY == 0  # noqa: SLF001
-            ):
-                logger.warning(
-                    "dns forwarder saturated (%d inflight), dropping query "
-                    "from %s:%d (saturation_drops=%d)",
-                    self._fwd._max_inflight,  # noqa: SLF001
-                    addr[0],
-                    addr[1],
-                    self._fwd._saturation_drop_count,  # noqa: SLF001
-                )
-            return
-
-        # Use underscore in task name to avoid colon-delimited log parser issues.
-        task = asyncio.create_task(
-            self._fwd._forward(data, addr),  # noqa: SLF001
-            name=f"dns-fwd-{addr[0]}_{addr[1]}",
-        )
-        self._fwd._tasks.add(task)  # noqa: SLF001
-        task.add_done_callback(self._fwd._tasks.discard)  # noqa: SLF001
+        self._fwd._on_query(data, addr)
 
     def error_received(self, exc: Exception) -> None:
         metrics_inc("dns.forwarder.socket_error", reason=type(exc).__name__)
@@ -90,7 +72,7 @@ class _DnsDatagramProtocol(asyncio.DatagramProtocol):
 # ── Forwarder ─────────────────────────────────────────────────────────────────
 
 
-class _DnsForwarder:
+class DnsForwarder:
     """Minimal DNS UDP forwarder.
 
     Listens locally; forwards each query as a UDP flow through the tunnel to
@@ -103,7 +85,7 @@ class _DnsForwarder:
         ws_send:       Coroutine callable conforming to
                        :class:`~exectunnel.transport.connection.WsSendCallable`.
         udp_registry:  Shared mutable dict mapping flow IDs to
-                       :class:`~exectunnel.transport.udp_flow._UdpFlowHandler`.
+                       :class:`~exectunnel.transport.udp_flow.UdpFlow`.
         max_inflight:  Maximum number of concurrent in-flight DNS queries.
                        Defaults to :data:`~exectunnel.config.defaults.DNS_MAX_INFLIGHT`.
         upstream_port: UDP port of the upstream DNS server.
@@ -115,7 +97,7 @@ class _DnsForwarder:
         local_port: int,
         upstream: str,
         ws_send: WsSendCallable,
-        udp_registry: dict[str, _UdpFlowHandler],
+        udp_registry: dict[str, UdpFlow],
         max_inflight: int = DNS_MAX_INFLIGHT,
         upstream_port: int = DNS_UPSTREAM_PORT,
     ) -> None:
@@ -136,19 +118,56 @@ class _DnsForwarder:
         self._saturation_drop_count: int = 0  # inflight limit exceeded
         self._error_drop_count: int = 0       # transport / protocol errors
         self._total_drop_count: int = 0       # all drops combined
-        self._query_count: int = 0            # queries forwarded (post-saturation)
+        self._query_count: int = 0            # queries that passed saturation check
         self._ok_count: int = 0               # queries with a response sent
         self._bytes_in: int = 0               # query bytes received
         self._bytes_out: int = 0              # response bytes sent
 
     # ── Async context manager ─────────────────────────────────────────────────
 
-    async def __aenter__(self) -> _DnsForwarder:
+    async def __aenter__(self) -> DnsForwarder:
         await self.start()
         return self
 
     async def __aexit__(self, *_: object) -> None:
         await self.stop()
+
+    # ── Package-internal callbacks (called by _DnsDatagramProtocol) ──────────
+
+    def _on_transport_ready(self, transport: asyncio.DatagramTransport) -> None:
+        """Store the transport once asyncio confirms the socket is ready."""
+        self._transport = transport
+
+    def _on_query(self, data: bytes, addr: tuple[str, int]) -> None:
+        """Dispatch an incoming DNS query — called from the datagram protocol."""
+        metrics_inc("dns.query.received")
+
+        if len(self._tasks) >= self._max_inflight:
+            self._saturation_drop_count += 1
+            self._total_drop_count += 1
+            metrics_inc("dns.query.drop.saturated")
+            if (
+                self._saturation_drop_count == 1
+                or self._saturation_drop_count % UDP_WARN_EVERY == 0
+            ):
+                logger.warning(
+                    "dns forwarder saturated (%d inflight), dropping query "
+                    "from %s:%d (saturation_drops=%d)",
+                    self._max_inflight,
+                    addr[0],
+                    addr[1],
+                    self._saturation_drop_count,
+                )
+            return
+
+        # Include flow_id in task name for unique identification in task dumps.
+        flow_id = new_flow_id()
+        task = asyncio.create_task(
+            self._forward(data, addr, flow_id),
+            name=f"dns-fwd-{addr[0]}_{addr[1]}-{flow_id[:8]}",
+        )
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -186,7 +205,15 @@ class _DnsForwarder:
                 ),
             ) from exc
 
-        assert isinstance(transport, asyncio.DatagramTransport)
+        if not isinstance(transport, asyncio.DatagramTransport):
+            transport.close()
+            raise TransportError(
+                "DNS forwarder received an unexpected transport type from asyncio.",
+                error_code="transport.dns_bad_transport_type",
+                details={"transport_type": type(transport).__name__},
+                hint="This is an asyncio internal error. Please report it.",
+            )
+
         self._transport = transport
         metrics_inc("dns.forwarder.started")
         logger.info(
@@ -216,20 +243,26 @@ class _DnsForwarder:
             for task in list(self._tasks):
                 task.cancel()
             await asyncio.gather(*list(self._tasks), return_exceptions=True)
-            self._tasks.clear()
 
     # ── Core forwarding logic ─────────────────────────────────────────────────
 
-    async def _forward(self, query: bytes, client_addr: tuple[str, int]) -> None:
+    async def _forward(
+        self,
+        query: bytes,
+        client_addr: tuple[str, int],
+        flow_id: str,
+    ) -> None:
         """Open a UDP flow, forward *query*, wait for the response, reply to client.
+
+        ``flow_id`` is pre-generated by :meth:`_on_query` so the task name
+        and the flow ID are consistent in logs and task dumps.
 
         All structured exceptions are caught here and converted into metrics +
         log entries so that a single bad query never tears down the forwarder.
 
-        ``_query_count`` is incremented only for queries that pass the
-        saturation check — saturation drops are counted separately in
-        ``_saturation_drop_count``.  ``_total_drop_count`` covers all drops
-        regardless of cause.
+        ``_query_count`` and ``_bytes_in`` are incremented only after the
+        handler is successfully opened — saturation drops are counted
+        separately in ``_saturation_drop_count``.
 
         Exception hierarchy
         -------------------
@@ -242,24 +275,21 @@ class _DnsForwarder:
         ``TransportError``
             Other transport blip; log at DEBUG.
         ``ExecTunnelError``
-            Any other library error (``ProtocolError``, ``FrameDecodingError``,
-            etc.); log at WARNING.
+            Any other library error; log at WARNING.
         ``Exception``
             Truly unexpected; log at WARNING with traceback.
         """
         start = asyncio.get_running_loop().time()
-        self._query_count += 1
-        self._bytes_in += len(query)
-        metrics_observe("dns.query.bytes.in", float(len(query)))
 
-        flow_id = new_flow_id()
-        handler = _UdpFlowHandler(
+        handler = UdpFlow(
             flow_id,
             self._upstream,
             self._upstream_port,
             self._ws_send,
             self._udp_registry,
         )
+        # Register in registry only after construction — open() may fail and
+        # the finally block will pop it regardless.
         self._udp_registry[flow_id] = handler
 
         # Tracks whether the agent already tore down the flow so we skip
@@ -269,6 +299,12 @@ class _DnsForwarder:
         try:
             # ── Open + send ───────────────────────────────────────────────────
             await handler.open()
+
+            # Count the query only after open() succeeds.
+            self._query_count += 1
+            self._bytes_in += len(query)
+            metrics_observe("dns.query.bytes.in", float(len(query)))
+
             await handler.send_datagram(query)
 
             # ── Receive response ──────────────────────────────────────────────
@@ -305,7 +341,7 @@ class _DnsForwarder:
                     flow_id,
                 )
 
-        except TimeoutError:
+        except asyncio.TimeoutError:
             # DNS clients retry naturally — log at DEBUG, not WARNING.
             self._error_drop_count += 1
             self._total_drop_count += 1
@@ -397,16 +433,16 @@ class _DnsForwarder:
                 asyncio.get_running_loop().time() - start,
             )
             # Close the flow unless the agent already tore it down.
-            # Suppress all exceptions from close() so they never suppress the
-            # original exception that caused us to enter the finally block.
+            # Suppress ExecTunnelError (covers ConnectionClosedError,
+            # WebSocketSendTimeoutError, TransportError) and OSError so
+            # close() never suppresses the original exception.
             if not agent_closed:
-                with contextlib.suppress(
-                    WebSocketSendTimeoutError,
-                    TransportError,
-                    ExecTunnelError,
-                    OSError,
-                ):
+                with contextlib.suppress(ExecTunnelError, OSError):
                     await handler.close()
+            else:
+                # Agent closed — mark the handler as remote-closed so it
+                # releases its internal state cleanly without sending UDP_CLOSE.
+                handler.close_remote()
 
             # Always remove from registry to prevent memory leaks.
             self._udp_registry.pop(flow_id, None)
@@ -430,7 +466,7 @@ class _DnsForwarder:
 
     @property
     def query_count(self) -> int:
-        """Total DNS queries forwarded (excludes saturation drops)."""
+        """Total DNS queries successfully opened (excludes saturation drops)."""
         return self._query_count
 
     @property

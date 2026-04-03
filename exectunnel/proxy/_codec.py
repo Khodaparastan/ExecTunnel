@@ -10,31 +10,33 @@ import struct
 from exectunnel.exceptions import ConfigurationError, ProtocolError
 from exectunnel.protocol.enums import AddrType, Reply
 
+__all__ = ["build_reply", "read_addr", "read_exact", "validate_domain"]
+
 # ── Domain-name validation ────────────────────────────────────────────────────
 
 # RFC 1123 relaxed: labels of 1–63 chars, total ≤ 253, no leading/trailing dot.
-# Underscores are intentionally excluded: they are not valid per RFC 1123 and
-# would corrupt tunnel frames if they appeared alongside frame-unsafe chars.
-# Real-world SRV / DMARC labels (_dmarc, _sip) use underscores; if you need
-# them, add a permissive flag to _validate_domain and document the trade-off.
-#
-# We also reject null bytes and the frame-unsafe chars validated by the
-# protocol layer (: < >) so a hostile domain can never corrupt a tunnel frame.
-_DOMAIN_LABEL_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9\-]{0,61}[A-Za-z0-9])?$")
-_DOMAIN_UNSAFE_RE = re.compile(r"[\x00:<>]")
+# re.ASCII ensures [A-Za-z0-9] never matches Unicode digits on exotic builds.
+# Underscores are intentionally excluded — not valid per RFC 1123 and would
+# corrupt tunnel frames alongside frame-unsafe chars.
+_DOMAIN_LABEL_RE = re.compile(
+    r"^[A-Za-z0-9]([A-Za-z0-9\-]{0,61}[A-Za-z0-9])?$",
+    re.ASCII,
+)
+_DOMAIN_UNSAFE_RE = re.compile(r"[\x00:<>]", re.ASCII)
 
 # Maximum number of bytes read_exact() will accept in a single call.
 # Protects against a caller accidentally passing a huge length field.
 _MAX_READ_BYTES: int = 65_535
 
-__all__ = ["build_reply", "read_addr", "read_exact"]
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-def _validate_domain(domain: str) -> None:
+def validate_domain(domain: str) -> None:
     """Raise :class:`ProtocolError` if *domain* is not a safe, well-formed hostname.
+
+    Exported (without leading underscore) so ``relay.py`` and other proxy
+    modules can reuse the same validation without reaching into private names.
 
     Checks performed:
 
@@ -42,6 +44,12 @@ def _validate_domain(domain: str) -> None:
     * No frame-unsafe characters (``\\x00``, ``:``, ``<``, ``>``).
     * Each dot-separated label matches RFC 1123 rules (1–63 chars,
       alphanumeric start/end, hyphens allowed in the middle).
+
+    Note:
+        A trailing dot (FQDN notation) is stripped before label splitting so
+        that ``"example.com."`` is treated identically to ``"example.com"``.
+        A bare ``"."`` (DNS root) becomes an empty string after stripping and
+        triggers the empty-label error — this is intentional.
 
     Args:
         domain: The decoded domain string to validate.
@@ -200,7 +208,7 @@ async def read_addr(reader: asyncio.StreamReader) -> tuple[str, int]:
                 ),
             ) from exc
         # Validate domain structure and safety before it touches any frame.
-        _validate_domain(host)
+        validate_domain(host)
 
     else:
         raise ProtocolError(
@@ -253,8 +261,9 @@ def build_reply(
             * *bind_port* is outside ``[0, 65535]``.
             * *bind_host* is not a valid IP address string.
     """
+    # Use a separate local to avoid shadowing the parameter type.
     try:
-        reply = Reply(reply)
+        reply_code = Reply(reply)
     except ValueError as exc:
         raise ConfigurationError(
             f"reply {reply!r} is not a valid SOCKS5 Reply code.",
@@ -303,7 +312,7 @@ def build_reply(
     atyp = AddrType.IPV4 if addr.version == 4 else AddrType.IPV6
 
     return (
-        bytes([0x05, int(reply), 0x00, int(atyp)])
+        bytes([0x05, int(reply_code), 0x00, int(atyp)])
         + addr.packed
         + struct.pack("!H", bind_port)
     )
