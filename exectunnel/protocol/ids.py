@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import secrets
 
 # Prefix characters that namespace IDs by type, preventing any cross-type
@@ -12,7 +13,8 @@ _UDP_PREFIX = "u"
 # 12 bytes → 96-bit entropy → birthday bound ~2^48 before 50% collision
 # probability; safe for high-concurrency, long-lived tunnel sessions.
 _TOKEN_BYTES = 12
-
+# conn_id / flow_id: one prefix char + 24 lowercase hex chars (96-bit token).
+ID_RE = re.compile(r"^[cu][0-9a-f]{24}$")
 
 def _new_id(prefix: str) -> str:
     """

@@ -28,12 +28,12 @@ Frame catalogue
 """
 
 from __future__ import annotations
-
+import binascii
 import base64
 import ipaddress
 import re
 from typing import NamedTuple
-
+from .ids import ID_RE
 # ── Frame protocol constants ──────────────────────────────────────────────────
 
 FRAME_PREFIX: str = "<<<EXECTUNNEL:"
@@ -50,6 +50,9 @@ BOOTSTRAP_CHUNK_SIZE_CHARS: int = 200
 # Read chunk size used when piping raw TCP streams (CONNECT relay).
 PIPE_READ_CHUNK_BYTES: int = 4_096
 
+# session-level error sentinel constant
+SESSION_CONN_ID: str = "c" + "0" * 24
+
 # ── Allowed message types ─────────────────────────────────────────────────────
 
 _VALID_MSG_TYPES: frozenset[str] = frozenset({
@@ -65,16 +68,14 @@ _VALID_MSG_TYPES: frozenset[str] = frozenset({
 
 # ── Validation helpers ────────────────────────────────────────────────────────
 
-# conn_id / flow_id: one prefix char + 24 lowercase hex chars (96-bit token).
-_ID_RE = re.compile(r"^[cu][0-9a-f]{24}$")
 
 # Characters that are structurally significant in the frame wire format.
 _FRAME_UNSAFE_RE = re.compile(r"[:<>]")
-
+MAX_FRAME_LEN: int = 8_192
 
 def _validate_id(value: str, name: str = "id") -> None:
     """Raise ``ValueError`` if *value* is not a well-formed tunnel ID."""
-    if not _ID_RE.match(value):
+    if not ID_RE.match(value):
         raise ValueError(
             f"Invalid tunnel {name} {value!r}: must match [cu][0-9a-f]{{24}}"
         )
@@ -174,10 +175,10 @@ def parse_host_port(payload: str) -> tuple[str, int]:
 
     try:
         port = int(port_str)
-    except ValueError:
+    except (binascii.Error, ValueError) as exc:
         raise ValueError(
             f"Non-numeric port {port_str!r} in payload: {payload!r}"
-        ) from None
+        ) from exc
 
     if not (1 <= port <= 65_535):
         raise ValueError(f"Port {port} out of range in payload: {payload!r}")
@@ -216,7 +217,7 @@ def _encode_frame(msg_type: str, conn_id: str, payload: str = "") -> str:
 
     Args:
         msg_type: Must be a member of ``_VALID_MSG_TYPES``.
-        conn_id:  Must match ``_ID_RE``, or be ``""`` for ``AGENT_READY``.
+        conn_id:  Must match ``ID_RE``, or be ``""`` for ``AGENT_READY``.
         payload:  Optional payload string.  Must not contain ``FRAME_SUFFIX``.
 
     Returns:
@@ -414,6 +415,8 @@ def parse_frame(line: str) -> ParsedFrame | None:
         A :class:`ParsedFrame` on success, ``None`` otherwise.
     """
     line = line.strip()
+    if len(line) > MAX_FRAME_LEN:
+        return None
     if not (line.startswith(FRAME_PREFIX) and line.endswith(FRAME_SUFFIX)):
         return None
 
@@ -431,7 +434,7 @@ def parse_frame(line: str) -> ParsedFrame | None:
     payload = parts[2] if len(parts) > 2 else ""
 
     # Validate conn_id format for frames that carry one.
-    if conn_id and not _ID_RE.match(conn_id):
+    if conn_id and not ID_RE.match(conn_id):
         return None
 
     return ParsedFrame(msg_type=msg_type, conn_id=conn_id, payload=payload)
