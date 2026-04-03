@@ -16,16 +16,13 @@ from exectunnel.config.defaults import (
     ACK_TIMEOUT_WINDOW_SECS,
     CONN_ACK_TIMEOUT_SECS,
     CONNECT_MAX_PENDING,
-    CONNECT_MAX_PENDING_CF,
     CONNECT_MAX_PENDING_PER_HOST,
-    CONNECT_PACE_CF_INTERVAL_SECS,
     DNS_LOCAL_PORT,
     PRE_ACK_BUFFER_CAP_BYTES,
     READY_TIMEOUT_SECS,
     SOCKS_DEFAULT_HOST,
     SOCKS_DEFAULT_PORT,
     WS_PING_INTERVAL_SECS,
-    WS_PING_TIMEOUT_SECS,
     WS_RECONNECT_BASE_DELAY_SECS,
     WS_RECONNECT_MAX_DELAY_SECS,
     WS_RECONNECT_MAX_RETRIES,
@@ -43,7 +40,6 @@ class BridgeConfig:
     """Runtime tunables for the WebSocket bridge."""
 
     ping_interval: int = WS_PING_INTERVAL_SECS
-    ping_timeout: int = WS_PING_TIMEOUT_SECS
     # Maximum time (seconds) to wait for a single ws.send() call.
     send_timeout: float = WS_SEND_TIMEOUT_SECS
     # Maximum number of frames queued for the outbound send loop.
@@ -93,9 +89,6 @@ class TunnelConfig:
     # Connect-hardening tunables (overridable via env).
     connect_max_pending: int = CONNECT_MAX_PENDING
     connect_max_pending_per_host: int = CONNECT_MAX_PENDING_PER_HOST
-    connect_max_pending_cf: int = CONNECT_MAX_PENDING_CF
-    # Stored internally as ms for backward compat with env var EXECTUNNEL_CONNECT_PACE_CF_MS.
-    connect_pace_cf_ms: int = int(CONNECT_PACE_CF_INTERVAL_SECS * 1000)
     # Pre-ACK send buffer cap in bytes (overridable via env).
     pre_ack_buffer_cap_bytes: int = PRE_ACK_BUFFER_CAP_BYTES
 
@@ -154,9 +147,6 @@ def get_app_config() -> AppConfig:
         bridge=BridgeConfig(
             ping_interval=parse_int_env(
                 "WSS_PING_INTERVAL", CONFIG.ping_interval, min_value=1
-            ),
-            ping_timeout=parse_int_env(
-                "WSS_PING_TIMEOUT", CONFIG.ping_timeout, min_value=1
             ),
             send_timeout=parse_float_env(
                 "WSS_SEND_TIMEOUT", CONFIG.send_timeout, min_value=0.1
@@ -217,16 +207,6 @@ def get_tunnel_config(
             "EXECTUNNEL_CONNECT_MAX_PENDING_PER_HOST",
             TUNNEL_CONFIG.connect_max_pending_per_host,
             min_value=1,
-        ),
-        connect_max_pending_cf=parse_int_env(
-            "EXECTUNNEL_CONNECT_MAX_PENDING_CF",
-            TUNNEL_CONFIG.connect_max_pending_cf,
-            min_value=1,
-        ),
-        connect_pace_cf_ms=parse_int_env(
-            "EXECTUNNEL_CONNECT_PACE_CF_MS",
-            TUNNEL_CONFIG.connect_pace_cf_ms,
-            min_value=0,
         ),
         pre_ack_buffer_cap_bytes=parse_int_env(
             "EXECTUNNEL_PRE_ACK_BUFFER_CAP_BYTES",
