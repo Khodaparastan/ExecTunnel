@@ -83,7 +83,7 @@ class TunnelConfig:
     # How long to wait for the remote agent to ACK a CONN_OPEN (per connection).
     conn_ack_timeout: float = CONN_ACK_TIMEOUT_SECS
     # CIDRs that bypass the tunnel and connect directly.
-    exclude: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = field(
+    exclude: list[ipaddress.IPv4Network | ipaddress.IPv6Network] | None = field(
         default_factory=get_default_exclusion_networks
     )
     # ACK-timeout tunables (overridable via env).

@@ -127,12 +127,12 @@ environment:
   EXECTUNNEL_OBS_HTTP_HEADERS         semicolon header list, e.g. Authorization=Bearer token
         """,
     )
-    _= parser.add_argument(
+    _ = parser.add_argument(
         "--version",
         action="version",
         version=f"exectunnel {__version__}",
     )
-    _=parser.add_argument(
+    _ = parser.add_argument(
         "--log-level",
         choices=["debug", "info", "warning", "error"],
         default="info",
@@ -280,7 +280,7 @@ async def run_tunnel_command(cfg: AppConfig, tun_cfg: TunnelConfig) -> None:
     * ``KeyboardInterrupt``            – clean shutdown; exit 0.
     * ``Exception``                    – unexpected; exit 2.
     """
-    from exectunnel.transport.session import TunnelSession
+    from exectunnel.session import TunnelSession
 
     trace_seed = os.getenv("EXECTUNNEL_TRACE_ID")
     with start_trace(trace_seed), span("cli.run_tunnel_command"):

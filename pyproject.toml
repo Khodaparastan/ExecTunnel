@@ -110,7 +110,7 @@ ignore = [
   "PLR6301",  # Method could be a function (no self used)
   "TRY301",
   "G201",
-
+  "S108",
   "S104",
   "PLW0603",
   "TRY400",
@@ -155,6 +155,7 @@ exclude = ["tests"]
 defineConstant = { DEBUG = true }
 reportMissingImports = "error"
 reportMissingTypeStubs = false
+reportImplicitStringConcatenation = false
 reportAny = false
 pythonVersion = "3.13"
 pythonPlatform = "Darwin"

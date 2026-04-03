@@ -1,4 +1,3 @@
-
 """Frame encode/decode and protocol constants.
 
 Wire format (newline-terminated)
@@ -53,18 +52,16 @@ PIPE_READ_CHUNK_BYTES: int = 4_096
 
 # ── Allowed message types ─────────────────────────────────────────────────────
 
-_VALID_MSG_TYPES: frozenset[str] = frozenset(
-    {
-        "AGENT_READY",
-        "CONN_OPEN",
-        "CONN_CLOSE",
-        "DATA",
-        "UDP_OPEN",
-        "UDP_DATA",
-        "UDP_CLOSE",
-        "ERROR",
-    }
-)
+_VALID_MSG_TYPES: frozenset[str] = frozenset({
+    "AGENT_READY",
+    "CONN_OPEN",
+    "CONN_CLOSE",
+    "DATA",
+    "UDP_OPEN",
+    "UDP_DATA",
+    "UDP_CLOSE",
+    "ERROR",
+})
 
 # ── Validation helpers ────────────────────────────────────────────────────────
 
@@ -79,8 +76,7 @@ def _validate_id(value: str, name: str = "id") -> None:
     """Raise ``ValueError`` if *value* is not a well-formed tunnel ID."""
     if not _ID_RE.match(value):
         raise ValueError(
-            f"Invalid tunnel {name} {value!r}: "
-            "must match [cu][0-9a-f]{24}"
+            f"Invalid tunnel {name} {value!r}: must match [cu][0-9a-f]{{24}}"
         )
 
 
@@ -88,8 +84,7 @@ def _validate_msg_type(msg_type: str) -> None:
     """Raise ``ValueError`` if *msg_type* is not in the allowed catalogue."""
     if msg_type not in _VALID_MSG_TYPES:
         raise ValueError(
-            f"Unknown msg_type {msg_type!r}. "
-            f"Allowed: {sorted(_VALID_MSG_TYPES)}"
+            f"Unknown msg_type {msg_type!r}. Allowed: {sorted(_VALID_MSG_TYPES)}"
         )
 
 
@@ -368,9 +363,7 @@ def encode_error_frame(conn_id: str, message: str) -> str:
         A newline-terminated ``ERROR`` frame string.
     """
     payload_b64 = (
-        base64.urlsafe_b64encode(message.encode("utf-8"))
-        .rstrip(b"=")
-        .decode("ascii")
+        base64.urlsafe_b64encode(message.encode("utf-8")).rstrip(b"=").decode("ascii")
     )
     return _encode_frame("ERROR", conn_id, payload_b64)
 

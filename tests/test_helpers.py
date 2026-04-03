@@ -1,7 +1,7 @@
 """Tests for exectunnel.helpers — frame codec and ID generation."""
 from __future__ import annotations
 
-from exectunnel.helpers import encode_frame, new_conn_id, new_flow_id, parse_frame
+from utils import encode_frame, new_conn_id, new_flow_id, parse_frame
 
 # ── encode_frame ──────────────────────────────────────────────────────────────
 
