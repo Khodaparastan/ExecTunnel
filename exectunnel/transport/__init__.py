@@ -1,10 +1,13 @@
-"""Transport domain: TCP connection handler and UDP flow handler."""
+"""Transport domain: TCP connection handler, UDP flow handler, and send protocol."""
 
-from exectunnel.transport.connection import _TcpConnectionHandler, WsSendCallable
-from exectunnel.transport.udp_flow import _UdpFlowHandler
+from exectunnel.transport.connection import (
+    TcpConnectionHandler,
+    WsSendCallable,
+)
+from exectunnel.transport.udp_flow import UdpFlowHandler
 
 __all__ = [
     "WsSendCallable",
-    "_TcpConnectionHandler",
-    "_UdpFlowHandler",
+    "TcpConnectionHandler",
+    "UdpFlowHandler",
 ]
