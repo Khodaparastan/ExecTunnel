@@ -1,13 +1,10 @@
-"""
-DNS forwarder — forwards DNS queries through the tunnel via UDP flows.
+"""DNS forwarder — forwards DNS queries through the tunnel via UDP flows.
 
 Belongs to the ``session`` layer because it orchestrates transport-layer
-primitives (:class:`~exectunnel.transport.udp.UdpFlow`) in the same way
-the session orchestrates TCP connections — it is not a SOCKS5 wire-protocol
+primitives (:class:`~exectunnel.transport.UdpFlow`) in the same way the
+session orchestrates TCP connections — it is not a SOCKS5 wire-protocol
 concern and does not belong in ``proxy``.
 """
-
-from __future__ import annotations
 
 import asyncio
 import contextlib
@@ -26,28 +23,23 @@ from exectunnel.exceptions import (
     WebSocketSendTimeoutError,
 )
 from exectunnel.observability import metrics_inc, metrics_observe
-from exectunnel.protocol.ids import new_flow_id
+from exectunnel.protocol import new_flow_id
 from exectunnel.transport import UdpFlow, WsSendCallable
 
-__all__ = ["DnsForwarder"]
+__all__: list[str] = []  # internal module
 
 logger = logging.getLogger(__name__)
 
 
-# ── Datagram protocol ─────────────────────────────────────────────────────────
-
-
 class _DnsDatagramProtocol(asyncio.DatagramProtocol):
-    """asyncio datagram protocol that dispatches received DNS queries to
-    :class:`DnsForwarder`.
-    """
+    """asyncio datagram protocol that dispatches received DNS queries."""
 
-    def __init__(self, forwarder: DnsForwarder) -> None:
-        self._fwd = forwarder
+    __slots__ = ("_forwarder",)
+
+    def __init__(self, forwarder: "DnsForwarder") -> None:
+        self._forwarder = forwarder
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
-        # Validate transport type without raising — raising from connection_made
-        # is not safe; asyncio may not handle it gracefully.
         if not isinstance(transport, asyncio.DatagramTransport):
             logger.error(
                 "dns forwarder: expected DatagramTransport, got %s — "
@@ -57,10 +49,10 @@ class _DnsDatagramProtocol(asyncio.DatagramProtocol):
             metrics_inc("dns.forwarder.bad_transport_type")
             transport.close()
             return
-        self._fwd._on_transport_ready(transport)
+        self._forwarder._on_transport_ready(transport)
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
-        self._fwd._on_query(data, addr)
+        self._forwarder._on_query(data, addr)
 
     def error_received(self, exc: Exception) -> None:
         metrics_inc("dns.forwarder.socket_error", reason=type(exc).__name__)
@@ -75,28 +67,48 @@ class _DnsDatagramProtocol(asyncio.DatagramProtocol):
             logger.debug("dns forwarder connection lost: %s", exc)
 
 
-# ── Forwarder ─────────────────────────────────────────────────────────────────
-
-
 class DnsForwarder:
     """Minimal DNS UDP forwarder.
 
     Listens locally; forwards each query as a UDP flow through the tunnel to
     ``upstream:upstream_port`` and returns the response to the client.
 
+    Each query opens a dedicated ``UdpFlow``, sends the query datagram, waits
+    for exactly one response datagram, then closes the flow.  The
+    ``recv_datagram()`` call is intentionally not looped — DNS is a
+    single-request/single-response protocol and the flow is closed immediately
+    after the first response.  Any additional datagrams that arrive before
+    close are discarded by the flow's queue drain.
+
     Args:
         local_port:    Port to bind the local UDP socket on ``127.0.0.1``.
         upstream:      IP or hostname of the upstream DNS server accessed
                        through the tunnel.
-        ws_send:       Coroutine callable conforming to
-                       :class:`~exectunnel.transport.connection.WsSendCallable`.
-        udp_registry:  Shared mutable dict mapping flow IDs to
-                       :class:`~exectunnel.transport.udp_flow.UdpFlow`.
+        ws_send:       Coroutine callable conforming to ``WsSendCallable``.
+        udp_registry:  Shared mutable dict mapping flow IDs to ``UdpFlow``.
         max_inflight:  Maximum number of concurrent in-flight DNS queries.
-                       Defaults to :data:`~exectunnel.config.defaults.DNS_MAX_INFLIGHT`.
         upstream_port: UDP port of the upstream DNS server.
-                       Defaults to :data:`~exectunnel.config.defaults.DNS_UPSTREAM_PORT`.
     """
+
+    __slots__ = (
+        "_local_port",
+        "_upstream",
+        "_upstream_port",
+        "_ws_send",
+        "_udp_registry",
+        "_max_inflight",
+        "_transport",
+        "_tasks",
+        "_started",
+        "_stopped",
+        "_saturation_drop_count",
+        "_error_drop_count",
+        "_total_drop_count",
+        "_query_count",
+        "_ok_count",
+        "_bytes_in",
+        "_bytes_out",
+    )
 
     def __init__(
         self,
@@ -115,37 +127,31 @@ class DnsForwarder:
         self._max_inflight = max(1, max_inflight)
         self._transport: asyncio.DatagramTransport | None = None
         self._tasks: set[asyncio.Task[None]] = set()
-
-        # Lifecycle guards.
         self._started: bool = False
         self._stopped: bool = False
-
-        # Telemetry — split by drop category for accurate dashboards.
-        self._saturation_drop_count: int = 0  # inflight limit exceeded
-        self._error_drop_count: int = 0  # transport / protocol errors
-        self._total_drop_count: int = 0  # all drops combined
-        self._query_count: int = 0  # queries that passed saturation check
-        self._ok_count: int = 0  # queries with a response sent
-        self._bytes_in: int = 0  # query bytes received
-        self._bytes_out: int = 0  # response bytes sent
+        self._saturation_drop_count: int = 0
+        self._error_drop_count: int = 0
+        self._total_drop_count: int = 0
+        self._query_count: int = 0
+        self._ok_count: int = 0
+        self._bytes_in: int = 0
+        self._bytes_out: int = 0
 
     # ── Async context manager ─────────────────────────────────────────────────
 
-    async def __aenter__(self) -> DnsForwarder:
+    async def __aenter__(self) -> "DnsForwarder":
         await self.start()
         return self
 
     async def __aexit__(self, *_: object) -> None:
         await self.stop()
 
-    # ── Package-internal callbacks (called by _DnsDatagramProtocol) ──────────
+    # ── Package-internal callbacks ────────────────────────────────────────────
 
     def _on_transport_ready(self, transport: asyncio.DatagramTransport) -> None:
-        """Store the transport once asyncio confirms the socket is ready."""
         self._transport = transport
 
     def _on_query(self, data: bytes, addr: tuple[str, int]) -> None:
-        """Dispatch an incoming DNS query — called from the datagram protocol."""
         metrics_inc("dns.query.received")
 
         if len(self._tasks) >= self._max_inflight:
@@ -166,10 +172,9 @@ class DnsForwarder:
                 )
             return
 
-        # Include flow_id in task name for unique identification in task dumps.
         flow_id = new_flow_id()
         task = asyncio.create_task(
-            self._forward(data, addr, flow_id),
+            self._forward_query(data, addr, flow_id),
             name=f"dns-fwd-{addr[0]}_{addr[1]}-{flow_id[:8]}",
         )
         self._tasks.add(task)
@@ -183,8 +188,7 @@ class DnsForwarder:
         Idempotent — subsequent calls are no-ops.
 
         Raises:
-            TransportError: If the local UDP endpoint cannot be created
-                (e.g. port already in use, insufficient permissions).
+            TransportError: If the local UDP endpoint cannot be created.
         """
         if self._started:
             return
@@ -196,14 +200,16 @@ class DnsForwarder:
                 lambda: _DnsDatagramProtocol(self),
                 local_addr=("127.0.0.1", self._local_port),
             )
-        except Exception as exc:
+        except OSError as exc:
+            # Narrow to OSError — the only failure mode for create_datagram_endpoint
+            # on a valid address is an OS-level bind failure.
             raise TransportError(
                 f"DNS forwarder failed to bind on 127.0.0.1:{self._local_port}.",
                 error_code="transport.dns_bind_failed",
                 details={
-                    "local_port": self._local_port,
-                    "upstream": self._upstream,
-                    "upstream_port": self._upstream_port,
+                    "host": "127.0.0.1",
+                    "port": self._local_port,
+                    "url": f"udp://127.0.0.1:{self._local_port}",
                 },
                 hint=(
                     "Ensure the port is not already in use and the process has "
@@ -216,7 +222,11 @@ class DnsForwarder:
             raise TransportError(
                 "DNS forwarder received an unexpected transport type from asyncio.",
                 error_code="transport.dns_bad_transport_type",
-                details={"transport_type": type(transport).__name__},
+                details={
+                    "host": "127.0.0.1",
+                    "port": self._local_port,
+                    "url": f"udp://127.0.0.1:{self._local_port}",
+                },
                 hint="This is an asyncio internal error. Please report it.",
             )
 
@@ -233,9 +243,6 @@ class DnsForwarder:
         """Close the local UDP socket and await cancellation of all in-flight tasks.
 
         Idempotent — subsequent calls are no-ops.
-
-        Awaiting task cancellation ensures that no in-flight ``_forward``
-        coroutine attempts to use the closed transport after ``stop()`` returns.
         """
         if self._stopped:
             return
@@ -252,7 +259,7 @@ class DnsForwarder:
 
     # ── Core forwarding logic ─────────────────────────────────────────────────
 
-    async def _forward(
+    async def _forward_query(
         self,
         query: bytes,
         client_addr: tuple[str, int],
@@ -260,32 +267,17 @@ class DnsForwarder:
     ) -> None:
         """Open a UDP flow, forward *query*, wait for the response, reply to client.
 
-        ``flow_id`` is pre-generated by :meth:`_on_query` so the task name
-        and the flow ID are consistent in logs and task dumps.
+        DNS is a single-request/single-response protocol.  One ``recv_datagram()``
+        call is made intentionally — the flow is closed immediately after the
+        first response.  This is a documented deviation from the transport
+        invariant that requires looping until ``None``; the loop is omitted
+        because the flow is closed synchronously after the single recv.
 
         All structured exceptions are caught here and converted into metrics +
         log entries so that a single bad query never tears down the forwarder.
-
-        ``_query_count`` and ``_bytes_in`` are incremented only after the
-        handler is successfully opened — saturation drops are counted
-        separately in ``_saturation_drop_count``.
-
-        Exception hierarchy
-        -------------------
-        ``asyncio.TimeoutError``
-            Query timed out; DNS client will retry naturally.
-        ``WebSocketSendTimeoutError``
-            Tunnel send queue stalled; warn loudly.
-        ``ConnectionClosedError``
-            Tunnel is gone; warn loudly.
-        ``TransportError``
-            Other transport blip; log at DEBUG.
-        ``ExecTunnelError``
-            Any other library error; log at WARNING.
-        ``Exception``
-            Truly unexpected; log at WARNING with traceback.
         """
         start = asyncio.get_running_loop().time()
+        agent_closed = False
 
         handler = UdpFlow(
             flow_id,
@@ -294,44 +286,53 @@ class DnsForwarder:
             self._ws_send,
             self._udp_registry,
         )
-        # Register in registry only after construction — open() may fail and
-        # the finally block will pop it regardless.
+        # Insert into registry BEFORE open() — agent may reply immediately.
         self._udp_registry[flow_id] = handler
 
-        # Tracks whether the agent already tore down the flow so we skip
-        # sending UDP_CLOSE (which would be spurious on a dead connection).
-        agent_closed = False
-
         try:
-            # ── Open + send ───────────────────────────────────────────────────
             await handler.open()
 
-            # Count the query only after open() succeeds.
             self._query_count += 1
             self._bytes_in += len(query)
             metrics_observe("dns.query.bytes.in", float(len(query)))
 
             await handler.send_datagram(query)
 
-            # ── Receive response ──────────────────────────────────────────────
-            response = await asyncio.wait_for(
-                handler.recv_datagram(),
-                timeout=DNS_QUERY_TIMEOUT_SECS,
-            )
+            # Single recv — DNS is request/response.  Flow is closed in the
+            # finally block immediately after, so no further datagrams can
+            timed_out = False
+            try:
+                async with asyncio.timeout(DNS_QUERY_TIMEOUT_SECS):
+                    response = await handler.recv_datagram()
+            except TimeoutError:
+                timed_out = True
+                self._error_drop_count += 1
+                self._total_drop_count += 1
+                metrics_inc("dns.query.timeout")
+                logger.debug(
+                    "dns query timed out for %s:%d (flow=%s, timeout_s=%s)",
+                    client_addr[0],
+                    client_addr[1],
+                    flow_id,
+                    DNS_QUERY_TIMEOUT_SECS,
+                )
+                return  # finally block handles cleanup.
+
+            if timed_out:
+                return
 
             if response is None:
-                # Agent closed the flow before sending a response.
                 agent_closed = True
                 metrics_inc("dns.query.error", error="agent_closed_no_response")
                 logger.debug(
-                    "dns query for %s:%d — agent closed flow before response (flow=%s)",
+                    "dns query for %s:%d — agent closed flow before response "
+                    "(flow=%s)",
                     client_addr[0],
                     client_addr[1],
                     flow_id,
                 )
                 return
 
-            # ── Reply to client ───────────────────────────────────────────────
             if self._transport is not None and not self._transport.is_closing():
                 self._transport.sendto(response, client_addr)
                 self._ok_count += 1
@@ -340,25 +341,12 @@ class DnsForwarder:
                 metrics_observe("dns.query.bytes.out", float(len(response)))
             else:
                 logger.debug(
-                    "dns query for %s:%d — transport closed before reply could "
-                    "be sent (flow=%s)",
+                    "dns query for %s:%d — transport closed before reply "
+                    "(flow=%s)",
                     client_addr[0],
                     client_addr[1],
                     flow_id,
                 )
-
-        except TimeoutError:
-            # DNS clients retry naturally — log at DEBUG, not WARNING.
-            self._error_drop_count += 1
-            self._total_drop_count += 1
-            metrics_inc("dns.query.timeout")
-            logger.debug(
-                "dns query timed out for %s:%d (flow=%s, timeout_s=%s)",
-                client_addr[0],
-                client_addr[1],
-                flow_id,
-                DNS_QUERY_TIMEOUT_SECS,
-            )
 
         except WebSocketSendTimeoutError as exc:
             self._error_drop_count += 1
@@ -390,7 +378,9 @@ class DnsForwarder:
         except TransportError as exc:
             self._error_drop_count += 1
             self._total_drop_count += 1
-            metrics_inc("dns.query.error", error=exc.error_code.replace(".", "_"))
+            metrics_inc(
+                "dns.query.error", error=exc.error_code.replace(".", "_")
+            )
             logger.debug(
                 "dns query for %s:%d dropped — transport error [%s]: %s "
                 "(flow=%s, error_id=%s)",
@@ -405,7 +395,9 @@ class DnsForwarder:
         except ExecTunnelError as exc:
             self._error_drop_count += 1
             self._total_drop_count += 1
-            metrics_inc("dns.query.error", error=exc.error_code.replace(".", "_"))
+            metrics_inc(
+                "dns.query.error", error=exc.error_code.replace(".", "_")
+            )
             logger.warning(
                 "dns query for %s:%d failed [%s]: %s (flow=%s, error_id=%s)",
                 client_addr[0],
@@ -426,10 +418,6 @@ class DnsForwarder:
                 client_addr[1],
                 exc,
                 flow_id,
-            )
-            logger.debug(
-                "dns query traceback (flow=%s)",
-                flow_id,
                 exc_info=True,
             )
 
@@ -439,19 +427,11 @@ class DnsForwarder:
                 asyncio.get_running_loop().time() - start,
             )
             # Close the flow unless the agent already tore it down.
-            # Suppress ExecTunnelError (covers ConnectionClosedError,
-            # WebSocketSendTimeoutError, TransportError) and OSError so
-            # close() never suppresses the original exception.
             if not agent_closed:
                 with contextlib.suppress(ExecTunnelError, OSError):
                     await handler.close()
             else:
-                # Agent closed — mark the handler as remote-closed so it
-                # releases its internal state cleanly without sending UDP_CLOSE.
                 handler.on_remote_closed()
-
-            # Always remove from registry to prevent memory leaks.
-            self._udp_registry.pop(flow_id, None)
 
     # ── Properties ────────────────────────────────────────────────────────────
 
@@ -497,8 +477,7 @@ class DnsForwarder:
 
     @property
     def is_running(self) -> bool:
-        """``True`` once the local UDP socket has been successfully bound
-        and before :meth:`stop` has been called."""
+        """``True`` once the local UDP socket has been bound and before stop()."""
         return (
             self._started
             and not self._stopped
