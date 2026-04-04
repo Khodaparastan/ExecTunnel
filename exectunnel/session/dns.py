@@ -1,4 +1,11 @@
-"""DNS forwarder — forwards queries through the tunnel via UDP flows."""
+"""
+DNS forwarder — forwards DNS queries through the tunnel via UDP flows.
+
+Belongs to the ``session`` layer because it orchestrates transport-layer
+primitives (:class:`~exectunnel.transport.udp.UdpFlow`) in the same way
+the session orchestrates TCP connections — it is not a SOCKS5 wire-protocol
+concern and does not belong in ``proxy``.
+"""
 
 from __future__ import annotations
 
@@ -20,8 +27,7 @@ from exectunnel.exceptions import (
 )
 from exectunnel.observability import metrics_inc, metrics_observe
 from exectunnel.protocol.ids import new_flow_id
-from exectunnel.transport import WsSendCallable
-from exectunnel.transport import UdpFlow
+from exectunnel.transport import UdpFlow, WsSendCallable
 
 __all__ = ["DnsForwarder"]
 
@@ -116,12 +122,12 @@ class DnsForwarder:
 
         # Telemetry — split by drop category for accurate dashboards.
         self._saturation_drop_count: int = 0  # inflight limit exceeded
-        self._error_drop_count: int = 0       # transport / protocol errors
-        self._total_drop_count: int = 0       # all drops combined
-        self._query_count: int = 0            # queries that passed saturation check
-        self._ok_count: int = 0               # queries with a response sent
-        self._bytes_in: int = 0               # query bytes received
-        self._bytes_out: int = 0              # response bytes sent
+        self._error_drop_count: int = 0  # transport / protocol errors
+        self._total_drop_count: int = 0  # all drops combined
+        self._query_count: int = 0  # queries that passed saturation check
+        self._ok_count: int = 0  # queries with a response sent
+        self._bytes_in: int = 0  # query bytes received
+        self._bytes_out: int = 0  # response bytes sent
 
     # ── Async context manager ─────────────────────────────────────────────────
 
@@ -341,7 +347,7 @@ class DnsForwarder:
                     flow_id,
                 )
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # DNS clients retry naturally — log at DEBUG, not WARNING.
             self._error_drop_count += 1
             self._total_drop_count += 1
@@ -442,7 +448,7 @@ class DnsForwarder:
             else:
                 # Agent closed — mark the handler as remote-closed so it
                 # releases its internal state cleanly without sending UDP_CLOSE.
-                handler.close_remote()
+                handler.on_remote_closed()
 
             # Always remove from registry to prevent memory leaks.
             self._udp_registry.pop(flow_id, None)
