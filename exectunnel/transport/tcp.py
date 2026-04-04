@@ -131,7 +131,11 @@ def _log_task_exception(
                 byte_key,
                 bytes_transferred,
                 exc.error_id,
-                extra={**base_extra, "error_code": exc.error_code, "error_id": exc.error_id},
+                extra={
+                    **base_extra,
+                    "error_code": exc.error_code,
+                    "error_id": exc.error_id,
+                },
             )
 
         case ConnectionClosedError():
@@ -145,7 +149,11 @@ def _log_task_exception(
                 byte_key,
                 bytes_transferred,
                 exc.error_id,
-                extra={**base_extra, "error_code": exc.error_code, "error_id": exc.error_id},
+                extra={
+                    **base_extra,
+                    "error_code": exc.error_code,
+                    "error_id": exc.error_id,
+                },
             )
 
         case TransportError():
@@ -162,7 +170,11 @@ def _log_task_exception(
                 byte_key,
                 bytes_transferred,
                 exc.error_id,
-                extra={**base_extra, "error_code": exc.error_code, "error_id": exc.error_id},
+                extra={
+                    **base_extra,
+                    "error_code": exc.error_code,
+                    "error_id": exc.error_id,
+                },
             )
 
         case OSError():
@@ -188,7 +200,11 @@ def _log_task_exception(
                 exc.error_code,
                 exc.message,
                 exc.error_id,
-                extra={**base_extra, "error_code": exc.error_code, "error_id": exc.error_id},
+                extra={
+                    **base_extra,
+                    "error_code": exc.error_code,
+                    "error_id": exc.error_id,
+                },
             )
 
         case _:
@@ -369,27 +385,33 @@ class TcpConnection:
         self._downstream_task = downstream_task
 
     # ── Called by recv_loop ───────────────────────────────────────────────────
-
     def feed(self, data: bytes) -> None:
         """Enqueue *data* received from the agent for the downstream task.
 
         Use :meth:`feed_async` post-ACK so the recv_loop applies proper
-        backpressure. This synchronous variant is for pre-ACK buffering and
-        callers that cannot await.
+        backpressure. This synchronous variant is for pre-ACK buffering
+        and callers that cannot await.
 
-        Pre-ACK overflow is treated as a fatal connection error — the
-        connection is closed immediately rather than silently dropping data,
-        because a pre-ACK overflow means the agent is sending data faster
-        than the local client can consume it before even acknowledging the
-        connection, which is a protocol violation.
+        Pre-ACK overflow schedules cleanup and raises
+        ``transport.pre_ack_buffer_overflow`` — the session layer catches
+        this specific code to signal ``ack_future`` with
+        ``"pre_ack_overflow"`` and tear down the connection.
+
+        Post-ACK queue full raises ``transport.inbound_queue_full`` —
+        the session layer catches this to log and drop without signalling
+        ``ack_future``.
 
         Args:
             data: Raw bytes decoded from a ``DATA`` frame payload.
 
         Raises:
-            TransportError:     If the pre-ACK buffer is full.
-            TransportError:     If the post-ACK inbound queue is full.
-            TransportError:     If *data* is not a ``bytes`` instance.
+            TransportError: ``transport.bad_argument``
+                            if *data* is not ``bytes``.
+            TransportError: ``transport.pre_ack_buffer_overflow``
+                            if the pre-ACK buffer is full (fatal —
+                            cleanup is scheduled before raising).
+            TransportError: ``transport.inbound_queue_full``
+                            if the post-ACK inbound queue is full.
         """
         require_bytes(data, self._id, "feed")
 
@@ -408,8 +430,6 @@ class TcpConnection:
                     pending,
                     extra={"conn_id": self._id},
                 )
-                # Schedule cleanup — connection is unrecoverable at this point.
-                # _cleanup guards against double-execution via _closed event.
                 if self._cleanup_task is None:
                     self._cleanup_task = asyncio.create_task(
                         self._cleanup(),
@@ -442,7 +462,7 @@ class TcpConnection:
             metrics_inc("tcp.connection.inbound_queue.drop")
             self._drop_count += 1
             raise TransportError(
-                f"conn {self._id!r}: inbound queue full; datagram dropped.",
+                f"conn {self._id!r}: inbound queue full; chunk dropped.",
                 error_code="transport.inbound_queue_full",
                 details={
                     "conn_id": self._id,
@@ -508,6 +528,32 @@ class TcpConnection:
                 ),
             )
 
+    async def close_unstarted(self) -> None:
+        """Close the writer directly when :meth:`start` was never called.
+
+        The normal cleanup path (``_on_task_done`` → ``_cleanup``) only
+        runs after both copy tasks finish. When the handler was never
+        started there are no tasks, so the session layer must trigger
+        writer teardown explicitly via this method.
+
+        Schedules and awaits ``_cleanup()`` directly so the registry eviction
+        and writer close happen in one place — no private attribute access
+        needed at the call site.
+
+        Safe to call multiple times — ``_cleanup`` is idempotent via
+        ``_closed``.
+
+        Raises:
+            RuntimeError: If called after :meth:`start` — use :meth:`abort`
+                          instead for started handlers.
+        """
+        if self._started:
+            raise RuntimeError(
+                f"conn {self._id!r}: close_unstarted() called after start(). "
+                "Use abort() to tear down a started handler."
+            )
+        await self._cleanup()
+
     def close_remote(self) -> None:
         """Signal that the agent has closed its side of the connection.
 
@@ -522,14 +568,10 @@ class TcpConnection:
             self._remote_closed.set()
 
     def abort(self) -> None:
-        """Hard-cancel both copy tasks immediately.
+        """Hard-cancel both directions immediately.
 
-        Used when the agent signals an unrecoverable ``ERROR`` and both
-        directions must be torn down without waiting for graceful drain.
-
-        For half-close teardown (agent closed only one direction), use
-        :meth:`close_remote` to stop the downstream path while keeping
-        upstream alive, or call :meth:`abort` to stop everything.
+        Used when the entire connection must be torn down with no draining
+        — e.g. session-level shutdown or unrecoverable protocol error.
 
         Idempotent — cancelling an already-done task is a no-op.
         """
@@ -539,18 +581,28 @@ class TcpConnection:
 
     def abort_upstream(self) -> None:
         """Cancel the upstream task only.
-        Used when the agent signals ERROR — stops sending DATA frames to a
-        connection the agent has already torn down, while keeping downstream
-        alive to drain any queued response data to the local client."""
+
+        Used when the agent signals ``ERROR`` — stops sending DATA frames
+        to a connection the agent has already torn down, while keeping
+        ``_downstream`` alive to drain any queued response data to the
+        local client.
+
+        Idempotent — cancelling an already-done task is a no-op.
+        """
         if self._upstream_task is not None and not self._upstream_task.done():
             self._upstream_task.cancel()
 
     def abort_downstream(self) -> None:
         """Cancel the downstream task only.
+
         Used for hard teardown when the local socket is known to be dead
-        and draining remaining queued data would be pointless."""
+        and draining remaining queued data would be pointless.
+
+        Idempotent — cancelling an already-done task is a no-op.
+        """
         if self._downstream_task is not None and not self._downstream_task.done():
             self._downstream_task.cancel()
+
     # ── Copy tasks ────────────────────────────────────────────────────────────
 
     async def _upstream(self) -> None:
@@ -746,9 +798,7 @@ class TcpConnection:
                 raise
 
             except Exception as exc:
-                _log_task_exception(
-                    self._id, "downstream", exc, self._bytes_downstream
-                )
+                _log_task_exception(self._id, "downstream", exc, self._bytes_downstream)
 
             finally:
                 # Always cancel the reused close_task on exit so it does not
@@ -885,9 +935,9 @@ class TcpConnection:
 
         # Schedule cleanup only when both tasks are finished, cleanup has not
         # already been scheduled, and the closed gate has not been set.
-        both_done = (
-            self._upstream_task is None or self._upstream_task.done()
-        ) and (self._downstream_task is None or self._downstream_task.done())
+        both_done = (self._upstream_task is None or self._upstream_task.done()) and (
+            self._downstream_task is None or self._downstream_task.done()
+        )
         if both_done and not self._closed.is_set() and self._cleanup_task is None:
             self._cleanup_task = asyncio.create_task(
                 self._cleanup(), name=f"tcp-cleanup-{self._id}"

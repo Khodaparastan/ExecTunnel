@@ -32,7 +32,6 @@ Design notes
 from collections.abc import Coroutine
 from typing import Any, Protocol, runtime_checkable
 
-
 __all__ = [
     "WsSendCallable",
     "TransportHandler",

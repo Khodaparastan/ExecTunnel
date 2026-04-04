@@ -34,7 +34,6 @@ All validators must follow the same contract:
 
 from exectunnel.exceptions import TransportError
 
-
 __all__ = ["require_bytes"]
 
 

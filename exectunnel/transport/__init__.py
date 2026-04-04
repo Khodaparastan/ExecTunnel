@@ -47,8 +47,8 @@ surface. No other layer should import from ``exectunnel.transport`` directly.
 """
 
 from exectunnel.transport._types import (
-    TransportHandler,
     TcpRegistry,
+    TransportHandler,
     UdpRegistry,
     WsSendCallable,
 )
