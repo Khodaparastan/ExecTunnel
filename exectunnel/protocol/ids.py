@@ -1,9 +1,26 @@
-"""TCP connection and UDP flow ID generation."""
+"""TCP connection and UDP flow ID generation.
+
+IDs are cryptographically random, prefix-namespaced strings that are safe
+to embed in any frame field without escaping.
+
+Format
+──────
+    <prefix><24 lowercase hex chars>
+
+    TCP connection IDs: ``c<24 hex>``  e.g. ``ca1b2c3d4e5f6a7b8c9d0e1f2a3b``
+    UDP flow IDs:       ``u<24 hex>``  e.g. ``ua1b2c3d4e5f6a7b8c9d0e1f2a3b``
+
+Entropy
+───────
+    12 bytes → 96-bit token → birthday bound ≈ 2^48 before 50 % collision
+    probability; safe for high-concurrency, long-lived tunnel sessions.
+"""
 
 from __future__ import annotations
 
 import re
 import secrets
+from typing import Final
 
 __all__ = [
     "ID_RE",
@@ -11,54 +28,40 @@ __all__ = [
     "new_flow_id",
 ]
 
+# ── Internal constants ────────────────────────────────────────────────────────
+
 # Prefix characters that namespace IDs by type, preventing any cross-type
 # collision even if the underlying token bytes happen to be identical.
-_TCP_PREFIX: str = "c"
-_UDP_PREFIX: str = "u"
+_TCP_PREFIX: Final[str] = "c"
+_UDP_PREFIX: Final[str] = "u"
 
-# 12 bytes → 96-bit entropy → birthday bound ~2^48 before 50 % collision
-# probability; safe for high-concurrency, long-lived tunnel sessions.
-_TOKEN_BYTES: int = 12
+# 12 bytes → 24 hex chars → 96-bit entropy.
+_TOKEN_BYTES: Final[int] = 12
 
-# conn_id / flow_id: one prefix char + 24 lowercase hex chars (96-bit token).
+# ── Public API ────────────────────────────────────────────────────────────────
+
+# Compiled pattern for validating conn_id / flow_id values.
 # re.ASCII ensures [0-9a-f] never matches Unicode digits on exotic builds.
-ID_RE: re.Pattern[str] = re.compile(r"^[cu][0-9a-f]{24}$", re.ASCII)
-
-
-def _new_id(prefix: str) -> str:
-    """
-    Generate a cryptographically random, prefix-namespaced tunnel ID.
-
-    The returned string is composed entirely of lowercase hex digits plus the
-    single-character prefix, making it safe to embed in any frame field
-    without escaping.
-
-    Args:
-        prefix: Single ASCII character prepended to the hex token.
-
-    Returns:
-        A string of the form ``<prefix><24 hex chars>``.
-    """
-    return prefix + secrets.token_hex(_TOKEN_BYTES)
+# Exported so that frames.py and the agent can share the same validator
+# without importing the generator functions.
+ID_RE: Final[re.Pattern[str]] = re.compile(r"^[cu][0-9a-f]{24}$", re.ASCII)
 
 
 def new_conn_id() -> str:
-    """
-    Generate a unique TCP connection ID.
+    """Generate a unique TCP connection ID.
 
     Returns:
         A string of the form ``c<24 hex chars>``,
-        e.g. ``ca1b2c3d4e5f6a7b8c9d0e1f``.
+        e.g. ``ca1b2c3d4e5f6a7b8c9d0e1f2a3b``.
     """
-    return _new_id(_TCP_PREFIX)
+    return _TCP_PREFIX + secrets.token_hex(_TOKEN_BYTES)
 
 
 def new_flow_id() -> str:
-    """
-    Generate a unique UDP flow ID.
+    """Generate a unique UDP flow ID.
 
     Returns:
         A string of the form ``u<24 hex chars>``,
-        e.g. ``ua1b2c3d4e5f6a7b8c9d0e1f``.
+        e.g. ``ua1b2c3d4e5f6a7b8c9d0e1f2a3b``.
     """
-    return _new_id(_UDP_PREFIX)
+    return _UDP_PREFIX + secrets.token_hex(_TOKEN_BYTES)
