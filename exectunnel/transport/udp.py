@@ -4,7 +4,7 @@ UDP flow handler — local side of a SOCKS5 UDP ASSOCIATE flow.
 Data flow
 ---------
 * **outbound**: local SOCKS5 relay → ``encode_udp_data_frame`` → WebSocket
-* **inbound**:  WebSocket UDP_DATA frames (queued by recv_loop) → local relay
+* **inbound**:  WebSocket ``UDP_DATA`` frames (queued by recv_loop) → local relay
 
 Lifecycle
 ---------
@@ -20,15 +20,24 @@ Lifecycle
 
 Protocol alignment
 ------------------
-All frame encoding uses the typed helpers from :mod:`exectunnel.protocol.frames`:
+All frame encoding uses the typed helpers from :mod:`exectunnel.protocol`
+(imported from the package root per Golden Rule #1):
 
-* :func:`~exectunnel.protocol.frames.encode_udp_open_frame`  — validates host
-  via :func:`~exectunnel.protocol.frames.encode_host_port`.
-* :func:`~exectunnel.protocol.frames.encode_udp_data_frame`  — accepts raw
-  ``bytes``; applies ``urlsafe_b64encode`` with no padding internally.
-* :func:`~exectunnel.protocol.frames.encode_udp_close_frame` — no payload.
+* :func:`~exectunnel.protocol.encode_udp_open_frame`  — validates host/port
+  via :func:`~exectunnel.protocol.encode_host_port`.
+* :func:`~exectunnel.protocol.encode_udp_data_frame`  — accepts raw ``bytes``;
+  applies ``urlsafe_b64encode`` with no padding internally.
+* :func:`~exectunnel.protocol.encode_udp_close_frame` — no payload.
 
 No manual base64 encoding is performed in this module.
+
+Layer contract
+--------------
+This module must never import from:
+
+* ``exectunnel.protocol.frames``  (use the package root)
+* ``exectunnel.proxy``            (SOCKS5 is not this layer's concern)
+* ``exectunnel.session``          (session orchestration is above this layer)
 """
 
 from __future__ import annotations
@@ -40,11 +49,12 @@ import logging
 from exectunnel.config.defaults import UDP_INBOUND_QUEUE_CAP, UDP_WARN_EVERY
 from exectunnel.exceptions import (
     ConnectionClosedError,
+    ProtocolError,
     TransportError,
     WebSocketSendTimeoutError,
 )
-from exectunnel.observability import metrics_inc
-from exectunnel.protocol.frames import (
+from exectunnel.observability import metrics_inc, span
+from exectunnel.protocol import (
     encode_udp_close_frame,
     encode_udp_data_frame,
     encode_udp_open_frame,
@@ -61,25 +71,27 @@ class UdpFlow:
     """Bridges one SOCKS5 UDP ASSOCIATE flow through the tunnel.
 
     Args:
-        flow_id:  Stable identifier for this UDP flow.
+        flow_id:  Stable identifier for this UDP flow (from
+                  :func:`~exectunnel.protocol.new_flow_id`).
         host:     Destination hostname or IP address string.
-        port:     Destination UDP port.
+        port:     Destination UDP port (1–65535).
         ws_send:  Coroutine callable that sends a frame string over the
                   WebSocket / exec channel. Must conform to
                   :class:`~exectunnel.transport._types.WsSendCallable`.
-        registry: Shared mapping of ``flow_id → handler``; the handler
+        registry: Shared mapping of ``flow_id → UdpFlow``; the handler
                   removes itself on :meth:`close` and :meth:`on_remote_closed`.
 
     Lifecycle flags
     ---------------
-    A single ``_opened`` bool replaces the previous redundant pair of
-    ``_open_attempted`` + ``_opened``. Idempotency of :meth:`open` is
-    guarded by ``_opened``; retry-ability after a failed open is preserved
-    because ``_opened`` is only set after a **successful** send.
+    * ``_opened`` — set only **after** ``UDP_OPEN`` is successfully sent so
+      that a failed open can be retried.  Idempotency of :meth:`open` is
+      guarded by this flag.
+    * ``_closed`` — set at the start of :meth:`close` / :meth:`on_remote_closed`
+      to prevent concurrent teardown.
+    * ``_closed_event`` — set by both teardown paths; used by
+      :meth:`recv_datagram` to unblock promptly on closure.
 
-    The ``_closed_event`` is set by both :meth:`close` (local teardown) and
-    :meth:`on_remote_closed` (agent-initiated teardown). It is used by
-    :meth:`recv_datagram` to unblock promptly on closure.
+    Satisfies :class:`~exectunnel.transport._types.TransportHandler`.
     """
 
     __slots__ = (
@@ -118,21 +130,17 @@ class UdpFlow:
         )
 
         # Unified close event — set by both close() (local) and
-        # on_remote_closed() (agent-initiated). recv_datagram() races this
+        # on_remote_closed() (agent-initiated).  recv_datagram() races this
         # against the inbound queue so it always unblocks promptly on closure.
         self._closed_event: asyncio.Event = asyncio.Event()
 
-        # Reusable close_task for recv_datagram() — created once on first
+        # Reusable close_task for recv_datagram() — created once on the first
         # blocking recv and reused across all subsequent calls to avoid
         # spawning a new Event.wait() coroutine per recv_datagram() call.
         # None until the first blocking recv_datagram() call.
         self._close_task: asyncio.Task[None] | None = None
 
         # Lifecycle flags.
-        # _opened: set only AFTER UDP_OPEN is successfully sent so that a
-        #   failed open can be retried.
-        # _closed: set at the start of close() / on_remote_closed() to
-        #   prevent concurrent teardown.
         self._opened: bool = False
         self._closed: bool = False
 
@@ -147,25 +155,34 @@ class UdpFlow:
         """Send the ``UDP_OPEN`` control frame to the remote agent.
 
         Idempotent after a **successful** open — subsequent calls are no-ops.
-        A failed open (e.g. invalid host, send timeout) does **not** set
-        ``_opened``, so the caller may retry with corrected arguments.
+        A failed open (e.g. send timeout) does **not** set ``_opened``, so
+        the caller may retry.
 
-        Guards against calling open() on an already-closed flow — a closed
-        flow cannot be reopened and the call raises immediately.
+        Host/port validation
+        --------------------
+        :func:`~exectunnel.protocol.encode_udp_open_frame` raises
+        :class:`~exectunnel.exceptions.ProtocolError` when the host or port
+        is frame-unsafe.  Per Golden Rule #6, ``ProtocolError`` indicates a
+        bug in the calling layer and must **not** be caught here — it
+        propagates to the session layer which is responsible for ensuring only
+        valid hosts are passed to this method.
 
         Raises:
             TransportError:
-                * If the flow is already closed.
-                * If *host* contains frame-unsafe characters (propagated from
-                  :func:`~exectunnel.protocol.frames.encode_host_port` as
-                  ``ValueError``, wrapped here).
-                * For any other transport-level failure during the open
-                  handshake.
+                If the flow is already closed (``error_code``
+                ``"transport.udp_open_on_closed"``).
+            ProtocolError:
+                If *host* or *port* is frame-unsafe — propagated from
+                :func:`~exectunnel.protocol.encode_udp_open_frame` without
+                wrapping.  This is a caller bug, not a transport error.
             WebSocketSendTimeoutError:
                 If the control frame cannot be delivered within the configured
                 send timeout.
             ConnectionClosedError:
                 If the underlying WebSocket connection is already closed.
+            TransportError:
+                For any other unexpected transport-level failure during the
+                open handshake (``error_code`` ``"transport.udp_open_failed"``).
         """
         if self._opened:
             return
@@ -178,24 +195,10 @@ class UdpFlow:
                 hint="A closed flow cannot be reopened. Create a new UdpFlow instead.",
             )
 
-        try:
-            frame = encode_udp_open_frame(self._id, self._host, self._port)
-        except ValueError as exc:
-            # encode_host_port raises ValueError for frame-unsafe host strings.
-            # Do NOT set _opened — the caller may retry with a valid host.
-            raise TransportError(
-                f"UDP flow {self._id!r}: invalid host {self._host!r} for UDP_OPEN frame.",
-                error_code="transport.udp_open_invalid_host",
-                details={
-                    "flow_id": self._id,
-                    "host": self._host,
-                    "port": self._port,
-                },
-                hint=(
-                    "The destination host contains characters that are unsafe in "
-                    "the tunnel frame format. Validate the host before opening a flow."
-                ),
-            ) from exc
+        # ProtocolError from encode_udp_open_frame propagates uncaught —
+        # it signals a bug in the caller (invalid host/port), not a
+        # transport failure.  See Golden Rule #6.
+        frame = encode_udp_open_frame(self._id, self._host, self._port)
 
         try:
             await self._ws_send(frame, control=True)
@@ -240,7 +243,8 @@ class UdpFlow:
                 If the close frame cannot be delivered within the configured
                 send timeout.
             TransportError:
-                For any other transport-level failure during teardown.
+                For any other transport-level failure during teardown
+                (``error_code`` ``"transport.udp_close_failed"``).
         """
         if self._closed:
             return
@@ -276,15 +280,17 @@ class UdpFlow:
     def on_remote_closed(self) -> None:
         """Signal that the agent has closed its side of the flow.
 
-        Renamed from ``close_remote()`` to ``on_remote_closed()`` to clearly
-        express that this method *reacts to* a remote event rather than
-        *initiating* a remote close.
+        This method *reacts to* a remote ``UDP_CLOSE`` event — it does not
+        initiate a remote close.  The session layer calls this when it
+        receives a ``UDP_CLOSE`` frame for this flow's ID.
 
         Sets the closed event so :meth:`recv_datagram` drains remaining
         queued datagrams and then returns ``None``.
 
         Idempotent — subsequent calls are no-ops.
         Safe to call before :meth:`open` or after :meth:`close`.
+
+        Satisfies :class:`~exectunnel.transport._types.TransportHandler`.
         """
         if not self._closed:
             self._closed = True
@@ -305,9 +311,11 @@ class UdpFlow:
 
         Args:
             data: Raw bytes decoded from a ``UDP_DATA`` frame payload.
+                  Must be a ``bytes`` instance — never ``str`` or ``bytearray``.
 
         Raises:
-            TransportError: If *data* is not a ``bytes`` instance.
+            TransportError: If *data* is not a ``bytes`` instance
+                (``error_code`` ``"transport.invalid_payload_type"``).
         """
         require_bytes(data, self._id, "feed")
 
@@ -411,20 +419,28 @@ class UdpFlow:
     async def send_datagram(self, data: bytes) -> None:
         """Encode *data* as a ``UDP_DATA`` frame and forward it to the agent.
 
-        Uses :func:`~exectunnel.protocol.frames.encode_udp_data_frame` which
-        accepts raw ``bytes`` and applies ``urlsafe_b64encode`` with no padding
+        Uses :func:`~exectunnel.protocol.encode_udp_data_frame` which accepts
+        raw ``bytes`` and applies ``urlsafe_b64encode`` with no padding
         internally — no manual base64 encoding is performed here.
+
+        UDP datagrams are **never split** — one datagram = one frame.  The
+        caller is responsible for ensuring *data* fits within the protocol's
+        maximum payload budget (≤ 6,108 bytes).
 
         Args:
             data: Raw datagram bytes to forward to the agent.
 
         Raises:
-            TransportError:            If *data* is not a ``bytes`` instance.
-            WebSocketSendTimeoutError: If the WebSocket send stalls beyond the
-                                       configured timeout.
-            ConnectionClosedError:     If the connection is closed before the
-                                       frame can be sent.
-            TransportError:            For any other transport-level failure.
+            TransportError:
+                If *data* is not a ``bytes`` instance
+                (``error_code`` ``"transport.invalid_payload_type"``).
+            WebSocketSendTimeoutError:
+                If the WebSocket send stalls beyond the configured timeout.
+            ConnectionClosedError:
+                If the connection is closed before the frame can be sent.
+            TransportError:
+                For any other transport-level failure
+                (``error_code`` ``"transport.udp_data_send_failed"``).
         """
         require_bytes(data, self._id, "send_datagram")
 
@@ -452,8 +468,8 @@ class UdpFlow:
     def _evict(self) -> None:
         """Remove this flow from the shared registry.
 
-        Extracted from both :meth:`close` and :meth:`on_remote_closed` to
-        avoid duplicating the registry pop call.
+        Called by both :meth:`close` and :meth:`on_remote_closed` to avoid
+        duplicating the registry pop.
         """
         self._registry.pop(self._id, None)
 
