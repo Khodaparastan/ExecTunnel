@@ -1,3 +1,4 @@
-from .session import PendingConnectState, TunnelSession
+from ._state import PendingConnectState
+from .session import TunnelSession
 
 __all__ = ["TunnelSession", "PendingConnectState"]
