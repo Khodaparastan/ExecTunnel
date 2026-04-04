@@ -1,8 +1,14 @@
-"""SOCKS5 protocol enumerations (RFC 1928 / RFC 1929)."""
+"""SOCKS5 protocol enumerations (RFC 1928 / RFC 1929).
+
+All enums use ``_missing_`` to raise an informative ``ValueError`` on unknown
+wire values rather than silently returning ``None``.  This surfaces protocol
+violations at the earliest possible point.
+"""
 
 from __future__ import annotations
 
 from enum import IntEnum
+from typing import Never
 
 __all__ = [
     "AddrType",
@@ -28,7 +34,7 @@ class AuthMethod(IntEnum):
     NO_ACCEPT = 0xFF
 
     @classmethod
-    def _missing_(cls, value: object) -> None:  # type: ignore[override]
+    def _missing_(cls, value: object) -> Never:
         raise ValueError(
             f"{value!r} is not a valid {cls.__name__} "
             f"(expected one of {[m.value for m in cls]})"
@@ -36,14 +42,20 @@ class AuthMethod(IntEnum):
 
 
 class Cmd(IntEnum):
-    """SOCKS5 command codes (RFC 1928 §4)."""
+    """SOCKS5 command codes (RFC 1928 §4).
+
+    Note:
+        ``BIND`` is defined for wire-format completeness only.
+        This tunnel implementation does **not** support the BIND command;
+        clients requesting BIND will receive a ``CMD_NOT_SUPPORTED`` reply.
+    """
 
     CONNECT = 0x01
     BIND = 0x02
     UDP_ASSOCIATE = 0x03
 
     @classmethod
-    def _missing_(cls, value: object) -> None:  # type: ignore[override]
+    def _missing_(cls, value: object) -> Never:
         raise ValueError(
             f"{value!r} is not a valid {cls.__name__} "
             f"(expected one of {[m.value for m in cls]})"
@@ -58,7 +70,7 @@ class AddrType(IntEnum):
     IPV6 = 0x04
 
     @classmethod
-    def _missing_(cls, value: object) -> None:  # type: ignore[override]
+    def _missing_(cls, value: object) -> Never:
         raise ValueError(
             f"{value!r} is not a valid {cls.__name__} "
             f"(expected one of {[m.value for m in cls]})"
@@ -79,7 +91,7 @@ class Reply(IntEnum):
     ADDR_NOT_SUPPORTED = 0x08
 
     @classmethod
-    def _missing_(cls, value: object) -> None:  # type: ignore[override]
+    def _missing_(cls, value: object) -> Never:
         raise ValueError(
             f"{value!r} is not a valid {cls.__name__} "
             f"(expected one of {[m.value for m in cls]})"
@@ -87,13 +99,13 @@ class Reply(IntEnum):
 
 
 class UserPassStatus(IntEnum):
-    """RFC 1929 §2 username/password authentication reply codes."""
+    """RFC 1929 §2 username/password sub-negotiation reply codes."""
 
     SUCCESS = 0x00
     FAILURE = 0xFF
 
     @classmethod
-    def _missing_(cls, value: object) -> None:  # type: ignore[override]
+    def _missing_(cls, value: object) -> Never:
         raise ValueError(
             f"{value!r} is not a valid {cls.__name__} "
             f"(expected one of {[m.value for m in cls]})"
