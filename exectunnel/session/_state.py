@@ -1,31 +1,38 @@
-from __future__ import annotations
+"""Per-connection pending state tracked by TunnelSession during CONN_OPEN/ACK."""
 
 import asyncio
-import collections
 from dataclasses import dataclass
-from typing import Generic, TypeVar
-
-_KT = TypeVar("_KT")
-_VT = TypeVar("_VT")
+from enum import StrEnum
 
 
-@dataclass(slots=True)
-class PendingConnectState:
-    """Tracks one in-flight CONN_OPEN that has not yet received CONN_ACK."""
+class AckStatus(StrEnum):
+    """Result values for the per-connection ACK future.
+
+    Used as ``asyncio.Future[AckStatus]`` results and as ``ack_status``
+    labels in metrics.  Always match on the enum member, never on the raw
+    string value.
+
+    Values deliberately match their names so that metric label strings are
+    self-documenting in dashboards.
+    """
+
+    OK               = "ok"
+    TIMEOUT          = "timeout"
+    WS_CLOSED        = "ws_closed"
+    AGENT_ERROR      = "agent_error"
+    AGENT_CLOSED     = "agent_closed"
+    WS_SEND_TIMEOUT  = "ws_send_timeout"
+    PRE_ACK_OVERFLOW = "pre_ack_overflow"
+    ERROR            = "error"
+
+
+@dataclass(frozen=True, slots=True)
+class PendingConnect:
+    """Tracks one in-flight ``CONN_OPEN`` that has not yet received ``CONN_ACK``.
+
+    ``ack_future`` is resolved by ``FrameReceiver._dispatch_frame`` when the
+    matching ``CONN_ACK`` or ``ERROR`` / ``CONN_CLOSE`` frame arrives.
+    """
 
     host: str
-    ack_future: asyncio.Future[str]
-
-
-class _LruDict(collections.OrderedDict, Generic[_KT, _VT]):
-    """OrderedDict that evicts the oldest entry when ``maxsize`` is exceeded."""
-
-    def __init__(self, maxsize: int) -> None:
-        super().__init__()
-        self._maxsize = maxsize
-
-    def __setitem__(self, key: _KT, value: _VT) -> None:  # type: ignore[override]
-        super().__setitem__(key, value)
-        self.move_to_end(key)
-        if len(self) > self._maxsize:
-            self.popitem(last=False)
+    ack_future: asyncio.Future[AckStatus]

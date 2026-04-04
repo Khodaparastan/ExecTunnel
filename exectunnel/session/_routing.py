@@ -1,4 +1,4 @@
-from __future__ import annotations
+"""Host exclusion routing — determines whether a destination bypasses the tunnel."""
 
 import ipaddress
 from collections.abc import Sequence
@@ -36,7 +36,6 @@ def is_host_excluded(
     try:
         addr = ipaddress.ip_address(host)
     except ValueError:
-        # Domain names are never excluded.
-        return False
+        return False  # Domain names are never excluded.
 
     return any(addr in net for net in exclusions)
