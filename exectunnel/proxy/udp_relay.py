@@ -13,7 +13,7 @@ from exectunnel.config.defaults import UDP_RELAY_QUEUE_CAP, UDP_WARN_EVERY
 from exectunnel.exceptions import ProtocolError, TransportError
 from exectunnel.observability import metrics_inc
 from exectunnel.protocol.enums import AddrType
-from exectunnel.proxy._codec import validate_domain
+from exectunnel.proxy._wire import validate_socks5_domain
 
 __all__ = ["UdpRelay"]
 
@@ -149,7 +149,7 @@ def _parse_udp_header(data: bytes) -> tuple[bytes, str, int]:
                 ),
             ) from exc
         # Validate domain structure and safety — same rules as TCP path.
-        validate_domain(host)
+        validate_socks5_domain(host)
         offset += dlen
 
     else:
@@ -231,10 +231,10 @@ class UdpRelay:
     Lifecycle::
 
         relay = UdpRelay()
-        port = await relay.start()          # bind; returns ephemeral port
-        item = await relay.recv()           # (payload, host, port) | None
-        relay.send_to_client(data, h, p)    # wrap + send back to client
-        relay.close()                       # tear down
+        port = await relay.start()  # bind; returns ephemeral port
+        item = await relay.recv()  # (payload, host, port) | None
+        relay.send_to_client(data, h, p)  # wrap + send back to client
+        relay.close()  # tear down
 
     Async context manager usage::
 
