@@ -7,6 +7,7 @@ import contextlib
 import logging
 from collections.abc import AsyncGenerator
 
+from exectunnel._stream import read_exact
 from exectunnel.config.defaults import HANDSHAKE_TIMEOUT_SECS
 from exectunnel.exceptions import (
     ExecTunnelError,
@@ -15,9 +16,9 @@ from exectunnel.exceptions import (
 )
 from exectunnel.observability import metrics_inc, metrics_observe, span
 from exectunnel.protocol.enums import AuthMethod, Cmd, Reply
-from exectunnel.proxy._codec import build_reply, read_addr, read_exact
-from exectunnel.proxy.relay import UdpRelay
+from exectunnel.proxy._wire import build_socks5_reply, read_socks5_addr
 from exectunnel.proxy.request import Socks5Request
+from exectunnel.proxy.udp_relay import UdpRelay
 
 logger = logging.getLogger("exectunnel.proxy.server")
 
@@ -302,7 +303,7 @@ class Socks5Server:
                 * Bad request version byte.
                 * Non-zero RSV byte.
                 * Unsupported ``CMD`` byte.
-                * Address parse errors (propagated from :func:`read_addr`).
+                * Address parse errors (propagated from :func:`read_socks5_addr`).
             TransportError:
                 UDP relay socket cannot be bound during ``UDP_ASSOCIATE``
                 (propagated from :meth:`UdpRelay.start`).
@@ -370,14 +371,15 @@ class Socks5Server:
             )
 
         if req_header[2] != 0x00:
-            await _write_and_drain_suppress(writer, build_reply(Reply.GENERAL_FAILURE))
+            await _write_and_drain_suppress(
+                writer, build_socks5_reply(Reply.GENERAL_FAILURE)
+            )
             raise ProtocolError(
                 f"SOCKS5 request RSV byte is {req_header[2]:#x}, expected 0x00.",
                 error_code="protocol.socks5_bad_rsv",
                 details={"received_rsv": hex(req_header[2])},
                 hint=(
-                    "The SOCKS5 client sent a non-zero RSV byte, "
-                    "violating RFC 1928 §4."
+                    "The SOCKS5 client sent a non-zero RSV byte, violating RFC 1928 §4."
                 ),
             )
 
@@ -385,7 +387,7 @@ class Socks5Server:
             cmd = Cmd(req_header[1])
         except ValueError:
             await _write_and_drain_suppress(
-                writer, build_reply(Reply.CMD_NOT_SUPPORTED)
+                writer, build_socks5_reply(Reply.CMD_NOT_SUPPORTED)
             )
             raise ProtocolError(
                 f"Unsupported SOCKS5 command: {req_header[1]:#x}.",
@@ -397,9 +399,9 @@ class Socks5Server:
                 ),
             )
 
-        # read_addr validates port != 0 internally; raises ProtocolError on
+        # read_socks5_addr validates port != 0 internally; raises ProtocolError on
         # any malformed address field.
-        host, port = await read_addr(reader)
+        host, port = await read_socks5_addr(reader)
 
         if cmd == Cmd.CONNECT:
             return Socks5Request(
@@ -415,9 +417,7 @@ class Socks5Server:
             # declared sending address.  It may be 0.0.0.0:0 if the client
             # does not know its sending address; UdpRelay.start() handles that.
             relay = UdpRelay()
-            await relay.start(
-                expected_client_addr=(host, port) if port != 0 else None
-            )
+            await relay.start(expected_client_addr=(host, port) if port != 0 else None)
             # relay.local_port is the ephemeral port the relay is bound to.
             # The caller MUST pass it as bind_port to send_reply_success() so
             # the SOCKS5 client knows where to send datagrams (RFC 1928 §7).
@@ -433,7 +433,7 @@ class Socks5Server:
         # BIND — known but explicitly unsupported.
         if cmd == Cmd.BIND:
             await _write_and_drain_suppress(
-                writer, build_reply(Reply.CMD_NOT_SUPPORTED)
+                writer, build_socks5_reply(Reply.CMD_NOT_SUPPORTED)
             )
             logger.debug(
                 "socks5 BIND command rejected (not implemented) for %s:%d",
@@ -444,7 +444,9 @@ class Socks5Server:
 
         # Exhaustive guard — should be unreachable given Cmd enum coverage,
         # but protects against future enum additions that miss a branch here.
-        await _write_and_drain_suppress(writer, build_reply(Reply.CMD_NOT_SUPPORTED))
+        await _write_and_drain_suppress(
+            writer, build_socks5_reply(Reply.CMD_NOT_SUPPORTED)
+        )
         raise ProtocolError(
             f"Unhandled SOCKS5 command: {cmd!r}.",
             error_code="protocol.socks5_unhandled_cmd",

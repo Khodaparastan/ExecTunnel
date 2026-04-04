@@ -1,23 +1,23 @@
-"""Proxy domain: SOCKS5 server, relay, request handling, and DNS forwarding."""
+"""Proxy layer: SOCKS5 server, request handling, and UDP relay.
 
-from exectunnel.proxy._codec import build_reply, read_addr, read_exact, validate_domain
-from exectunnel.proxy.dns_forwarder import DnsForwarder
-from exectunnel.proxy.relay import UdpRelay
+This package implements the SOCKS5 wire protocol (RFC 1928) and exposes three
+primary public types:
+
+* :class:`Socks5Server` — async SOCKS5 accept loop that yields requests.
+* :class:`Socks5Request` — represents a single negotiated SOCKS5 handshake.
+* :class:`UdpRelay` — UDP datagram relay for ``UDP_ASSOCIATE`` sessions.
+
+Layer contract:
+    **Knows about:** SOCKS5 wire protocol, UDP relay, protocol enums.
+    **Does not know about:** WebSocket, frame encoding, session management.
+"""
+
 from exectunnel.proxy.request import Socks5Request
 from exectunnel.proxy.server import Socks5Server
+from exectunnel.proxy.udp_relay import UdpRelay
 
 __all__ = [
-    # ── Server ─────────────────────────────────────────────────────────────
-    "Socks5Server",
-    # ── Request ────────────────────────────────────────────────────────────
     "Socks5Request",
-    # ── UDP relay ──────────────────────────────────────────────────────────
+    "Socks5Server",
     "UdpRelay",
-    # ── DNS forwarding ─────────────────────────────────────────────────────
-    "DnsForwarder",
-    # ── Codec helpers ──────────────────────────────────────────────────────
-    "build_reply",
-    "read_addr",
-    "read_exact",
-    "validate_domain",
 ]

@@ -8,8 +8,8 @@ from dataclasses import dataclass, field
 
 from exectunnel.exceptions import ProtocolError
 from exectunnel.protocol.enums import Cmd, Reply
-from exectunnel.proxy._codec import build_reply
-from exectunnel.proxy.relay import UdpRelay
+from exectunnel.proxy._wire import build_socks5_reply
+from exectunnel.proxy.udp_relay import UdpRelay
 
 __all__ = ["Socks5Request"]
 
@@ -166,7 +166,7 @@ class Socks5Request:
                 * If a reply has already been sent (double-reply guard).
             ConfigurationError:
                 If *bind_host* or *bind_port* are invalid (propagated from
-                :func:`build_reply`).
+                :func:`build_socks5_reply`).
         """
         if self.writer.is_closing():
             raise ProtocolError(
@@ -184,7 +184,7 @@ class Socks5Request:
                 ),
             )
         self._mark_replied()
-        self.writer.write(build_reply(Reply.SUCCESS, bind_host, bind_port))
+        self.writer.write(build_socks5_reply(Reply.SUCCESS, bind_host, bind_port))
 
     def reply_error(self, reply: Reply = Reply.GENERAL_FAILURE) -> None:
         """Queue an error reply into the writer buffer.
@@ -206,12 +206,12 @@ class Socks5Request:
                 If a reply has already been sent (double-reply guard).
             ConfigurationError:
                 If *reply* is not a valid :class:`Reply` member (propagated
-                from :func:`build_reply`).
+                from :func:`build_socks5_reply`).
         """
         self._mark_replied()
-        # build_reply() is called first and may raise ConfigurationError —
+        # build_socks5_reply() is called first and may raise ConfigurationError —
         # that propagates to the caller before writer.write() is attempted.
-        packet = build_reply(reply)
+        packet = build_socks5_reply(reply)
         with contextlib.suppress(RuntimeError, OSError):
             self.writer.write(packet)
 
@@ -242,7 +242,7 @@ class Socks5Request:
                 * Double-reply guard (propagated from :meth:`reply_success`).
             ConfigurationError:
                 Invalid *bind_host* / *bind_port* (propagated from
-                :func:`build_reply`).
+                :func:`build_socks5_reply`).
             OSError:
                 If the underlying socket write or drain fails.
         """
@@ -270,7 +270,7 @@ class Socks5Request:
             ProtocolError:
                 Double-reply guard (propagated from :meth:`reply_error`).
             ConfigurationError:
-                Invalid *reply* code (propagated from :func:`build_reply`).
+                Invalid *reply* code (propagated from :func:`build_socks5_reply`).
                 This is a caller bug and is **not** suppressed.
         """
         try:
