@@ -13,11 +13,11 @@ All helpers in this module are:
 
 Design notes
 ------------
-``_require_bytes`` previously lived in ``tcp.py`` as a module-level
-free function and was only used by ``TcpConnectionHandler``.  Moving it here:
+``require_bytes`` previously lived in ``tcp.py`` as a module-level free
+function and was only used by ``TcpConnection``.  Moving it here:
 
-1. Eliminates the duplicate validation that ``UdpFlowHandler`` performed
-   inline (with slightly different error codes and messages).
+1. Eliminates the duplicate validation that ``UdpFlow`` performed inline
+   (with slightly different error codes and messages).
 2. Makes the validation contract explicit and testable in isolation.
 3. Keeps ``tcp.py`` and ``udp.py`` focused on lifecycle and I/O logic.
 
@@ -30,7 +30,11 @@ All validators must follow the same contract:
 * Return the validated value typed correctly on success.
 * Raise a typed exception from :mod:`exectunnel.exceptions` on failure —
   never a bare ``ValueError`` or ``TypeError``.
+* Never use ``raise ... from exc`` unless re-raising inside an ``except``
+  block — a direct raise has no cause to chain.
 """
+
+from __future__ import annotations
 
 from exectunnel.exceptions import TransportError
 
@@ -42,14 +46,22 @@ def require_bytes(value: object, handler_id: str, method: str) -> bytes:
 
     Both :class:`~exectunnel.transport.tcp.TcpConnection` and
     :class:`~exectunnel.transport.udp.UdpFlow` call this before processing
-    any inbound or outbound payload to ensure the frame decoder always
-    passes raw bytes — never ``str``, ``memoryview``, or ``bytearray``.
+    any inbound or outbound payload to ensure the frame encoder always
+    receives raw bytes — never ``str``, ``memoryview``, or ``bytearray``.
 
     Raises :class:`~exectunnel.exceptions.TransportError` rather than
-    ``FrameDecodingError`` because a non-``bytes`` payload at this boundary
-    is a **programming error** in the caller (wrong type passed to a public
-    method), not a malformed frame received from the wire.  The transport
-    layer is the gatekeeper; the protocol layer is not involved.
+    :class:`~exectunnel.exceptions.FrameDecodingError` because a non-``bytes``
+    payload at this boundary is a **programming error** in the caller (wrong
+    type passed to a public method), not a malformed frame received from the
+    wire.  The transport layer is the gatekeeper; the protocol layer is not
+    involved.
+
+    The ``error_code`` ``"transport.invalid_payload_type"`` is a custom
+    override of :attr:`TransportError.default_error_code` (``"transport.error"``),
+    valid per the :class:`~exectunnel.exceptions.ExecTunnelError` constructor
+    contract.  The ``details`` key ``handler_id`` is intentionally generic —
+    it covers both ``conn_id`` (TCP) and ``flow_id`` (UDP) without requiring
+    separate validators.
 
     Args:
         value:      The value to validate.
@@ -62,6 +74,7 @@ def require_bytes(value: object, handler_id: str, method: str) -> bytes:
 
     Raises:
         TransportError: If *value* is not a ``bytes`` instance.
+            ``error_code`` is ``"transport.invalid_payload_type"``.
 
     Example::
 
@@ -74,7 +87,7 @@ def require_bytes(value: object, handler_id: str, method: str) -> bytes:
     raise TransportError(
         f"{handler_id!r}: {method}() requires a bytes payload; "
         f"got {type(value).__name__!r}.",
-        error_code="transport.bad_argument",
+        error_code="transport.invalid_payload_type",
         details={
             "handler_id": handler_id,
             "method": method,
