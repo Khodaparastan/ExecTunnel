@@ -33,15 +33,9 @@ from exectunnel._version import __version__
 from exectunnel.config import AppConfig, TunnelConfig
 from exectunnel.config.defaults import (
     ACK_TIMEOUT_RECONNECT_THRESHOLD,
-    ACK_TIMEOUT_WINDOW_SECS,
     ACK_TIMEOUT_WARN_EVERY,
-    CONN_ACK_TIMEOUT_SECS,
-    DNS_LOCAL_PORT,
-    DNS_UPSTREAM_PORT,
+    ACK_TIMEOUT_WINDOW_SECS,
     METRICS_REPORT_INTERVAL_SECS,
-    READY_TIMEOUT_SECS,
-    SOCKS_DEFAULT_HOST,
-    SOCKS_DEFAULT_PORT,
     WS_PING_INTERVAL_SECS,
     WS_RECONNECT_BASE_DELAY_SECS,
     WS_RECONNECT_MAX_DELAY_SECS,
@@ -95,9 +89,7 @@ def _positive_float(value: str) -> float:
             f"invalid number {value!r}: must be a positive float"
         ) from exc
     if parsed <= 0:
-        raise argparse.ArgumentTypeError(
-            f"invalid number {value!r}: must be > 0"
-        )
+        raise argparse.ArgumentTypeError(f"invalid number {value!r}: must be > 0")
     return parsed
 
 
@@ -437,9 +429,7 @@ async def run_tunnel_command(cfg: AppConfig, tun_cfg: TunnelConfig) -> int:
                     error=exc.error_code.replace(".", "_"),
                 )
                 logger.error(
-                    "fatal: bootstrap failed [%s]: %s\n"
-                    "  hint   : %s\n"
-                    "  error_id: %s",
+                    "fatal: bootstrap failed [%s]: %s\n  hint   : %s\n  error_id: %s",
                     exc.error_code,
                     exc.message,
                     exc.hint or "—",
@@ -479,9 +469,7 @@ async def run_tunnel_command(cfg: AppConfig, tun_cfg: TunnelConfig) -> int:
                     error=exc.error_code.replace(".", "_"),
                 )
                 logger.error(
-                    "fatal: tunnel error [%s]: %s\n"
-                    "  hint   : %s\n"
-                    "  error_id: %s",
+                    "fatal: tunnel error [%s]: %s\n  hint   : %s\n  error_id: %s",
                     exc.error_code,
                     exc.message,
                     exc.hint or "—",
@@ -582,6 +570,7 @@ def main() -> None:
 
         if exit_code != 0:
             sys.exit(exit_code)
+
 
 if __name__ == "__main__":
     main()

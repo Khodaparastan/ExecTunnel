@@ -9,7 +9,6 @@ dist/
 !.env.example
 .venv
 venv
-
 # IDE
 .zed/
 .idea/

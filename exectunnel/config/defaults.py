@@ -12,7 +12,9 @@ Design rules
 
 from __future__ import annotations
 
-__all__: list[str] = []  # This module is imported by name; wildcard import not intended.
+__all__: list[
+    str
+] = []  # This module is imported by name; wildcard import not intended.
 
 # ── WebSocket / Bridge ────────────────────────────────────────────────────────
 

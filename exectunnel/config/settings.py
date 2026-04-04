@@ -18,6 +18,7 @@ from exectunnel.config.defaults import (
     CONNECT_MAX_PENDING,
     CONNECT_MAX_PENDING_PER_HOST,
     DNS_LOCAL_PORT,
+    DNS_MAX_INFLIGHT,
     PRE_ACK_BUFFER_CAP_BYTES,
     READY_TIMEOUT_SECS,
     SOCKS_DEFAULT_HOST,
@@ -47,6 +48,7 @@ class BridgeConfig:
     reconnect_max_retries: int = WS_RECONNECT_MAX_RETRIES
     reconnect_base_delay: float = WS_RECONNECT_BASE_DELAY_SECS
     reconnect_max_delay: float = WS_RECONNECT_MAX_DELAY_SECS
+    dns_max_inflight: int = DNS_MAX_INFLIGHT
 
 
 @dataclass(slots=True, frozen=True)

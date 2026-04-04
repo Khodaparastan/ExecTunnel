@@ -129,8 +129,7 @@ def _validate_msg_type(msg_type: str) -> None:
     """Raise ``ValueError`` if *msg_type* is not in the allowed catalogue."""
     if msg_type not in _VALID_MSG_TYPES:
         raise ValueError(
-            f"Unknown msg_type {msg_type!r}. "
-            f"Allowed: {sorted(_VALID_MSG_TYPES)}"
+            f"Unknown msg_type {msg_type!r}. Allowed: {sorted(_VALID_MSG_TYPES)}"
         )
 
 
@@ -185,9 +184,7 @@ def encode_host_port(host: str, port: int) -> str:
 
     # Basic structural check: must look like a plausible hostname.
     if not _DOMAIN_RE.match(host):
-        raise ValueError(
-            f"Host {host!r} is not a valid hostname or IP address."
-        )
+        raise ValueError(f"Host {host!r} is not a valid hostname or IP address.")
 
     return f"{host}:{port}"
 
@@ -218,9 +215,7 @@ def parse_host_port(payload: str) -> tuple[str, int]:
         # Bracket-quoted IPv6: [addr]:port
         bracket_end = payload.find("]")
         if bracket_end == -1 or payload[bracket_end + 1 : bracket_end + 2] != ":":
-            raise ValueError(
-                f"Malformed bracketed host in payload: {payload!r}"
-            )
+            raise ValueError(f"Malformed bracketed host in payload: {payload!r}")
         host = payload[1:bracket_end]
         port_str = payload[bracket_end + 2 :]
     else:
@@ -229,9 +224,7 @@ def parse_host_port(payload: str) -> tuple[str, int]:
         # should always bracket-quote IPv6 via encode_host_port.
         host, sep, port_str = payload.rpartition(":")
         if not sep:
-            raise ValueError(
-                f"Missing port separator in payload: {payload!r}"
-            )
+            raise ValueError(f"Missing port separator in payload: {payload!r}")
 
     if not host:
         raise ValueError(f"Empty host in payload: {payload!r}")
@@ -244,9 +237,7 @@ def parse_host_port(payload: str) -> tuple[str, int]:
         ) from exc
 
     if not (1 <= port <= 65_535):
-        raise ValueError(
-            f"Port {port} out of range in payload: {payload!r}"
-        )
+        raise ValueError(f"Port {port} out of range in payload: {payload!r}")
 
     return host, port
 
@@ -448,9 +439,7 @@ def encode_error_frame(conn_id: str, message: str) -> str:
         A newline-terminated ``ERROR`` frame string.
     """
     payload_b64 = (
-        base64.urlsafe_b64encode(message.encode("utf-8"))
-        .rstrip(b"=")
-        .decode("ascii")
+        base64.urlsafe_b64encode(message.encode("utf-8")).rstrip(b"=").decode("ascii")
     )
     return _encode_frame("ERROR", conn_id, payload_b64)
 
@@ -475,9 +464,7 @@ def decode_data_payload(payload: str) -> bytes:
     try:
         return base64.urlsafe_b64decode(payload + "=" * padding)
     except binascii.Error as exc:
-        raise ValueError(
-            f"Invalid base64url payload: {payload!r}"
-        ) from exc
+        raise ValueError(f"Invalid base64url payload: {payload!r}") from exc
 
 
 def parse_frame(line: str) -> ParsedFrame | None:
