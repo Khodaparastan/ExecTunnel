@@ -1,4 +1,27 @@
-"""Protocol domain: frame codec, ID generation, SOCKS5 enums."""
+"""Protocol domain: frame codec, ID generation, SOCKS5 enums.
+
+Public surface
+──────────────
+This package exposes everything a caller needs to speak the ExecTunnel wire
+protocol:
+
+* **Frame constants** — ``FRAME_PREFIX``, ``FRAME_SUFFIX``, ``READY_FRAME``,
+  ``SESSION_CONN_ID``, ``MAX_FRAME_LEN``
+* **Frame encoders** — one typed function per frame type
+* **Frame decoder** — ``parse_frame`` / ``is_ready_frame``
+* **Payload helpers** — ``decode_binary_payload``, ``decode_error_payload``,
+  ``encode_host_port``, ``parse_host_port``
+* **ID generators** — ``new_conn_id``, ``new_flow_id``
+* **SOCKS5 enums** — ``AddrType``, ``AuthMethod``, ``Cmd``, ``Reply``,
+  ``UserPassStatus``
+
+Layer contract
+──────────────
+The protocol layer knows about frame format and SOCKS5 enumerations.
+It does **not** know about I/O, threads, asyncio, WebSocket, DNS, or sessions.
+"""
+
+from __future__ import annotations
 
 from exectunnel.protocol.enums import (
     AddrType,
@@ -8,15 +31,14 @@ from exectunnel.protocol.enums import (
     UserPassStatus,
 )
 from exectunnel.protocol.frames import (
-    BOOTSTRAP_CHUNK_SIZE_CHARS,
     FRAME_PREFIX,
     FRAME_SUFFIX,
     MAX_FRAME_LEN,
-    PIPE_READ_CHUNK_BYTES,
     READY_FRAME,
     SESSION_CONN_ID,
     ParsedFrame,
-    decode_data_payload,
+    decode_binary_payload,
+    decode_error_payload,
     encode_conn_close_frame,
     encode_conn_open_frame,
     encode_data_frame,
@@ -29,15 +51,13 @@ from exectunnel.protocol.frames import (
     parse_frame,
     parse_host_port,
 )
-from exectunnel.protocol.ids import ID_RE, new_conn_id, new_flow_id
+from exectunnel.protocol.ids import new_conn_id, new_flow_id
 
 __all__ = [
-    # ── Constants ──────────────────────────────────────────────────────────
-    "BOOTSTRAP_CHUNK_SIZE_CHARS",
+    # ── Frame constants ────────────────────────────────────────────────────
     "FRAME_PREFIX",
     "FRAME_SUFFIX",
     "MAX_FRAME_LEN",
-    "PIPE_READ_CHUNK_BYTES",
     "READY_FRAME",
     "SESSION_CONN_ID",
     # ── SOCKS5 enums ───────────────────────────────────────────────────────
@@ -46,9 +66,7 @@ __all__ = [
     "Cmd",
     "Reply",
     "UserPassStatus",
-    # ── Validation ─────────────────────────────────────────────────────────
-    "ID_RE",
-    # ── Frame types ────────────────────────────────────────────────────────
+    # ── Frame result type ──────────────────────────────────────────────────
     "ParsedFrame",
     # ── Frame encoders ─────────────────────────────────────────────────────
     "encode_conn_close_frame",
@@ -62,7 +80,8 @@ __all__ = [
     "is_ready_frame",
     "parse_frame",
     # ── Payload helpers ────────────────────────────────────────────────────
-    "decode_data_payload",
+    "decode_binary_payload",
+    "decode_error_payload",
     "encode_host_port",
     "parse_host_port",
     # ── ID generators ──────────────────────────────────────────────────────
