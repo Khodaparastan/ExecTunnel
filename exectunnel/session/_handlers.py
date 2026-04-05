@@ -210,9 +210,7 @@ class RequestDispatcher:
 
                 try:
                     # CONN_OPEN is not a control frame — use default flags.
-                    await self._ws_send(
-                        encode_conn_open_frame(conn_id, host, port)
-                    )
+                    await self._ws_send(encode_conn_open_frame(conn_id, host, port))
                 except WebSocketSendTimeoutError as exc:
                     failure_reason = AckStatus.WS_SEND_TIMEOUT
                     ack_status = AckStatus.WS_SEND_TIMEOUT
@@ -273,7 +271,26 @@ class RequestDispatcher:
 
             metrics_inc("tunnel.conn_ack.ok")
             metrics_inc("socks_reply_code", code=int(Reply.SUCCESS))
-            await req.send_reply_success()
+
+            # send_reply_success() can raise OSError when the SOCKS5 client
+            # closes its socket before we send the reply — this is a normal
+            # race condition (e.g. aria2 probing connections, client timeout).
+            # Treat it as a silent teardown, not an ACK failure or tunnel error.
+            try:
+                await req.send_reply_success()
+            except OSError as exc:
+                logger.debug(
+                    "conn %s: SOCKS5 client closed before reply could be sent: %s",
+                    conn_id,
+                    exc,
+                    extra={"conn_id": conn_id},
+                )
+                metrics_inc("socks_reply_code", code=int(Reply.GENERAL_FAILURE))
+                await self._teardown_failed_connection(conn_id, handler)
+                return
+
+            # Per transport.md: start() called after agent ACK and after
+            # send_reply_success() — client starts sending data after the reply.
             handler.start()
             await handler.closed_event.wait()
 
@@ -299,7 +316,26 @@ class RequestDispatcher:
             if not req.replied:
                 await req.send_reply_error(reply)
 
+        except OSError as exc:
+            # OSError during the connect/ACK/relay sequence means the SOCKS5
+            # client socket died — normal race condition, not a tunnel error.
+            # Do NOT count as an ACK failure; do NOT log at ERROR.
+            # Examples: ConnectionResetError("Connection lost") from drain(),
+            # BrokenPipeError from write(), ECONNRESET from the local socket.
+            logger.debug(
+                "conn %s: SOCKS5 client I/O error during connect: %s",
+                conn_id,
+                exc,
+                extra={"conn_id": conn_id},
+            )
+            metrics_inc("socks_reply_code", code=int(Reply.GENERAL_FAILURE))
+            await self._teardown_failed_connection(conn_id, handler)
+            if not req.replied:
+                with contextlib.suppress(OSError):
+                    await req.send_reply_error(reply)
+
         except Exception as exc:
+            # Truly unexpected — log at ERROR and count as ACK failure.
             ack_status = AckStatus.ERROR
             self._record_ack_failure(conn_id, AckStatus.ERROR)
             self._record_connect_failure(host, AckStatus.ERROR, reply)
