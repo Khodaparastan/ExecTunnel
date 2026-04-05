@@ -31,7 +31,7 @@ from exectunnel.exceptions import (
     BootstrapError,
     FrameDecodingError,
 )
-from exectunnel.observability import metrics_inc, metrics_observe
+from exectunnel.observability import metrics_inc, metrics_observe, span
 from exectunnel.protocol import is_ready_frame
 
 from ._payload import load_agent_b64
@@ -106,41 +106,42 @@ class AgentBootstrapper:
         start = loop.time()
         metrics_inc("tunnel.bootstrap.started")
 
-        await self._upload_agent(start=start)
+        with span("session.bootstrap"):
+            await self._upload_agent(start=start)
 
-        logger.info("waiting for agent AGENT_READY…")
-        try:
-            async with asyncio.timeout(self._tun.ready_timeout):
-                await self._wait_for_ready(start=start)
-        except TimeoutError as exc:
-            detail = (
-                f"; last output: {self._diag[-1]}" if self._diag else ""
+            logger.info("waiting for agent AGENT_READY…")
+            try:
+                async with asyncio.timeout(self._tun.ready_timeout):
+                    await self._wait_for_ready(start=start)
+            except TimeoutError as exc:
+                detail = (
+                    f"; last output: {self._diag[-1]}" if self._diag else ""
+                )
+                metrics_inc("tunnel.bootstrap.timeout")
+                raise AgentReadyTimeoutError(
+                    f"Agent did not signal AGENT_READY within "
+                    f"{self._tun.ready_timeout}s{detail}",
+                    details={
+                        "timeout_s": self._tun.ready_timeout,
+                        "host": self._app.wss_url,
+                        "last_output": self._diag[-1] if self._diag else None,
+                    },
+                    hint=(
+                        "Increase EXECTUNNEL_AGENT_TIMEOUT or check the remote "
+                        "Python version and available memory."
+                    ),
+                ) from exc
+
+            logger.info(
+                "agent ready — SOCKS5 on %s:%d",
+                self._tun.socks_host,
+                self._tun.socks_port,
             )
-            metrics_inc("tunnel.bootstrap.timeout")
-            raise AgentReadyTimeoutError(
-                f"Agent did not signal AGENT_READY within "
-                f"{self._tun.ready_timeout}s{detail}",
-                details={
-                    "timeout_s": self._tun.ready_timeout,
-                    "host": self._app.wss_url,
-                    "last_output": self._diag[-1] if self._diag else None,
-                },
-                hint=(
-                    "Increase EXECTUNNEL_AGENT_TIMEOUT or check the remote "
-                    "Python version and available memory."
-                ),
-            ) from exc
-
-        logger.info(
-            "agent ready — SOCKS5 on %s:%d",
-            self._tun.socks_host,
-            self._tun.socks_port,
-        )
-        metrics_inc("tunnel.bootstrap.ok")
-        metrics_observe(
-            "tunnel.bootstrap.duration_sec",
-            asyncio.get_running_loop().time() - start,
-        )
+            metrics_inc("tunnel.bootstrap.ok")
+            metrics_observe(
+                "session_bootstrap_duration_seconds",
+                asyncio.get_running_loop().time() - start,
+            )
 
     # ── Upload ────────────────────────────────────────────────────────────────
 

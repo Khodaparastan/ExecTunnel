@@ -300,12 +300,10 @@ class DnsForwarder:
 
             # Single recv — DNS is request/response.  Flow is closed in the
             # finally block immediately after, so no further datagrams can
-            timed_out = False
             try:
                 async with asyncio.timeout(DNS_QUERY_TIMEOUT_SECS):
                     response = await handler.recv_datagram()
             except TimeoutError:
-                timed_out = True
                 self._error_drop_count += 1
                 self._total_drop_count += 1
                 metrics_inc("dns.query.timeout")
@@ -317,9 +315,6 @@ class DnsForwarder:
                     DNS_QUERY_TIMEOUT_SECS,
                 )
                 return  # finally block handles cleanup.
-
-            if timed_out:
-                return
 
             if response is None:
                 agent_closed = True

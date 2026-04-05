@@ -31,7 +31,7 @@ from exectunnel.exceptions import (
     TransportError,
     UnexpectedFrameError,
 )
-from exectunnel.observability import metrics_inc
+from exectunnel.observability import metrics_inc, span
 from exectunnel.protocol import (
     FRAME_PREFIX,
     FRAME_SUFFIX,
@@ -195,54 +195,55 @@ class FrameReceiver:
 
         msg_type = frame.msg_type
         conn_id = frame.conn_id
-        metrics_inc("tunnel.frames.received", type=msg_type)
+        metrics_inc("session_frames_inbound_total", msg_type=msg_type)
 
-        match msg_type:
-            case "DATA":
-                await self._on_data(conn_id, frame.payload)
+        with span("session.handle_frame", msg_type=msg_type, conn_id=conn_id):
+            match msg_type:
+                case "DATA":
+                    await self._on_data(conn_id, frame.payload)
 
-            case "CONN_CLOSE":
-                self._on_conn_close(conn_id)
+                case "CONN_CLOSE":
+                    self._on_conn_close(conn_id)
 
-            case "UDP_DATA":
-                self._on_udp_data(conn_id, frame.payload)
+                case "UDP_DATA":
+                    self._on_udp_data(conn_id, frame.payload)
 
-            case "UDP_CLOSE":
-                self._on_udp_close(conn_id)
+                case "UDP_CLOSE":
+                    self._on_udp_close(conn_id)
 
-            case "ERROR":
-                await self._on_error(conn_id, frame.payload)
+                case "ERROR":
+                    await self._on_error(conn_id, frame.payload)
 
-            case "AGENT_READY":
-                raise UnexpectedFrameError(
-                    "AGENT_READY received after session was established.",
-                    details={
-                        "state": "running",
-                        "frame_type": "AGENT_READY",
-                    },
-                )
+                case "AGENT_READY":
+                    raise UnexpectedFrameError(
+                        "AGENT_READY received after session was established.",
+                        details={
+                            "state": "running",
+                            "frame_type": "AGENT_READY",
+                        },
+                    )
 
-            case "CONN_OPEN" | "UDP_OPEN":
-                # Agent never sends these — they are client→agent only.
-                raise UnexpectedFrameError(
-                    f"{msg_type} received from agent — unexpected direction.",
-                    details={
-                        "state": "running",
-                        "frame_type": msg_type,
-                    },
-                )
+                case "CONN_OPEN" | "UDP_OPEN":
+                    # Agent never sends these — they are client→agent only.
+                    raise UnexpectedFrameError(
+                        f"{msg_type} received from agent — unexpected direction.",
+                        details={
+                            "state": "running",
+                            "frame_type": msg_type,
+                        },
+                    )
 
-            case _:
-                # parse_frame guarantees msg_type is valid — this branch
-                # can only be reached if a new frame type was added to the
-                # protocol package without updating this dispatcher.
-                raise UnexpectedFrameError(
-                    f"Unhandled frame type {msg_type!r} — update session dispatcher.",
-                    details={
-                        "state": "running",
-                        "frame_type": msg_type,
-                    },
-                )
+                case _:
+                    # parse_frame guarantees msg_type is valid — this branch
+                    # can only be reached if a new frame type was added to the
+                    # protocol package without updating this dispatcher.
+                    raise UnexpectedFrameError(
+                        f"Unhandled frame type {msg_type!r} — update session dispatcher.",
+                        details={
+                            "state": "running",
+                            "frame_type": msg_type,
+                        },
+                    )
 
     # ── Per-type callbacks ────────────────────────────────────────────────────
 
@@ -268,7 +269,13 @@ class FrameReceiver:
         pending = self._pending_connects.get(inner)
         if pending is not None and not pending.ack_future.done():
             pending.ack_future.set_result(AckStatus.OK)
-        metrics_inc("tunnel.frames.received", type="CONN_ACK")
+            metrics_inc("session_frames_inbound_total", msg_type="CONN_ACK")
+        else:
+            logger.debug(
+                "recv: CONN_ACK for unknown or already-resolved conn_id %r — ignoring",
+                inner,
+            )
+            metrics_inc("tunnel.frames.conn_ack.stale")
 
     async def _on_data(self, conn_id: str, payload: str) -> None:
         """Feed decoded bytes to the TcpConnection handler.

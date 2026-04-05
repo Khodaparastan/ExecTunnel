@@ -22,6 +22,7 @@ import logging
 from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed
 
+from exectunnel.config.defaults import SEND_DROP_LOG_EVERY
 from exectunnel.config.settings import AppConfig
 from exectunnel.exceptions import (
     ConnectionClosedError,
@@ -45,8 +46,6 @@ class _StopSentinel:
 
 _QUEUE_STOP = _StopSentinel()
 
-# Log send-drop warnings at most once per this many drops.
-_SEND_DROP_LOG_EVERY = 100
 
 # Type alias for queue items: a frame string or the stop sentinel.
 _SendQueueItem = str | _StopSentinel
@@ -193,7 +192,7 @@ class WsSender:
             metrics_inc("tunnel.frames.send_drop")
             if (
                 self._send_drop_count == 1
-                or self._send_drop_count % _SEND_DROP_LOG_EVERY == 0
+                or self._send_drop_count % SEND_DROP_LOG_EVERY == 0
             ):
                 logger.warning(
                     "send data queue full, dropping frame (drops=%d)",
@@ -232,8 +231,12 @@ class WsSender:
                     return  # Clean exit.
 
                 frame: str = item  # type: ignore[assignment]
+                # Extract msg_type for outbound metric — format: <<<EXECTUNNEL:{TYPE}:...
+                _parts = frame.split(":", 2)
+                _msg_type = _parts[1] if len(_parts) >= 2 else "unknown"
                 try:
                     metrics_inc("tunnel.frames.sent")
+                    metrics_inc("session_frames_outbound_total", msg_type=_msg_type)
                     async with asyncio.timeout(send_timeout):
                         await ws.send(frame)
                 except TimeoutError as exc:

@@ -130,7 +130,7 @@ class TunnelSession:
             self._tun.connect_max_pending_per_host,
         )
 
-        with span("tunnel.session"):
+        with span("session.run"):
             while True:
                 reconnect_reason: str | None = None
                 try:
@@ -238,7 +238,7 @@ class TunnelSession:
                 # Cap total delay to max_delay so jitter never overshoots.
                 delay = min(delay + jitter, max_delay)
                 attempt += 1
-                metrics_inc("tunnel.reconnect.scheduled")
+                metrics_inc("session_reconnects_total", reason=reconnect_reason.split(":")[0] if reconnect_reason else "unknown")
                 metrics_observe("tunnel.reconnect.delay_sec", delay)
                 logger.warning(
                     "WebSocket disconnected (%s), reconnecting in %.1fs "
@@ -253,25 +253,31 @@ class TunnelSession:
     # ── Session initialisation ────────────────────────────────────────────────
 
     async def _clear_session_state(self) -> None:
-        """Close and clear all per-session state before a new session starts.
+        """Abort/close all per-session state before a new session starts.
 
-        Closes any lingering TCP connections, pending connects, and UDP flows
-        from a previous session to prevent resource leaks on reconnect.
-        Request tasks from the previous session are cancelled by
+        Aborts any lingering TCP connections, cancels pending connect futures,
+        and closes UDP flows from a previous session to prevent resource leaks
+        on reconnect.  Request tasks from the previous session are cancelled by
         ``_run_tasks`` before this is called, so the set should already be
         empty — clearing it here is a safety net.
         """
-        # Close TCP connections from the previous session.
+        # Abort TCP connections from the previous session.
+        # TcpConnection has no close() — use abort() for started handlers and
+        # close_unstarted() for handlers that never reached the RUNNING state.
         for conn in self._tcp_registry.values():
             try:
-                await conn.close()
+                if conn.is_started:
+                    conn.abort()
+                else:
+                    await conn.close_unstarted()
             except Exception:  # noqa: BLE001
-                logger.debug("error closing stale tcp connection during session reset", exc_info=True)
+                logger.debug("error aborting stale tcp connection during session reset", exc_info=True)
         self._tcp_registry.clear()
 
         # Cancel pending connect futures.
         for pending in self._pending_connects.values():
-            pending.cancel()
+            if not pending.ack_future.done():
+                pending.ack_future.cancel()
         self._pending_connects.clear()
 
         # Close UDP flows from the previous session.

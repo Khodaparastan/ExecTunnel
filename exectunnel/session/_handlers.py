@@ -28,7 +28,7 @@ from exectunnel.exceptions import (
     TransportError,
     WebSocketSendTimeoutError,
 )
-from exectunnel.observability import metrics_inc, metrics_observe
+from exectunnel.observability import metrics_gauge_inc, metrics_inc, metrics_observe, span
 from exectunnel.protocol import (
     Reply,
     encode_conn_open_frame,
@@ -128,10 +128,15 @@ class RequestDispatcher:
 
     async def dispatch(self, req: Socks5Request) -> None:
         """Dispatch a SOCKS5 request to the appropriate handler."""
+        # Each request task inherits the session's trace context via asyncio
+        # context copy.  We open a fresh child span so per-request logs carry
+        # a unique span_id while sharing the session trace_id.
         if req.is_connect:
-            await self._handle_connect(req)
+            with span("socks.connect", host=req.host, port=req.port):
+                await self._handle_connect(req)
         elif req.is_udp_associate:
-            await self._handle_udp_associate(req)
+            with span("socks.udp_associate"):
+                await self._handle_udp_associate(req)
         else:
             if not req.replied:
                 await req.send_reply_error(Reply.CMD_NOT_SUPPORTED)
@@ -195,6 +200,7 @@ class RequestDispatcher:
         # Insert into registry BEFORE sending CONN_OPEN — agent may reply
         # before the await returns.
         self._tcp_registry[conn_id] = handler
+        metrics_gauge_inc("session_active_tcp_connections")
         self._pending_connects[conn_id] = pending
         self._emit_pending_gauge()
 
@@ -538,6 +544,7 @@ class RequestDispatcher:
                         )
                         # Insert BEFORE open() — agent may reply immediately.
                         self._udp_registry[flow_id] = flow_handler
+                        metrics_gauge_inc("session_active_udp_flows")
                         try:
                             await flow_handler.open()
                         except (
@@ -664,10 +671,17 @@ class RequestDispatcher:
         )
 
     def reset_ack_state(self) -> None:
-        """Reset ACK timeout window state after a successful bootstrap."""
+        """Reset all ACK failure tracking state after a successful bootstrap.
+
+        Called at the start of each session so that failure counts from a
+        previous (failed) session do not inflate totals or suppress log lines
+        in the new session.
+        """
         self._ack_reconnect_requested = False
         self._ack_timeout_window_start = None
         self._ack_timeout_window_count = 0
+        self._ack_failure_count = 0
+        self._ack_failure_suppressed = 0
 
     # ── Connection hardening helpers ──────────────────────────────────────────
 
