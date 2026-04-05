@@ -68,7 +68,7 @@ from exectunnel.exceptions import (
     TransportError,
     WebSocketSendTimeoutError,
 )
-from exectunnel.observability import metrics_inc, metrics_observe, span
+from exectunnel.observability import metrics_gauge_dec, metrics_inc, metrics_observe, span
 from exectunnel.protocol import encode_conn_close_frame, encode_data_frame
 from exectunnel.transport._types import TcpRegistry, WsSendCallable
 from exectunnel.transport._validation import require_bytes
@@ -89,6 +89,21 @@ _DOWNSTREAM_BATCH_SIZE: Final[int] = 16
 
 # Minimum sensible pre-ACK buffer cap — one full read chunk.
 _MIN_PRE_ACK_BUFFER_CAP: Final[int] = PIPE_READ_CHUNK_BYTES
+
+# Maximum raw bytes per DATA chunk that fit within MAX_FRAME_LEN after
+# base64url encoding (no padding).  Derivation:
+#   overhead = len(FRAME_PREFIX) + len("DATA") + 1 + len(conn_id) + 1 + len(FRAME_SUFFIX)
+#            = 14 + 4 + 1 + 25 + 1 + 3 = 48
+#   b64_budget = MAX_FRAME_LEN - overhead = 8192 - 48 = 8144
+#   max_raw    = floor(8144 * 3 / 4) = 6108
+#   conn_id    = "c" + token_hex(12) = 1 + 24 = 25 chars
+_MAX_DATA_CHUNK_BYTES: Final[int] = 6_108
+
+assert PIPE_READ_CHUNK_BYTES <= _MAX_DATA_CHUNK_BYTES, (
+    f"PIPE_READ_CHUNK_BYTES ({PIPE_READ_CHUNK_BYTES}) exceeds the protocol "
+    f"maximum of {_MAX_DATA_CHUNK_BYTES} bytes per DATA chunk. "
+    "Reduce PIPE_READ_CHUNK_BYTES or the agent will reject oversized frames as FrameDecodingError."
+)
 
 
 # ── Exception logging helper ──────────────────────────────────────────────────
@@ -1064,6 +1079,7 @@ class TcpConnection:
                 await task
 
         self._registry.pop(self._id, None)
+        metrics_gauge_dec("session_active_tcp_connections")
 
         # Close the writer with a timeout so a stalled OS never blocks cleanup.
         with contextlib.suppress(OSError, RuntimeError):

@@ -53,7 +53,7 @@ from exectunnel.exceptions import (
     TransportError,
     WebSocketSendTimeoutError,
 )
-from exectunnel.observability import metrics_inc, span
+from exectunnel.observability import metrics_gauge_dec, metrics_inc, span
 from exectunnel.protocol import (
     encode_udp_close_frame,
     encode_udp_data_frame,
@@ -468,10 +468,10 @@ class UdpFlow:
     def _evict(self) -> None:
         """Remove this flow from the shared registry.
 
-        Called by both :meth:`close` and :meth:`on_remote_closed` to avoid
         duplicating the registry pop.
         """
         self._registry.pop(self._id, None)
+        metrics_gauge_dec("session_active_udp_flows")
 
     # ── Properties ────────────────────────────────────────────────────────────
 
