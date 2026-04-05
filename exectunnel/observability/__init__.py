@@ -1,14 +1,19 @@
-from exectunnel.observability.logging import LevelName, configure_logging
-from exectunnel.observability.metrics import (
+from .exporters import Exporter, build_exporters, build_obs_payload
+from .logging import LevelName, configure_logging
+from .metrics import (
     METRICS,
     MetricsRegistry,
+    metrics_gauge_dec,
+    metrics_gauge_inc,
+    metrics_gauge_set,
     metrics_inc,
     metrics_observe,
     metrics_reset,
     metrics_snapshot,
 )
-from exectunnel.observability.reporter import run_metrics_reporter
-from exectunnel.observability.tracing import (
+from .reporter import run_metrics_reporter
+from .tracing import (
+    current_parent_span_id,
     current_span_id,
     current_trace_id,
     span,
@@ -16,17 +21,29 @@ from exectunnel.observability.tracing import (
 )
 
 __all__ = [
+    # exporters
+    "Exporter",
+    "build_exporters",
+    "build_obs_payload",
+    # logging
     "LevelName",
+    "configure_logging",
+    # metrics
     "METRICS",
     "MetricsRegistry",
-    "configure_logging",
-    "current_span_id",
-    "current_trace_id",
+    "metrics_gauge_dec",
+    "metrics_gauge_inc",
+    "metrics_gauge_set",
     "metrics_inc",
     "metrics_observe",
     "metrics_reset",
     "metrics_snapshot",
+    # reporter
     "run_metrics_reporter",
+    # tracing
+    "current_parent_span_id",
+    "current_span_id",
+    "current_trace_id",
     "span",
     "start_trace",
 ]

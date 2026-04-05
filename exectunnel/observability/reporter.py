@@ -6,35 +6,58 @@ import json
 import logging
 import os
 
-from exectunnel.config.env import parse_bool_env
-from exectunnel.observability.exporters import (
+from .exporters import (
     EXPORTER_ERRORS,
     Exporter,
     build_exporters,
     build_obs_payload,
 )
-from exectunnel.observability.metrics import metrics_snapshot
+from .metrics import metrics_snapshot
+from .utils import parse_bool_env, parse_float_env, parse_int_env
+
+# Default reporting interval when the caller does not supply one explicitly.
+_DEFAULT_INTERVAL_SEC = 30.0
+_MIN_INTERVAL_SEC = 1.0
+_MAX_INTERVAL_SEC = 3600.0
 
 
 async def run_metrics_reporter(
-    interval_sec: float,
-    stop_event: asyncio.Event,
+    interval_sec: float | None = None,
+    stop_event: asyncio.Event | None = None,
     *,
     logger_name: str = "exectunnel.metrics",
 ) -> None:
+    """Periodically emit a metrics snapshot to all configured exporters.
+
+    Parameters
+    ----------
+    interval_sec:
+        Seconds between snapshots.  When *None* the value is read from
+        ``EXECTUNNEL_METRICS_INTERVAL_SEC`` (default 30 s).
+    stop_event:
+        Signals the reporter to flush a final snapshot and exit.  When
+        *None* a private event is created (the reporter runs until cancelled).
+    """
+    if stop_event is None:
+        stop_event = asyncio.Event()
+
+    if interval_sec is None:
+        interval_sec = parse_float_env(
+            "EXECTUNNEL_METRICS_INTERVAL_SEC",
+            _DEFAULT_INTERVAL_SEC,
+            min_value=_MIN_INTERVAL_SEC,
+            max_value=_MAX_INTERVAL_SEC,
+        )
+
     logger = logging.getLogger(logger_name)
     verbose = parse_bool_env("EXECTUNNEL_METRICS_VERBOSE", False)
-    try:
-        top_n = max(1, int(os.getenv("EXECTUNNEL_METRICS_TOP_N", "12")))
-    except ValueError:
-        top_n = 12
+    top_n = parse_int_env("EXECTUNNEL_METRICS_TOP_N", 12, min_value=1)
 
-    log_level_env = os.getenv("EXECTUNNEL_METRICS_LOG_LEVEL", "debug").strip().lower()
-    log_fn = logger.info if log_level_env == "info" else logger.debug
+    log_level_env = parse_bool_env("EXECTUNNEL_METRICS_LOG_LEVEL_INFO", False)
+    log_fn = logger.info if log_level_env else logger.debug
+
     obs_platform = os.getenv("EXECTUNNEL_OBS_PLATFORM", "generic").strip() or "generic"
-    obs_service = (
-        os.getenv("EXECTUNNEL_OBS_SERVICE", "exectunnel").strip() or "exectunnel"
-    )
+    obs_service = os.getenv("EXECTUNNEL_OBS_SERVICE", "exectunnel").strip() or "exectunnel"
 
     def emit_log(snapshot: dict[str, object], payload: dict[str, object]) -> None:
         final = bool(payload.get("final", False))

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 def _normalize_tags(tags: dict[str, object] | None) -> tuple[tuple[str, str], ...]:
@@ -33,6 +33,24 @@ class _Histogram:
         if self.max is None or value > self.max:
             self.max = value
 
+    @property
+    def avg(self) -> float | None:
+        return (self.total / self.count) if self.count else None
+
+
+@dataclass
+class _Gauge:
+    value: float = field(default=0.0)
+
+    def set(self, value: float) -> None:
+        self.value = value
+
+    def inc(self, delta: float = 1.0) -> None:
+        self.value += delta
+
+    def dec(self, delta: float = 1.0) -> None:
+        self.value -= delta
+
 
 class MetricsRegistry:
     def __init__(self) -> None:
@@ -41,6 +59,11 @@ class MetricsRegistry:
             defaultdict(int)
         )
         self._hists: dict[tuple[str, tuple[tuple[str, str], ...]], _Histogram] = {}
+        self._gauges: dict[tuple[str, tuple[tuple[str, str], ...]], _Gauge] = {}
+
+    # ------------------------------------------------------------------
+    # Counter
+    # ------------------------------------------------------------------
 
     def inc(
         self, name: str, value: int = 1, tags: dict[str, object] | None = None
@@ -48,6 +71,10 @@ class MetricsRegistry:
         key = (name, _normalize_tags(tags))
         with self._lock:
             self._counters[key] += value
+
+    # ------------------------------------------------------------------
+    # Histogram
+    # ------------------------------------------------------------------
 
     def observe(
         self, name: str, value: float, tags: dict[str, object] | None = None
@@ -60,10 +87,52 @@ class MetricsRegistry:
                 self._hists[key] = hist
             hist.observe(value)
 
+    # ------------------------------------------------------------------
+    # Gauge
+    # ------------------------------------------------------------------
+
+    def gauge_set(
+        self, name: str, value: float, tags: dict[str, object] | None = None
+    ) -> None:
+        key = (name, _normalize_tags(tags))
+        with self._lock:
+            g = self._gauges.get(key)
+            if g is None:
+                g = _Gauge()
+                self._gauges[key] = g
+            g.set(value)
+
+    def gauge_inc(
+        self, name: str, delta: float = 1.0, tags: dict[str, object] | None = None
+    ) -> None:
+        key = (name, _normalize_tags(tags))
+        with self._lock:
+            g = self._gauges.get(key)
+            if g is None:
+                g = _Gauge()
+                self._gauges[key] = g
+            g.inc(delta)
+
+    def gauge_dec(
+        self, name: str, delta: float = 1.0, tags: dict[str, object] | None = None
+    ) -> None:
+        key = (name, _normalize_tags(tags))
+        with self._lock:
+            g = self._gauges.get(key)
+            if g is None:
+                g = _Gauge()
+                self._gauges[key] = g
+            g.dec(delta)
+
+    # ------------------------------------------------------------------
+    # Snapshot / reset
+    # ------------------------------------------------------------------
+
     def snapshot(self) -> dict[str, object]:
         with self._lock:
             counters = dict(self._counters)
             hists = dict(self._hists)
+            gauges = dict(self._gauges)
         out: dict[str, object] = {}
         for (name, tags), value in counters.items():
             out[_render_metric_key(name, tags)] = value
@@ -71,16 +140,24 @@ class MetricsRegistry:
             prefix = _render_metric_key(name, tags)
             out[f"{prefix}.count"] = hist.count
             out[f"{prefix}.sum"] = round(hist.total, 6)
+            if hist.avg is not None:
+                out[f"{prefix}.avg"] = round(hist.avg, 6)
             if hist.min is not None:
                 out[f"{prefix}.min"] = round(hist.min, 6)
             if hist.max is not None:
                 out[f"{prefix}.max"] = round(hist.max, 6)
+        for (name, tags), gauge in gauges.items():
+            out[_render_metric_key(name, tags)] = round(gauge.value, 6)
         return out
 
-    def clear(self) -> None:
+    def reset(self) -> None:
         with self._lock:
             self._counters.clear()
             self._hists.clear()
+            self._gauges.clear()
+
+    # Keep backward-compat alias
+    clear = reset
 
 
 METRICS = MetricsRegistry()
@@ -94,9 +171,21 @@ def metrics_observe(metric: str, value: float, **tags: object) -> None:
     METRICS.observe(metric, value=value, tags=tags or None)
 
 
+def metrics_gauge_set(metric: str, value: float, **tags: object) -> None:
+    METRICS.gauge_set(metric, value=value, tags=tags or None)
+
+
+def metrics_gauge_inc(metric: str, delta: float = 1.0, **tags: object) -> None:
+    METRICS.gauge_inc(metric, delta=delta, tags=tags or None)
+
+
+def metrics_gauge_dec(metric: str, delta: float = 1.0, **tags: object) -> None:
+    METRICS.gauge_dec(metric, delta=delta, tags=tags or None)
+
+
 def metrics_snapshot() -> dict[str, object]:
     return METRICS.snapshot()
 
 
 def metrics_reset() -> None:
-    METRICS.clear()
+    METRICS.reset()

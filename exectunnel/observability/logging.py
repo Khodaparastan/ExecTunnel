@@ -7,7 +7,7 @@ import sys
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
-from exectunnel.observability.tracing import current_span_id, current_trace_id
+from .tracing import current_span_id, current_trace_id
 
 _LEVELS: dict[str, int] = {
     "debug": logging.DEBUG,
@@ -92,7 +92,7 @@ class _ConsoleFormatter(logging.Formatter):
         )
 
     def format(self, record: logging.LogRecord) -> str:
-        ts = datetime.now().strftime("%H:%M:%S")
+        ts = datetime.now(UTC).strftime("%H:%M:%S")
         level = f"{record.levelname:<7}"
         message = record.getMessage()
         level, message = self._colorize(record.levelno, level, message)
