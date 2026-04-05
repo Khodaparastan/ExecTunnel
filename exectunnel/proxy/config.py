@@ -8,7 +8,7 @@ opened.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from exectunnel.exceptions import ConfigurationError
 from exectunnel.proxy._constants import (
@@ -16,6 +16,7 @@ from exectunnel.proxy._constants import (
     DEFAULT_QUEUE_CAPACITY,
     DROP_WARN_INTERVAL,
     LOOPBACK_ADDRS,
+    QUEUE_PUT_TIMEOUT,
 )
 
 __all__: list[str] = ["Socks5ServerConfig"]
@@ -28,43 +29,27 @@ class Socks5ServerConfig:
     All fields are validated at construction time via ``__post_init__``.
 
     Attributes:
-        host:               Bind address for the SOCKS5 listen socket.
-                            Defaults to ``"127.0.0.1"``.
-        port:               Bind port.  Must be in ``[1, 65535]``.
-                            Defaults to ``1080``.
-        handshake_timeout:  Maximum seconds allowed for a single SOCKS5
-                            handshake before the connection is dropped.
-                            Must be positive.  Defaults to
-                            :data:`~exectunnel.proxy._constants.DEFAULT_HANDSHAKE_TIMEOUT`.
-        queue_capacity:     Maximum number of completed
-                            :class:`~exectunnel.proxy.request.Socks5Request`
-                            objects to buffer before back-pressuring the
-                            accept loop.  Must be ≥ 1.  Defaults to
-                            :data:`~exectunnel.proxy._constants.DEFAULT_QUEUE_CAPACITY`.
-        udp_drop_warn_interval: Log a warning every *N* UDP queue-full drops
-                            to avoid log flooding.  Must be ≥ 1.  Defaults to
-                            :data:`~exectunnel.proxy._constants.DROP_WARN_INTERVAL`.
+        host:                   Bind address.  Defaults to ``"127.0.0.1"``.
+        port:                   Bind port in ``[1, 65535]``.  Defaults to ``1080``.
+        handshake_timeout:      Max seconds for a SOCKS5 handshake.  Positive.
+        queue_capacity:         Max buffered requests before backpressure.  ≥ 1.
+        queue_put_timeout:      Max seconds to wait when enqueueing a completed
+                                handshake.  Positive.
+        udp_drop_warn_interval: Log a warning every *N* UDP queue-full drops.  ≥ 1.
 
     Raises:
         ConfigurationError: If any field fails validation.
-
-    Example::
-
-        cfg = Socks5ServerConfig(host="127.0.0.1", port=1080)
-        async with Socks5Server(cfg) as server:
-            async for req in server:
-                asyncio.create_task(handle(req))
     """
 
     host: str = "127.0.0.1"
     port: int = 1080
     handshake_timeout: float = DEFAULT_HANDSHAKE_TIMEOUT
     queue_capacity: int = DEFAULT_QUEUE_CAPACITY
+    queue_put_timeout: float = QUEUE_PUT_TIMEOUT
     udp_drop_warn_interval: int = DROP_WARN_INTERVAL
 
     def __post_init__(self) -> None:
-        """Validate all fields, raising :class:`~exectunnel.exceptions.ConfigurationError`
-        on the first violation found."""
+        """Validate all fields."""
         if not self.host:
             raise ConfigurationError(
                 "Socks5ServerConfig.host must not be empty.",
@@ -104,6 +89,18 @@ class Socks5ServerConfig:
                     "expected": "integer ≥ 1",
                 },
                 hint="Set queue_capacity to at least 1.",
+            )
+
+        if self.queue_put_timeout <= 0:
+            raise ConfigurationError(
+                f"Socks5ServerConfig.queue_put_timeout {self.queue_put_timeout!r} "
+                "must be a positive number.",
+                details={
+                    "field": "queue_put_timeout",
+                    "value": self.queue_put_timeout,
+                    "expected": "positive float (seconds)",
+                },
+                hint="Set queue_put_timeout to a positive number of seconds.",
             )
 
         if self.udp_drop_warn_interval < 1:

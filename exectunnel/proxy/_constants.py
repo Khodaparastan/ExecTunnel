@@ -14,11 +14,11 @@ __all__: list[str] = [
     "DROP_WARN_INTERVAL",
     "LOOPBACK_ADDRS",
     "MAX_UDP_PAYLOAD_BYTES",
+    "QUEUE_PUT_TIMEOUT",
 ]
 
 # Maximum UDP payload accepted from the SOCKS5 client.
 # 65507 = 65535 − 20 (IPv4 header) − 8 (UDP header).
-# Anything larger is physically impossible over standard IPv4/UDP.
 MAX_UDP_PAYLOAD_BYTES: int = 65_507
 
 # Default SOCKS5 handshake timeout in seconds.
@@ -30,5 +30,13 @@ DEFAULT_QUEUE_CAPACITY: int = 2_048
 # Log a warning every N drops to avoid log flooding on a saturated relay.
 DROP_WARN_INTERVAL: int = 100
 
+# Maximum seconds to wait when enqueueing a completed handshake before
+# dropping the connection with a GENERAL_FAILURE reply.  Prevents indefinite
+# stalls when the consumer is slow.
+QUEUE_PUT_TIMEOUT: float = 5.0
+
 # Addresses considered loopback — binding to anything else triggers a warning.
-LOOPBACK_ADDRS: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost"})
+# Only IP literals are included; "localhost" is excluded because it depends on
+# DNS resolution and may resolve to a non-loopback address on misconfigured
+# systems.
+LOOPBACK_ADDRS: frozenset[str] = frozenset({"127.0.0.1", "::1"})

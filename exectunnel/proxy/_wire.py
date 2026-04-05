@@ -10,8 +10,10 @@ module side-effect free and trivially unit-testable.
 Public surface (package-internal only — not re-exported from ``__init__.py``)
 ------------------------------------------------------------------------------
 * :func:`validate_socks5_domain` — RFC 1123 domain safety check.
+* :func:`parse_socks5_addr_buf`  — Sync ATYP+addr+port parser from a buffer.
 * :func:`parse_udp_header`       — SOCKS5 UDP datagram header parser (RFC 1928 §7).
 * :func:`build_socks5_reply`     — SOCKS5 reply packet serialiser (RFC 1928 §6).
+* :func:`build_udp_header`       — SOCKS5 UDP reply header builder.
 
 Exceptions raised
 -----------------
@@ -34,6 +36,8 @@ from exectunnel.proxy._constants import MAX_UDP_PAYLOAD_BYTES
 
 __all__: list[str] = [
     "build_socks5_reply",
+    "build_udp_header",
+    "parse_socks5_addr_buf",
     "parse_udp_header",
     "validate_socks5_domain",
 ]
@@ -43,17 +47,13 @@ __all__: list[str] = [
 # ---------------------------------------------------------------------------
 
 # RFC 1123 relaxed: labels of 1–63 chars, total ≤ 253, no leading/trailing dot.
-# re.ASCII ensures [A-Za-z0-9] never matches Unicode digits on exotic builds.
-# Underscores are intentionally excluded — not valid per RFC 1123 and would
-# corrupt tunnel frames alongside frame-unsafe characters.
 _DOMAIN_LABEL_RE: re.Pattern[str] = re.compile(
     r"^[A-Za-z0-9]([A-Za-z0-9\-]{0,61}[A-Za-z0-9])?$",
     re.ASCII,
 )
 
-# Characters that are either NUL (stream terminator) or frame-unsafe per the
-# ExecTunnel wire format (protocol.md — FRAME_PREFIX / FRAME_SUFFIX chars).
-# Blocked set: \x00 (NUL), : (field separator), < and > (frame delimiters).
+# Characters that are NUL (stream terminator) or frame-unsafe per the
+# ExecTunnel wire format.
 _DOMAIN_UNSAFE_RE: re.Pattern[str] = re.compile(r"[\x00:<>]", re.ASCII)
 
 # Maximum total length of a DNS name per RFC 1035 §2.3.4.
@@ -74,9 +74,7 @@ def validate_socks5_domain(domain: str) -> None:
        * Interior characters are alphanumeric or ``-``.
 
     A trailing dot (FQDN notation) is stripped before label splitting so
-    ``"example.com."`` is treated identically to ``"example.com"``.  A bare
-    ``"."`` becomes an empty string after stripping and triggers the
-    empty-label error — this is intentional.
+    ``"example.com."`` is treated identically to ``"example.com"``.
 
     Args:
         domain: The decoded domain string to validate.
@@ -139,6 +137,170 @@ def validate_socks5_domain(domain: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Shared address parsing from a buffer (sync)
+# ---------------------------------------------------------------------------
+
+
+def parse_socks5_addr_buf(
+    data: bytes,
+    offset: int,
+    *,
+    context: str = "SOCKS5",
+    allow_port_zero: bool = False,
+) -> tuple[str, int, int]:
+    """Parse ``ATYP + address + port`` from *data* starting at *offset*.
+
+    Single source of truth for SOCKS5 address parsing from a contiguous
+    buffer.  Used by :func:`parse_udp_header` directly and by
+    :func:`~exectunnel.proxy._io.read_socks5_addr` after assembling bytes
+    from the stream.
+
+    Args:
+        data:            Raw bytes buffer.
+        offset:          Byte position of the ATYP field.
+        context:         Human-readable context for error messages
+                         (e.g. ``"SOCKS5 UDP"``).
+        allow_port_zero: If ``False`` (default), port 0 raises
+                         :class:`ProtocolError`.  Set to ``True`` for
+                         ``UDP_ASSOCIATE`` requests where the client may
+                         declare ``DST.PORT=0`` per RFC 1928 §4.
+
+    Returns:
+        A ``(host, port, new_offset)`` tuple where *new_offset* points to
+        the first byte after the port field.
+
+    Raises:
+        ProtocolError: On any parse failure.
+    """
+    if len(data) < offset + 1:
+        raise ProtocolError(
+            f"{context} address truncated before ATYP byte.",
+            details={"socks5_field": "ATYP", "expected": "at least 1 byte for ATYP"},
+            hint=f"The {context} address field is truncated.",
+        )
+
+    atyp = data[offset]
+    offset += 1
+
+    if atyp == AddrType.IPV4:
+        if len(data) < offset + 4:
+            raise ProtocolError(
+                f"{context} IPv4 address truncated.",
+                details={
+                    "socks5_field": "DST.ADDR",
+                    "expected": f"at least {offset + 4} bytes for IPv4 address",
+                },
+                hint=f"The {context} IPv4 address field is incomplete.",
+            )
+        host = str(ipaddress.IPv4Address(data[offset : offset + 4]))
+        offset += 4
+
+    elif atyp == AddrType.IPV6:
+        if len(data) < offset + 16:
+            raise ProtocolError(
+                f"{context} IPv6 address truncated.",
+                details={
+                    "socks5_field": "DST.ADDR",
+                    "expected": f"at least {offset + 16} bytes for IPv6 address",
+                },
+                hint=f"The {context} IPv6 address field is incomplete.",
+            )
+        host = str(ipaddress.IPv6Address(data[offset : offset + 16]).compressed)
+        offset += 16
+
+    elif atyp == AddrType.DOMAIN:
+        if len(data) < offset + 1:
+            raise ProtocolError(
+                f"{context} DOMAIN address truncated before length byte.",
+                details={
+                    "socks5_field": "DST.ADDR.LEN",
+                    "expected": "at least 1 byte for domain length field",
+                },
+                hint=f"The {context} DOMAIN header has no length byte.",
+            )
+        dlen = data[offset]
+        offset += 1
+
+        if dlen == 0:
+            raise ProtocolError(
+                f"{context} DOMAIN address length must be greater than zero.",
+                details={
+                    "socks5_field": "DST.ADDR.LEN",
+                    "expected": "domain length ≥ 1",
+                },
+                hint=f"The {context} client sent a zero-length domain name.",
+            )
+
+        if len(data) < offset + dlen:
+            raise ProtocolError(
+                f"{context} DOMAIN address truncated before domain bytes.",
+                details={
+                    "socks5_field": "DST.ADDR",
+                    "expected": f"at least {offset + dlen} bytes for domain",
+                },
+                hint=f"The {context} domain name is shorter than its declared length.",
+            )
+
+        raw_domain = data[offset : offset + dlen]
+        try:
+            host = raw_domain.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ProtocolError(
+                f"{context} DOMAIN address bytes are not valid UTF-8.",
+                details={
+                    "socks5_field": "DST.ADDR",
+                    "raw_bytes": raw_domain.hex()[:128],
+                    "codec": "utf-8",
+                },
+                hint=(
+                    f"The {context} client sent a domain name that cannot be decoded "
+                    "as UTF-8.  Only ASCII/UTF-8 hostnames are supported."
+                ),
+            ) from exc
+
+        validate_socks5_domain(host)
+        offset += dlen
+
+    else:
+        raise ProtocolError(
+            f"Unsupported {context} address type: {atyp:#x}.",
+            details={
+                "socks5_field": "ATYP",
+                "expected": "ATYP 0x01 (IPv4), 0x03 (DOMAIN), or 0x04 (IPv6)",
+            },
+            hint=(
+                "Only ATYP 0x01 (IPv4), 0x03 (DOMAIN), and 0x04 (IPv6) are supported."
+            ),
+        )
+
+    # Port
+    if len(data) < offset + 2:
+        raise ProtocolError(
+            f"{context} address truncated before port field.",
+            details={
+                "socks5_field": "DST.PORT",
+                "expected": f"at least {offset + 2} bytes for port field",
+            },
+            hint=f"The {context} address has no port field.",
+        )
+
+    port = struct.unpack("!H", data[offset : offset + 2])[0]
+    offset += 2
+
+    if port == 0 and not allow_port_zero:
+        raise ProtocolError(
+            f"{context} destination port is 0.",
+            details={
+                "socks5_field": "DST.PORT",
+                "expected": "destination port in [1, 65535]",
+            },
+            hint="Port 0 is not a valid destination port.",
+        )
+
+    return host, port, offset
+
+
+# ---------------------------------------------------------------------------
 # UDP datagram header parser
 # ---------------------------------------------------------------------------
 
@@ -146,8 +308,7 @@ def validate_socks5_domain(domain: str) -> None:
 def parse_udp_header(data: bytes) -> tuple[bytes, str, int]:
     """Parse a SOCKS5 UDP datagram header and return ``(payload, host, port)``.
 
-    Pure function — no I/O, no state.  Safe to call from any execution context
-    including synchronous unit tests and the in-pod agent.
+    Pure function — no I/O, no state.
 
     Wire layout (RFC 1928 §7)::
 
@@ -158,25 +319,14 @@ def parse_udp_header(data: bytes) -> tuple[bytes, str, int]:
         +----+------+------+----------+----------+----------+
 
     Args:
-        data: Raw bytes received from the SOCKS5 client, including the
-              RFC 1928 §7 header.
+        data: Raw bytes received from the SOCKS5 client.
 
     Returns:
-        A ``(payload, host, port)`` tuple where *host* is a normalised IP or
-        domain string and *port* is an integer in ``[1, 65535]``.
+        A ``(payload, host, port)`` tuple.
 
     Raises:
-        ProtocolError:
-            * Datagram shorter than 4 bytes (minimum header).
-            * Non-zero FRAG field (fragmentation not supported).
-            * Unsupported ATYP value.
-            * Truncated address or port field.
-            * Zero-length domain name.
-            * Domain bytes not valid UTF-8.
-            * Domain fails RFC 1123 / safety validation.
-            * Destination port is 0.
+        ProtocolError: On any parse failure.
     """
-    # Minimum: RSV(2) + FRAG(1) + ATYP(1) = 4 bytes.
     if len(data) < 4:
         raise ProtocolError(
             f"SOCKS5 UDP datagram too short: {len(data)} byte(s), minimum is 4.",
@@ -187,7 +337,6 @@ def parse_udp_header(data: bytes) -> tuple[bytes, str, int]:
             hint="The SOCKS5 client sent a datagram shorter than the minimum header size.",
         )
 
-    # FRAG != 0 means reassembly is required; fragmentation is not supported.
     if data[2] != 0:
         raise ProtocolError(
             f"SOCKS5 UDP fragmentation is not supported (FRAG={data[2]:#x}).",
@@ -201,127 +350,39 @@ def parse_udp_header(data: bytes) -> tuple[bytes, str, int]:
             ),
         )
 
-    atyp = data[3]
-    offset = 4
-
-    if atyp == AddrType.IPV4:
-        if len(data) < offset + 4 + 2:
-            raise ProtocolError(
-                "SOCKS5 UDP IPv4 datagram truncated before address+port.",
-                details={
-                    "socks5_field": "DST.ADDR",
-                    "expected": f"at least {offset + 4 + 2} bytes for IPv4 address+port",
-                },
-                hint="The SOCKS5 client sent an incomplete IPv4 address field.",
-            )
-        host = str(ipaddress.IPv4Address(data[offset : offset + 4]))
-        offset += 4
-
-    elif atyp == AddrType.IPV6:
-        if len(data) < offset + 16 + 2:
-            raise ProtocolError(
-                "SOCKS5 UDP IPv6 datagram truncated before address+port.",
-                details={
-                    "socks5_field": "DST.ADDR",
-                    "expected": f"at least {offset + 16 + 2} bytes for IPv6 address+port",
-                },
-                hint="The SOCKS5 client sent an incomplete IPv6 address field.",
-            )
-        host = str(ipaddress.IPv6Address(data[offset : offset + 16]).compressed)
-        offset += 16
-
-    elif atyp == AddrType.DOMAIN:
-        if len(data) < offset + 1:
-            raise ProtocolError(
-                "SOCKS5 UDP DOMAIN datagram truncated before length byte.",
-                details={
-                    "socks5_field": "DST.ADDR.LEN",
-                    "expected": "at least 1 byte for domain length field",
-                },
-                hint="The SOCKS5 client sent a DOMAIN header with no length byte.",
-            )
-        dlen = data[offset]
-        offset += 1
-
-        if dlen == 0:
-            raise ProtocolError(
-                "SOCKS5 UDP DOMAIN address length must be greater than zero.",
-                details={
-                    "socks5_field": "DST.ADDR.LEN",
-                    "expected": "domain length ≥ 1 (RFC 1928 §7)",
-                },
-                hint=(
-                    "The SOCKS5 client sent a zero-length domain name, which "
-                    "violates RFC 1928 §7."
-                ),
-            )
-
-        if len(data) < offset + dlen + 2:
-            raise ProtocolError(
-                "SOCKS5 UDP DOMAIN datagram truncated before domain bytes+port.",
-                details={
-                    "socks5_field": "DST.ADDR",
-                    "expected": f"at least {offset + dlen + 2} bytes for domain+port",
-                },
-                hint="The SOCKS5 client sent a domain name shorter than its declared length.",
-            )
-
-        raw_domain = data[offset : offset + dlen]
-        try:
-            host = raw_domain.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ProtocolError(
-                "SOCKS5 UDP DOMAIN address bytes are not valid UTF-8.",
-                details={
-                    "socks5_field": "DST.ADDR",
-                    "raw_bytes": raw_domain.hex()[:128],
-                    "codec": "utf-8",
-                },
-                hint=(
-                    "The SOCKS5 client sent a domain name that cannot be decoded "
-                    "as UTF-8.  Only ASCII/UTF-8 hostnames are supported."
-                ),
-            ) from exc
-
-        validate_socks5_domain(host)
-        offset += dlen
-
-    else:
-        raise ProtocolError(
-            f"Unsupported SOCKS5 UDP address type: {atyp:#x}.",
-            details={
-                "socks5_field": "ATYP",
-                "expected": "ATYP 0x01 (IPv4), 0x03 (DOMAIN), or 0x04 (IPv6)",
-            },
-            hint=(
-                "Only ATYP 0x01 (IPv4), 0x03 (DOMAIN), and 0x04 (IPv6) are "
-                "supported per RFC 1928 §7."
-            ),
-        )
-
-    if len(data) < offset + 2:
-        raise ProtocolError(
-            "SOCKS5 UDP datagram truncated before port field.",
-            details={
-                "socks5_field": "DST.PORT",
-                "expected": f"at least {offset + 2} bytes for port field",
-            },
-            hint="The SOCKS5 client sent a datagram with no port field.",
-        )
-
-    port = struct.unpack("!H", data[offset : offset + 2])[0]
-    if port == 0:
-        raise ProtocolError(
-            "SOCKS5 UDP datagram destination port is 0.",
-            details={
-                "socks5_field": "DST.PORT",
-                "expected": "destination port in [1, 65535]",
-            },
-            hint="Port 0 is not a valid destination port in a SOCKS5 UDP datagram.",
-        )
-
-    payload = data[offset + 2 :]
+    # ATYP starts at offset 3; parse_socks5_addr_buf reads ATYP+addr+port.
+    host, port, end_offset = parse_socks5_addr_buf(
+        data, 3, context="SOCKS5 UDP", allow_port_zero=False
+    )
+    payload = data[end_offset:]
     return payload, host, port
+
+
+# ---------------------------------------------------------------------------
+# UDP reply header builder
+# ---------------------------------------------------------------------------
+
+
+def build_udp_header(atyp: AddrType, addr_packed: bytes, port: int) -> bytes:
+    """Build the SOCKS5 UDP reply header (RSV + FRAG + ATYP + ADDR + PORT).
+
+    Pre-computes the header bytes to avoid per-datagram allocation overhead
+    in :meth:`~exectunnel.proxy.udp_relay.UdpRelay.send_to_client`.
+
+    Args:
+        atyp:        :class:`~exectunnel.protocol.AddrType` enum member.
+        addr_packed: Packed address bytes (4 for IPv4, 16 for IPv6).
+        port:        Port number in ``[0, 65535]``.
+
+    Returns:
+        Header bytes ready for concatenation with the payload.
+    """
+    return (
+        b"\x00\x00\x00"
+        + bytes([int(atyp)])
+        + addr_packed
+        + struct.pack("!H", port)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -338,26 +399,19 @@ def build_socks5_reply(
 
     The default ``bind_host="0.0.0.0"`` and ``bind_port=0`` represent the
     "unspecified" address per RFC 1928 §6 convention and are appropriate for
-    error replies.  For success replies, callers should pass the actual bound
-    address — see :meth:`~exectunnel.proxy.request.Socks5Request.send_reply_success`
-    which defaults to ``"127.0.0.1"`` for the loopback tunnel use-case.
+    error replies.
 
     Args:
-        reply:     The SOCKS5 reply code as a
-                   :class:`~exectunnel.protocol.Reply` member.
+        reply:     The SOCKS5 reply code.
         bind_host: The ``BND.ADDR`` field.  Must be a valid IPv4 or IPv6
-                   address string — RFC 1928 §6 prohibits domain names in
-                   replies.  Defaults to ``"0.0.0.0"``.
+                   address string.  Defaults to ``"0.0.0.0"``.
         bind_port: The ``BND.PORT`` field.  Must be in ``[0, 65535]``.
-                   Defaults to ``0``.
 
     Returns:
-        A serialised SOCKS5 reply packet as :class:`bytes`.
+        A serialised SOCKS5 reply packet.
 
     Raises:
-        ConfigurationError:
-            * *bind_port* is outside ``[0, 65535]``.
-            * *bind_host* is not a valid IP address string.
+        ConfigurationError: Invalid *bind_port* or *bind_host*.
     """
     if not (0 <= bind_port <= 65_535):
         raise ConfigurationError(
