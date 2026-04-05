@@ -40,7 +40,7 @@ logger = logging.getLogger("exectunnel")
 class BridgeConfig:
     """Runtime tunables for the WebSocket bridge."""
 
-    ping_interval: int = WS_PING_INTERVAL_SECS
+    ping_interval: float = WS_PING_INTERVAL_SECS
     # Maximum time (seconds) to wait for a single ws.send() call.
     send_timeout: float = WS_SEND_TIMEOUT_SECS
     # Maximum number of frames queued for the outbound send loop.
@@ -93,6 +93,7 @@ class TunnelConfig:
     connect_max_pending_per_host: int = CONNECT_MAX_PENDING_PER_HOST
     # Pre-ACK send buffer cap in bytes (overridable via env).
     pre_ack_buffer_cap_bytes: int = PRE_ACK_BUFFER_CAP_BYTES
+    connect_pace_interval_secs: int = 3
 
 
 # Module-level default bridge config

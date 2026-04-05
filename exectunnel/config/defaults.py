@@ -21,9 +21,10 @@ __all__: list[
 # Application-level keepalive interval sent through _keepalive_loop.
 # The websockets built-in ping is disabled (ping_interval=None) because its
 # background task competes for the internal write lock under sustained load.
-# 30 s is the standard NAT/proxy idle timeout floor; most middleboxes close
-# idle TCP connections after 30–60 s.
-WS_PING_INTERVAL_SECS: float = 30.0
+# 20 s is well below the standard NAT/proxy idle timeout floor (30–60 s) and
+# gives a full 10 s of headroom before WS_SEND_TIMEOUT_SECS (30 s) fires,
+# preventing a slow ping send from spuriously triggering a tunnel teardown.
+WS_PING_INTERVAL_SECS: float = 20.0
 
 # Maximum time to wait for a single WebSocket frame send to complete.
 # Over a kubectl exec channel, a stalled send indicates a dead tunnel.
