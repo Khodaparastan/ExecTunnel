@@ -444,9 +444,6 @@ class TcpConnection:
                     pending,
                     extra={"conn_id": self._id},
                 )
-                # Schedule cleanup if not already scheduled.  _cleanup() is
-                # idempotent via _closed, so double-scheduling is safe but
-                # wasteful — the None guard prevents it.
                 if self._cleanup_task is None:
                     self._cleanup_task = asyncio.create_task(
                         self._cleanup(),
@@ -617,8 +614,10 @@ class TcpConnection:
         Idempotent — cancelling an already-done task is a no-op.
 
         Note:
-            This method is not part of :class:`~exectunnel.transport._types.TransportHandler`.
-            The session layer must type-narrow to ``TcpConnection`` before calling it.
+            This method is not part of
+            :class:`~exectunnel.transport._types.TransportHandler`.
+            The session layer must type-narrow to ``TcpConnection`` before
+            calling it.
         """
         if self._upstream_task is not None and not self._upstream_task.done():
             self._upstream_task.cancel()
@@ -632,8 +631,10 @@ class TcpConnection:
         Idempotent — cancelling an already-done task is a no-op.
 
         Note:
-            This method is not part of :class:`~exectunnel.transport._types.TransportHandler`.
-            The session layer must type-narrow to ``TcpConnection`` before calling it.
+            This method is not part of
+            :class:`~exectunnel.transport._types.TransportHandler`.
+            The session layer must type-narrow to ``TcpConnection`` before
+            calling it.
         """
         if self._downstream_task is not None and not self._downstream_task.done():
             self._downstream_task.cancel()
@@ -707,6 +708,19 @@ class TcpConnection:
         queue is empty, then writes EOF and exits.  This guarantees every byte
         the agent sent is delivered before the local socket is half-closed.
 
+        OSError / BrokenPipeError handling
+        -----------------------------------
+        Any ``OSError`` from ``writer.write()`` or ``writer.drain()`` means
+        the local socket is dead — the SOCKS5 client (e.g. aria2) has closed
+        its end.  There is no recovery: the task exits immediately via
+        ``return``.  This prevents the log storm that would otherwise occur
+        when the inbound queue still has items and the loop retries the dead
+        write on every iteration.
+
+        The ``_on_task_done`` callback detects the downstream exit and cancels
+        the upstream task, which sends ``CONN_CLOSE`` to the agent so the
+        agent-side socket is also torn down cleanly.
+
         Task reuse strategy
         -------------------
         The ``close_task`` (waiting on ``_remote_closed``) is created **once**
@@ -751,16 +765,22 @@ class TcpConnection:
                             for chunk in batch:
                                 self._bytes_downstream += len(chunk)
                         except OSError as exc:
+                            # Local socket is dead — no recovery possible.
+                            # Exit immediately to stop the log storm that would
+                            # occur if we continued looping over a dead writer.
+                            # _on_task_done will cancel upstream and send
+                            # CONN_CLOSE to the agent.
                             metrics_inc(
                                 "tcp.connection.downstream.error", error="os_drain"
                             )
                             logger.debug(
-                                "conn %s: downstream drain error: %s",
+                                "conn %s: downstream write error: %s — "
+                                "local socket closed, tearing down",
                                 self._id,
                                 exc,
-                                exc_info=True,
                                 extra={"conn_id": self._id},
                             )
+                            return
                         continue
 
                     # ── Queue empty — check close flag ────────────────────────
@@ -770,13 +790,17 @@ class TcpConnection:
                                 self._writer.write_eof()
                                 await self._writer.drain()
                             except OSError as exc:
+                                # Socket already dead — EOF not deliverable.
+                                # Exit cleanly; upstream will be cancelled by
+                                # _on_task_done.
                                 logger.debug(
-                                    "conn %s: downstream write_eof error: %s",
+                                    "conn %s: downstream write_eof error: %s — "
+                                    "local socket closed",
                                     self._id,
                                     exc,
-                                    exc_info=True,
                                     extra={"conn_id": self._id},
                                 )
+                                return
                         self._downstream_ended_cleanly = True
                         break
 
@@ -789,7 +813,7 @@ class TcpConnection:
                     )
 
                     try:
-                        done, pending = await asyncio.wait(
+                        done, _ = await asyncio.wait(
                             {get_task, close_task},
                             return_when=asyncio.FIRST_COMPLETED,
                         )
@@ -803,7 +827,7 @@ class TcpConnection:
 
                     # Cancel the get_task loser only — close_task is reused
                     # and must not be cancelled here.
-                    if get_task in pending:
+                    if get_task not in done:
                         get_task.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
                             await get_task
@@ -815,16 +839,20 @@ class TcpConnection:
                             await self._writer.drain()
                             self._bytes_downstream += len(chunk)
                         except OSError as exc:
+                            # Local socket is dead — no recovery possible.
+                            # Exit immediately; _on_task_done handles upstream
+                            # cancellation and CONN_CLOSE.
                             metrics_inc(
                                 "tcp.connection.downstream.error", error="os_drain"
                             )
                             logger.debug(
-                                "conn %s: downstream drain error: %s",
+                                "conn %s: downstream write error: %s — "
+                                "local socket closed, tearing down",
                                 self._id,
                                 exc,
-                                exc_info=True,
                                 extra={"conn_id": self._id},
                             )
+                            return
                     # If close_task fired (or both fired), loop back to the
                     # batch-drain path which will empty the queue before
                     # honouring the close flag.
@@ -840,7 +868,8 @@ class TcpConnection:
 
             finally:
                 # Always cancel the reused close_task on exit so it does not
-                # leak if _downstream exits via any path (clean, error, cancel).
+                # leak if _downstream exits via any path (clean, error, cancel,
+                # or early return on OSError).
                 if not close_task.done():
                     close_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
@@ -887,7 +916,8 @@ class TcpConnection:
             )
         except ConnectionClosedError as exc:
             logger.debug(
-                "conn %s: CONN_CLOSE skipped — connection already closed (error_id=%s)",
+                "conn %s: CONN_CLOSE skipped — connection already closed "
+                "(error_id=%s)",
                 self._id,
                 exc.error_id,
                 extra={"conn_id": self._id, "error_id": exc.error_id},
@@ -920,8 +950,13 @@ class TcpConnection:
         not cancelled), ``_downstream`` is kept alive so the remote server's
         response can still be delivered to the local client.
 
-        When ``_downstream`` exits (cleanly or otherwise), ``_upstream`` is
-        always cancelled — there is no more inbound data to relay.
+        When ``_downstream`` exits (cleanly or otherwise, including early
+        return on ``OSError``), ``_upstream`` is always cancelled — there is
+        no more inbound data to relay.  This is the path that fires when
+        aria2 closes its SOCKS5 connection mid-download: ``_downstream``
+        returns on ``BrokenPipeError``, this callback cancels ``_upstream``,
+        ``_upstream``'s ``finally`` sends ``CONN_CLOSE`` to the agent, and
+        the agent tears down its TCP connection to the CDN.
 
         When ``_upstream`` exits with an error or is cancelled, ``_downstream``
         is cancelled immediately.
@@ -939,7 +974,8 @@ class TcpConnection:
             if exc is not None:
                 if isinstance(exc, ExecTunnelError):
                     logger.debug(
-                        "conn %s task %s ended with library error [%s] (error_id=%s): %s",
+                        "conn %s task %s ended with library error [%s] "
+                        "(error_id=%s): %s",
                         self._id,
                         task.get_name(),
                         exc.error_code,
@@ -965,8 +1001,9 @@ class TcpConnection:
                 task_ended_cleanly and self._upstream_ended_cleanly
             )
         else:
-            # Downstream finished (cleanly or otherwise) → always cancel upstream.
-            # There is no more inbound data to relay.
+            # Downstream finished (cleanly, via error, or via early return on
+            # OSError) → always cancel upstream.  There is no more inbound
+            # data to relay.  Upstream's finally block sends CONN_CLOSE.
             should_cancel_peer = True
 
         if should_cancel_peer:
@@ -1032,10 +1069,8 @@ class TcpConnection:
         with contextlib.suppress(OSError, RuntimeError):
             self._writer.close()
         with contextlib.suppress(OSError, RuntimeError, asyncio.TimeoutError):
-            await asyncio.wait_for(
-                self._writer.wait_closed(),
-                timeout=_WRITER_CLOSE_TIMEOUT_SECS,
-            )
+            async with asyncio.timeout(_WRITER_CLOSE_TIMEOUT_SECS):
+                await self._writer.wait_closed()
 
         logger.debug(
             "conn %s cleaned up (bytes_up=%d, bytes_down=%d, drops=%d)",

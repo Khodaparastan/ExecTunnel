@@ -51,7 +51,7 @@ from exectunnel.protocol.frames import (
     parse_frame,
     parse_host_port,
 )
-from exectunnel.protocol.ids import new_conn_id, new_flow_id
+from exectunnel.protocol.ids import new_conn_id, new_flow_id,ID_RE
 
 __all__ = [
     # ── Frame constants ────────────────────────────────────────────────────
@@ -87,4 +87,5 @@ __all__ = [
     # ── ID generators ──────────────────────────────────────────────────────
     "new_conn_id",
     "new_flow_id",
+    "ID_RE",
 ]
