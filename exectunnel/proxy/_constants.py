@@ -28,7 +28,9 @@ DEFAULT_HANDSHAKE_TIMEOUT: float = 30.0
 DEFAULT_QUEUE_CAPACITY: int = 2_048
 
 # Log a warning every N drops to avoid log flooding on a saturated relay.
-DROP_WARN_INTERVAL: int = 100
+# 1,000 matches UDP_WARN_EVERY in defaults.py and _UDP_DROP_WARN_EVERY in the
+# agent for consistent log volume across all drop-counting paths.
+DROP_WARN_INTERVAL: int = 1_000
 
 # Maximum seconds to wait when enqueueing a completed handshake before
 # dropping the connection with a GENERAL_FAILURE reply.  Prevents indefinite
