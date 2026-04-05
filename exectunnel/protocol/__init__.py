@@ -11,7 +11,7 @@ protocol:
 * **Frame decoder** — ``parse_frame`` / ``is_ready_frame``
 * **Payload helpers** — ``decode_binary_payload``, ``decode_error_payload``,
   ``encode_host_port``, ``parse_host_port``
-* **ID generators** — ``new_conn_id``, ``new_flow_id``
+* **ID generators** — ``new_conn_id``, ``new_flow_id``, ``ID_RE``
 * **SOCKS5 enums** — ``AddrType``, ``AuthMethod``, ``Cmd``, ``Reply``,
   ``UserPassStatus``
 
@@ -51,7 +51,7 @@ from exectunnel.protocol.frames import (
     parse_frame,
     parse_host_port,
 )
-from exectunnel.protocol.ids import new_conn_id, new_flow_id,ID_RE
+from exectunnel.protocol.ids import ID_RE, new_conn_id, new_flow_id
 
 __all__ = [
     # ── Frame constants ────────────────────────────────────────────────────
@@ -88,4 +88,5 @@ __all__ = [
     "new_conn_id",
     "new_flow_id",
     "ID_RE",
+    "SESSION_CONN_ID",
 ]

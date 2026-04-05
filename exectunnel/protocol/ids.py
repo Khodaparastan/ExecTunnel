@@ -24,6 +24,7 @@ from typing import Final
 
 __all__ = [
     "ID_RE",
+    "SESSION_CONN_ID",
     "new_conn_id",
     "new_flow_id",
 ]
@@ -40,6 +41,11 @@ _TOKEN_BYTES: Final[int] = 12
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+# Session-level error sentinel: a valid conn_id-shaped value that is
+# deliberately outside the random space (all-zero token) so callers can
+# distinguish session-level errors from per-connection errors.
+SESSION_CONN_ID: Final[str] = _TCP_PREFIX + "0" * (_TOKEN_BYTES * 2)
+
 # Compiled pattern for validating conn_id / flow_id values.
 # re.ASCII ensures [0-9a-f] never matches Unicode digits on exotic builds.
 # Exported so that frames.py and the agent can share the same validator
@@ -54,7 +60,9 @@ def new_conn_id() -> str:
         A string of the form ``c<24 hex chars>``,
         e.g. ``ca1b2c3d4e5f6a7b8c9d0e1f2a3b``.
     """
-    return _TCP_PREFIX + secrets.token_hex(_TOKEN_BYTES)
+    result = _TCP_PREFIX + secrets.token_hex(_TOKEN_BYTES)
+    assert ID_RE.match(result), f"new_conn_id produced invalid ID: {result!r}"  # noqa: S101
+    return result
 
 
 def new_flow_id() -> str:
@@ -64,4 +72,6 @@ def new_flow_id() -> str:
         A string of the form ``u<24 hex chars>``,
         e.g. ``ua1b2c3d4e5f6a7b8c9d0e1f2a3b``.
     """
-    return _UDP_PREFIX + secrets.token_hex(_TOKEN_BYTES)
+    result = _UDP_PREFIX + secrets.token_hex(_TOKEN_BYTES)
+    assert ID_RE.match(result), f"new_flow_id produced invalid ID: {result!r}"  # noqa: S101
+    return result

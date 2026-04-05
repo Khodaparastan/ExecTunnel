@@ -52,7 +52,7 @@ from typing import Final
 
 from exectunnel.exceptions import FrameDecodingError, ProtocolError
 
-from .ids import ID_RE, _TCP_PREFIX, _TOKEN_BYTES
+from .ids import ID_RE, SESSION_CONN_ID as _SESSION_CONN_ID
 
 __all__ = [
     # ── Constants ──────────────────────────────────────────────────────────
@@ -94,8 +94,8 @@ READY_FRAME: Final[str] = "<<<EXECTUNNEL:AGENT_READY>>>"
 # Session-level error sentinel: a valid conn_id-shaped value that is
 # deliberately outside the random space (all-zero token) so callers can
 # distinguish session-level errors from per-connection errors.
-# Derived from ids constants so it stays consistent if the format ever changes.
-SESSION_CONN_ID: Final[str] = _TCP_PREFIX + "0" * (_TOKEN_BYTES * 2)
+# Defined in ids.py and re-exported here so the public surface is unchanged.
+SESSION_CONN_ID: Final[str] = _SESSION_CONN_ID
 
 # Maximum accepted frame length (characters, excluding the trailing newline).
 # Frames longer than this are rejected by parse_frame to guard against memory
@@ -175,6 +175,12 @@ def encode_host_port(host: str, port: int) -> str:
     * The port is validated to be in ``[1, 65535]``.
     * Domain names are checked for frame-unsafe characters and basic
       structural validity.
+
+    Note:
+        Port ``0`` is intentionally excluded here.  It is not a valid
+        destination port for OPEN frames.  ``build_socks5_reply`` in the
+        proxy layer accepts port ``0`` as the RFC 1928 §6 "unspecified"
+        sentinel for error replies — that is a separate, asymmetric use-case.
 
     Args:
         host: Destination hostname or IP address string.
@@ -323,12 +329,12 @@ class ParsedFrame:
 
     Attributes:
         msg_type: One of the frame type strings in ``_VALID_MSG_TYPES``.
-        conn_id:  Tunnel connection / flow ID, or ``""`` for ``AGENT_READY``.
+        conn_id:  Tunnel connection / flow ID, or ``None`` for ``AGENT_READY``.
         payload:  Frame payload string, or ``""`` when absent.
     """
 
     msg_type: str
-    conn_id: str
+    conn_id: str | None
     payload: str
 
 
@@ -358,7 +364,7 @@ def _encode_frame(msg_type: str, conn_id: str, payload: str = "") -> str:
     _validate_msg_type(msg_type)
 
     # AGENT_READY is the only frame that legitimately has no conn_id.
-    if conn_id:
+    if conn_id is not None and conn_id:
         _validate_id(conn_id, name=msg_type)
 
     # Guard against payload containing the frame suffix or prefix, which
@@ -590,6 +596,7 @@ def decode_error_payload(payload: str) -> str:
             },
         ) from exc
 
+
 def parse_frame(line: str) -> ParsedFrame | None:
     """Parse one line into a :class:`ParsedFrame` or return ``None``.
 
@@ -626,14 +633,26 @@ def parse_frame(line: str) -> ParsedFrame | None:
     """
     line = line.strip()
 
-    # Fast-path: oversized lines are never tunnel frames — drop silently.
-    if len(line) > MAX_FRAME_LEN:
-        log.debug("parse_frame: dropping oversized line (%d chars)", len(line))
+    # Check for tunnel frame markers BEFORE the length guard so that an
+    # oversized line that carries the prefix/suffix is treated as a protocol
+    # fault rather than silently discarded as noise.
+    is_tunnel_frame = line.startswith(FRAME_PREFIX) and line.endswith(FRAME_SUFFIX)
+
+    if not is_tunnel_frame:
+        # Not a tunnel frame at all (shell noise, blank lines, etc.).
+        if len(line) > MAX_FRAME_LEN:
+            log.debug("parse_frame: dropping oversized non-frame line (%d chars)", len(line))
         return None
 
-    # Fast-path: not a tunnel frame at all (shell noise, blank lines, etc.).
-    if not (line.startswith(FRAME_PREFIX) and line.endswith(FRAME_SUFFIX)):
-        return None
+    if len(line) > MAX_FRAME_LEN:
+        raise FrameDecodingError(
+            f"Oversized tunnel frame ({len(line)} chars, limit {MAX_FRAME_LEN}). "
+            "Possible memory-exhaustion or injection attempt.",
+            details={
+                "raw_bytes": line.encode("ascii", errors="replace").hex()[:128],
+                "codec": "frame",
+            },
+        )
 
     # ── From here on the line IS a tunnel frame — errors are protocol faults,
     #    not noise, and must be raised rather than silently dropped. ──────────
@@ -652,11 +671,13 @@ def parse_frame(line: str) -> ParsedFrame | None:
             },
         )
 
-    conn_id = parts[1] if len(parts) > 1 else ""
+    # AGENT_READY carries no conn_id; use None (not "") so callers cannot
+    # accidentally treat an absent ID as a valid empty string.
+    conn_id = parts[1] if len(parts) > 1 else None
     payload = parts[2] if len(parts) > 2 else ""
 
     # Validate conn_id format for frames that carry one.
-    if conn_id and not ID_RE.match(conn_id):
+    if conn_id is not None and not ID_RE.match(conn_id):
         raise FrameDecodingError(
             f"Tunnel frame has malformed conn_id {conn_id!r} "
             f"(msg_type={msg_type!r}).",
