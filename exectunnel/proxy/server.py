@@ -1,9 +1,8 @@
 """SOCKS5 server — async accept loop (RFC 1928, no-auth only).
 
 :class:`Socks5Server` binds a TCP listen socket, negotiates the SOCKS5
-handshake for each accepted connection, and enqueues completed
-:class:`~exectunnel.proxy.request.Socks5Request` objects for the session
-layer to consume via ``async for``.
+handshake for each accepted connection, and yields completed
+:class:`~exectunnel.proxy.request.Socks5Request` objects via ``async for``.
 
 Supported commands
 ------------------
@@ -24,7 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncIterator
 
 from exectunnel.exceptions import (
     ExecTunnelError,
@@ -34,23 +33,18 @@ from exectunnel.exceptions import (
 from exectunnel.protocol import AuthMethod, Cmd, Reply
 from exectunnel.proxy._io import (
     close_writer,
+    read_exact,
     read_socks5_addr,
     write_and_drain_silent,
 )
 from exectunnel.proxy._wire import build_socks5_reply
+from exectunnel.proxy.config import Socks5ServerConfig
 from exectunnel.proxy.request import Socks5Request
 from exectunnel.proxy.udp_relay import UdpRelay
 
 __all__: list[str] = ["Socks5Server"]
 
 logger = logging.getLogger(__name__)
-
-# Default SOCKS5 handshake timeout in seconds.
-# Callers that need a different value should pass it to the constructor.
-_DEFAULT_HANDSHAKE_TIMEOUT: float = 30.0
-
-# Addresses considered loopback — binding to anything else triggers a warning.
-_LOOPBACK_ADDRS: frozenset[str] = frozenset({"127.0.0.1", "::1", "localhost"})
 
 
 class Socks5Server:
@@ -66,7 +60,8 @@ class Socks5Server:
 
     Example — fire-and-forget handler::
 
-        server = Socks5Server("127.0.0.1", 1080)
+        cfg = Socks5ServerConfig(host="127.0.0.1", port=1080)
+        server = Socks5Server(cfg)
         await server.start()
         async for req in server:
             asyncio.create_task(handle(req))
@@ -74,28 +69,22 @@ class Socks5Server:
 
     Example — async context manager::
 
-        async with Socks5Server("127.0.0.1", 1080) as server:
+        async with Socks5Server(Socks5ServerConfig()) as server:
             async for req in server:
                 asyncio.create_task(handle(req))
 
     Args:
-        host:              Bind address.  Defaults to ``"127.0.0.1"``.
-        port:              Bind port.  Defaults to ``1080``.
-        handshake_timeout: Maximum seconds allowed for a single SOCKS5
-                           handshake.  Defaults to ``30.0``.
+        config: :class:`~exectunnel.proxy.config.Socks5ServerConfig` instance.
+                All bind parameters and timeouts are taken from here.
+                Defaults to ``Socks5ServerConfig()`` (127.0.0.1:1080).
     """
 
-    def __init__(
-        self,
-        host: str = "127.0.0.1",
-        port: int = 1080,
-        handshake_timeout: float = _DEFAULT_HANDSHAKE_TIMEOUT,
-    ) -> None:
-        self._host = host
-        self._port = port
-        self._handshake_timeout = handshake_timeout
+    def __init__(self, config: Socks5ServerConfig | None = None) -> None:
+        self._config = config if config is not None else Socks5ServerConfig()
 
-        self._queue: asyncio.Queue[Socks5Request | None] = asyncio.Queue()
+        self._queue: asyncio.Queue[Socks5Request | None] = asyncio.Queue(
+            self._config.queue_capacity
+        )
         self._server: asyncio.Server | None = None
         self._started: bool = False
         self._stopped: bool = False
@@ -120,35 +109,36 @@ class Socks5Server:
             )
         self._started = True
 
+        cfg = self._config
         try:
             self._server = await asyncio.start_server(
                 self._handle_client,
-                self._host,
-                self._port,
+                cfg.host,
+                cfg.port,
             )
         except OSError as exc:
             raise TransportError(
-                f"SOCKS5 server failed to bind on {self._host}:{self._port}.",
+                f"SOCKS5 server failed to bind on {cfg.host}:{cfg.port}.",
                 details={
-                    "host": self._host,
-                    "port": self._port,
-                    "url": f"tcp://{self._host}:{self._port}",
+                    "host": cfg.host,
+                    "port": cfg.port,
+                    "url": cfg.url,
                 },
                 hint=(
-                    f"Ensure port {self._port} is not already in use and that "
+                    f"Ensure port {cfg.port} is not already in use and that "
                     "the process has permission to bind on the requested address."
                 ),
             ) from exc
 
-        logger.info("SOCKS5 listening on %s:%d", self._host, self._port)
+        logger.info("SOCKS5 listening on %s:%d", cfg.host, cfg.port)
 
-        if self._host not in _LOOPBACK_ADDRS:
+        if not cfg.is_loopback:
             logger.warning(
                 "SOCKS5 server bound to non-loopback address %s:%d — "
                 "any network-reachable host can use this as an open proxy. "
                 "Bind to 127.0.0.1 unless public access is intentional.",
-                self._host,
-                self._port,
+                cfg.host,
+                cfg.port,
             )
 
     async def stop(self) -> None:
@@ -156,29 +146,43 @@ class Socks5Server:
 
         Safe to call before :meth:`start` — a no-op in that case.
         Idempotent — subsequent calls are no-ops.
+
+        Shutdown order:
+        1. Stop accepting new connections.
+        2. Cancel and await all in-flight handshake tasks (so their writers
+           are closed before the queue is drained).
+        3. Enqueue the ``None`` sentinel to stop the async iterator.
+        4. Drain and close any requests that were queued but never consumed.
+
+        Note on the ``_stopped`` / sentinel race: ``_stopped`` is set at the
+        top of this method.  The async iterator checks ``_stopped`` after
+        dequeuing each item, so a real request dequeued just as ``_stopped``
+        becomes ``True`` will be returned to the consumer but the iterator
+        will exit on the *next* iteration.  Requests that were never dequeued
+        are cleaned up by the drain loop below.
         """
         if self._stopped:
             return
         self._stopped = True
 
-        # Stop accepting new connections before cancelling existing handshakes.
+        # 1. Stop accepting new connections before cancelling existing handshakes.
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
 
-        # Cancel all in-flight handshake tasks and wait for them to finish so
-        # their writers are properly closed before we drain the queue.
+        # 2. Cancel all in-flight handshake tasks and wait for them to finish so
+        #    their writers are properly closed before we drain the queue.
         if self._handshake_tasks:
             for task in list(self._handshake_tasks):
                 task.cancel()
             await asyncio.gather(*self._handshake_tasks, return_exceptions=True)
             self._handshake_tasks.clear()
 
-        # Signal the async iterator to stop.
+        # 3. Signal the async iterator to stop.
         await self._queue.put(None)
 
-        # Drain any requests that were queued but never consumed.
-        while not self._queue.empty():
+        # 4. Drain any requests that were queued but never consumed.
+        while True:
             try:
                 req = self._queue.get_nowait()
             except asyncio.QueueEmpty:
@@ -197,10 +201,10 @@ class Socks5Server:
 
     # ── Async iteration ──────────────────────────────────────────────────────
 
-    def __aiter__(self) -> AsyncGenerator[Socks5Request, None]:
+    def __aiter__(self) -> AsyncIterator[Socks5Request]:
         return self._iter()
 
-    async def _iter(self) -> AsyncGenerator[Socks5Request, None]:
+    async def _iter(self) -> AsyncIterator[Socks5Request]:
         """Yield :class:`~exectunnel.proxy.request.Socks5Request` objects until
         :meth:`stop` is called."""
         while True:
@@ -227,10 +231,9 @@ class Socks5Server:
             self._handshake_tasks.add(task)
 
         try:
-            req = await asyncio.wait_for(
-                self._negotiate(reader, writer),
-                timeout=self._handshake_timeout,
-            )
+            async with asyncio.timeout(self._config.handshake_timeout):
+                req = await self._negotiate(reader, writer)
+
             if req is not None:
                 await self._queue.put(req)
                 logger.debug(
@@ -243,7 +246,7 @@ class Socks5Server:
         except TimeoutError:
             logger.warning(
                 "socks5 handshake timed out after %.1fs",
-                self._handshake_timeout,
+                self._config.handshake_timeout,
             )
             await close_writer(writer)
 
@@ -294,20 +297,26 @@ class Socks5Server:
 
     # ── SOCKS5 negotiation ───────────────────────────────────────────────────
 
-    @staticmethod
     async def _negotiate(
+        self,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> Socks5Request | None:
-        """Perform the full SOCKS5 handshake and return a :class:`~exectunnel.proxy.request.Socks5Request`.
+        """Perform the full SOCKS5 handshake and return a
+        :class:`~exectunnel.proxy.request.Socks5Request`.
 
-        Returns ``None`` when the command is valid but not supported (``BIND``)
-        — the appropriate SOCKS5 error reply has already been sent to the client.
+        Returns ``None`` when the command is ``BIND`` — the appropriate
+        SOCKS5 error reply has already been sent to the client.
 
         For ``UDP_ASSOCIATE``, the relay port is stored on
         ``Socks5Request.udp_relay.local_port``.  Callers **must** pass it as
-        ``bind_port`` to :meth:`~exectunnel.proxy.request.Socks5Request.send_reply_success`
-        so the SOCKS5 client knows which port to send datagrams to (RFC 1928 §7).
+        ``bind_port`` to
+        :meth:`~exectunnel.proxy.request.Socks5Request.send_reply_success`
+        so the SOCKS5 client knows which port to send datagrams to
+        (RFC 1928 §7).
+
+        If ``UdpRelay.start()`` raises, the relay is closed before the
+        exception propagates so no socket is leaked.
 
         Raises:
             ProtocolError:
@@ -321,17 +330,16 @@ class Socks5Server:
                   :func:`~exectunnel.proxy._io.read_socks5_addr`).
             TransportError:
                 UDP relay socket cannot be bound during ``UDP_ASSOCIATE``
-                (propagated from :meth:`~exectunnel.proxy.udp_relay.UdpRelay.start`).
+                (propagated from
+                :meth:`~exectunnel.proxy.udp_relay.UdpRelay.start`).
         """
         # ── Greeting: VER(1) + NMETHODS(1) + METHODS(N) ─────────────────────
-        from exectunnel._stream import read_exact  # local import — see _io.py
-
         header = await read_exact(reader, 2)
         if header[0] != 0x05:
             raise ProtocolError(
                 f"Not a SOCKS5 client: version byte is {header[0]:#x}, expected 0x05.",
                 details={
-                    "frame_type": "SOCKS5_GREETING",
+                    "socks5_field": "VER",
                     "expected": "version byte 0x05",
                 },
                 hint=(
@@ -348,7 +356,7 @@ class Socks5Server:
             raise ProtocolError(
                 "SOCKS5 greeting lists zero authentication methods.",
                 details={
-                    "frame_type": "SOCKS5_GREETING",
+                    "socks5_field": "NMETHODS",
                     "expected": "at least one authentication method",
                 },
                 hint="The SOCKS5 client sent a greeting with no authentication methods.",
@@ -363,8 +371,11 @@ class Socks5Server:
             raise ProtocolError(
                 "SOCKS5 client does not offer NO_AUTH (method 0x00).",
                 details={
-                    "frame_type": "SOCKS5_GREETING",
-                    "expected": f"method 0x{int(AuthMethod.NO_AUTH):02x} (NO_AUTH) in offered set",
+                    "socks5_field": "METHODS",
+                    "expected": (
+                        f"method 0x{int(AuthMethod.NO_AUTH):02x} (NO_AUTH) "
+                        "in offered set"
+                    ),
                 },
                 hint=(
                     "Configure the SOCKS5 client to use no-authentication mode. "
@@ -381,7 +392,7 @@ class Socks5Server:
             raise ProtocolError(
                 f"Bad SOCKS5 request version: {req_header[0]:#x}, expected 0x05.",
                 details={
-                    "frame_type": "SOCKS5_REQUEST",
+                    "socks5_field": "VER",
                     "expected": "version byte 0x05",
                 },
                 hint="The SOCKS5 client sent a malformed request header.",
@@ -394,10 +405,13 @@ class Socks5Server:
             raise ProtocolError(
                 f"SOCKS5 request RSV byte is {req_header[2]:#x}, expected 0x00.",
                 details={
-                    "frame_type": "SOCKS5_REQUEST",
+                    "socks5_field": "RSV",
                     "expected": "RSV byte 0x00 (RFC 1928 §4)",
                 },
-                hint="The SOCKS5 client sent a non-zero RSV byte, violating RFC 1928 §4.",
+                hint=(
+                    "The SOCKS5 client sent a non-zero RSV byte, "
+                    "violating RFC 1928 §4."
+                ),
             )
 
         try:
@@ -409,7 +423,7 @@ class Socks5Server:
             raise ProtocolError(
                 f"Unsupported SOCKS5 command: {req_header[1]:#x}.",
                 details={
-                    "frame_type": "SOCKS5_REQUEST",
+                    "socks5_field": "CMD",
                     "expected": "CMD 0x01 (CONNECT) or 0x03 (UDP_ASSOCIATE)",
                 },
                 hint=(
@@ -420,57 +434,67 @@ class Socks5Server:
 
         host, port = await read_socks5_addr(reader)
 
-        if cmd == Cmd.CONNECT:
-            return Socks5Request(
-                cmd=cmd,
-                host=host,
-                port=port,
-                reader=reader,
-                writer=writer,
-            )
+        match cmd:
+            case Cmd.CONNECT:
+                return Socks5Request(
+                    cmd=cmd,
+                    host=host,
+                    port=port,
+                    reader=reader,
+                    writer=writer,
+                )
 
-        if cmd == Cmd.UDP_ASSOCIATE:
-            # RFC 1928 §7: the host/port in the request is the client's
-            # declared sending address.  It may be 0.0.0.0:0 if the client
-            # does not know its sending address; UdpRelay.start() handles that.
-            relay = UdpRelay()
-            await relay.start(
-                expected_client_addr=(host, port) if port != 0 else None
-            )
-            return Socks5Request(
-                cmd=cmd,
-                host=host,
-                port=port,
-                reader=reader,
-                writer=writer,
-                udp_relay=relay,
-            )
+            case Cmd.UDP_ASSOCIATE:
+                # RFC 1928 §7: the host/port in the request is the client's
+                # declared sending address.  It may be 0.0.0.0:0 if the client
+                # does not know its sending address; UdpRelay.start() handles
+                # the unspecified-address case internally.
+                relay = UdpRelay(
+                    queue_capacity=self._config.queue_capacity,
+                    drop_warn_interval=self._config.udp_drop_warn_interval,
+                )
+                try:
+                    await relay.start(
+                        expected_client_addr=(host, port) if port != 0 else None
+                    )
+                except Exception:
+                    relay.close()
+                    raise
+                return Socks5Request(
+                    cmd=cmd,
+                    host=host,
+                    port=port,
+                    reader=reader,
+                    writer=writer,
+                    udp_relay=relay,
+                )
 
-        # BIND — known but explicitly unsupported.
-        if cmd == Cmd.BIND:
-            await write_and_drain_silent(
-                writer, build_socks5_reply(Reply.CMD_NOT_SUPPORTED)
-            )
-            logger.debug(
-                "socks5 BIND command rejected (not implemented) for %s:%d",
-                host,
-                port,
-            )
-            return None
+            case Cmd.BIND:
+                # Known but explicitly unsupported.
+                await write_and_drain_silent(
+                    writer, build_socks5_reply(Reply.CMD_NOT_SUPPORTED)
+                )
+                logger.debug(
+                    "socks5 BIND command rejected (not implemented) for %s:%d",
+                    host,
+                    port,
+                )
+                return None
 
-        # Exhaustive guard — unreachable given current Cmd enum coverage, but
-        # protects against future enum additions that miss a branch here.
-        await write_and_drain_silent(
-            writer, build_socks5_reply(Reply.CMD_NOT_SUPPORTED)
-        )
-        raise ProtocolError(
-            f"Unhandled SOCKS5 command: {cmd!r}.",
-            details={
-                "frame_type": "SOCKS5_REQUEST",
-                "expected": "handled Cmd enum member",
-            },
-            hint=(
-                "This is an exectunnel bug — a new Cmd enum value was added "
-                "without a corresponding handler in _negotiate()."
-            ),
-        )
+            case _:
+                # Exhaustive guard — unreachable given current Cmd enum coverage,
+                # but protects against future enum additions that miss a branch.
+                await write_and_drain_silent(
+                    writer, build_socks5_reply(Reply.CMD_NOT_SUPPORTED)
+                )
+                raise ProtocolError(
+                    f"Unhandled SOCKS5 command: {cmd!r}.",
+                    details={
+                        "socks5_field": "CMD",
+                        "expected": "handled Cmd enum member",
+                    },
+                    hint=(
+                        "This is an exectunnel bug — a new Cmd enum value was added "
+                        "without a corresponding handler in _negotiate()."
+                    ),
+                )

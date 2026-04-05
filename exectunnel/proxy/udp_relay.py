@@ -2,7 +2,8 @@
 
 :class:`UdpRelay` wraps a local UDP socket that the SOCKS5 client sends
 datagrams to.  It strips and adds SOCKS5 UDP headers (RFC 1928 §7) and
-exposes a simple ``recv`` / ``send_to_client`` interface to the session layer.
+exposes a simple :meth:`~UdpRelay.recv` / :meth:`~UdpRelay.send_to_client`
+interface to the session layer.
 
 Design notes
 ------------
@@ -26,18 +27,16 @@ import struct
 
 from exectunnel.exceptions import ProtocolError, TransportError
 from exectunnel.protocol import AddrType
-from exectunnel.proxy._wire import MAX_UDP_PAYLOAD_BYTES, parse_udp_header
+from exectunnel.proxy._constants import (
+    DEFAULT_QUEUE_CAPACITY,
+    DROP_WARN_INTERVAL,
+    MAX_UDP_PAYLOAD_BYTES,
+)
+from exectunnel.proxy._wire import parse_udp_header
 
 __all__: list[str] = ["UdpRelay"]
 
 logger = logging.getLogger(__name__)
-
-# Default capacity of the inbound datagram queue.
-# Callers that need a different capacity should pass it to the constructor.
-_DEFAULT_QUEUE_CAPACITY: int = 256
-
-# Log a warning every N drops to avoid log flooding.
-_DROP_WARN_INTERVAL: int = 100
 
 
 # ---------------------------------------------------------------------------
@@ -46,7 +45,8 @@ _DROP_WARN_INTERVAL: int = 100
 
 
 class _RelayDatagramProtocol(asyncio.DatagramProtocol):
-    """asyncio datagram protocol that forwards received datagrams to a :class:`UdpRelay`."""
+    """asyncio datagram protocol that forwards received datagrams to a
+    :class:`UdpRelay`."""
 
     __slots__ = ("_relay",)
 
@@ -97,17 +97,19 @@ class UdpRelay:
             # … relay data …
 
     Args:
-        queue_capacity: Maximum number of inbound datagrams to buffer before
-                        dropping.  Defaults to ``256``.
-        drop_warn_interval: Log a warning every *N* queue-full drops to avoid
-                            log flooding.  Defaults to ``100``.
+        queue_capacity:      Maximum number of inbound datagrams to buffer
+                             before dropping.  Defaults to
+                             :data:`~exectunnel.proxy._constants.DEFAULT_QUEUE_CAPACITY`.
+        drop_warn_interval:  Log a warning every *N* queue-full drops to avoid
+                             log flooding.  Defaults to
+                             :data:`~exectunnel.proxy._constants.DROP_WARN_INTERVAL`.
     """
 
     def __init__(
         self,
         *,
-        queue_capacity: int = _DEFAULT_QUEUE_CAPACITY,
-        drop_warn_interval: int = _DROP_WARN_INTERVAL,
+        queue_capacity: int = DEFAULT_QUEUE_CAPACITY,
+        drop_warn_interval: int = DROP_WARN_INTERVAL,
     ) -> None:
         self._queue_capacity = queue_capacity
         self._drop_warn_interval = drop_warn_interval
@@ -160,6 +162,7 @@ class UdpRelay:
                 address (``0.0.0.0`` / ``::``) and the port is non-zero,
                 datagrams from other addresses are rejected immediately rather
                 than waiting for the first datagram to bind the client address.
+                A malformed hint host is silently ignored (logged at DEBUG).
 
         Returns:
             The ephemeral port the relay is bound to on ``127.0.0.1``.
@@ -188,6 +191,11 @@ class UdpRelay:
                 hint_addr = ipaddress.ip_address(hint_host)
                 is_unspecified = hint_addr.is_unspecified
             except ValueError:
+                # Malformed hint (e.g. domain name) — ignore silently.
+                logger.debug(
+                    "udp relay: ignoring malformed expected_client_addr host %r",
+                    hint_host,
+                )
                 is_unspecified = True
             if not is_unspecified and hint_port != 0:
                 self._expected_client_addr = expected_client_addr
@@ -365,8 +373,8 @@ class UdpRelay:
             been closed and the queue is fully drained.
 
         Raises:
-            RuntimeError:            If called before :meth:`start`.
-            asyncio.CancelledError:  Propagated as-is — never suppressed.
+            RuntimeError:           If called before :meth:`start`.
+            asyncio.CancelledError: Propagated as-is — never suppressed.
         """
         if self._queue is None or self._close_event is None:
             raise RuntimeError(
@@ -384,20 +392,18 @@ class UdpRelay:
         if self._close_event.is_set():
             return None
 
-        # Race the queue against the close event using a single gather with
-        # shield so we avoid creating two tasks on every hot-path call.
+        # Race the queue against the close event using asyncio.create_task()
+        # (asyncio.ensure_future is deprecated since Python 3.10).
         queue_task: asyncio.Task[tuple[bytes, str, int]] = asyncio.create_task(
             self._queue.get(),
-            name=f"udp-relay-recv-{self._local_port}",
         )
         close_task: asyncio.Task[None] = asyncio.create_task(
             self._close_event.wait(),
-            name=f"udp-relay-close-{self._local_port}",
         )
 
         try:
             done, pending = await asyncio.wait(
-                {queue_task, close_task},
+                [queue_task, close_task],
                 return_when=asyncio.FIRST_COMPLETED,
             )
         except asyncio.CancelledError:
@@ -409,10 +415,12 @@ class UdpRelay:
                 await close_task
             raise
 
-        # Cancel the loser task.
+        # Cancel the loser — but harvest its result first if it already finished
+        # to avoid discarding a datagram that arrived in the same scheduler tick.
         for task in pending:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            if not task.done():
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.InvalidStateError):
                 await task
 
         # queue_task won — return the item.
@@ -421,10 +429,10 @@ class UdpRelay:
 
         # close_task won — drain one final time to avoid losing the last item
         # if a datagram arrived between the close signal and task cancellation.
-        with contextlib.suppress(asyncio.QueueEmpty):
+        try:
             return self._queue.get_nowait()
-
-        return None
+        except asyncio.QueueEmpty:
+            return None
 
     # ── Outbound path (session layer → client) ───────────────────────────────
 
@@ -446,13 +454,14 @@ class UdpRelay:
             ProtocolError:
                 * *payload* is not :class:`bytes`.
                 * *src_port* is outside ``[0, 65535]``.
+                These are caller bugs in the session layer.
         """
         if not isinstance(payload, bytes):
             raise ProtocolError(
                 f"send_to_client() requires a bytes payload, "
                 f"got {type(payload).__name__!r}.",
                 details={
-                    "frame_type": "UDP_DATA",
+                    "socks5_field": "DATA",
                     "expected": "bytes payload",
                 },
                 hint="This is a caller bug in the session layer.",
@@ -462,7 +471,7 @@ class UdpRelay:
             raise ProtocolError(
                 f"send_to_client() src_port {src_port!r} is out of range [0, 65535].",
                 details={
-                    "frame_type": "UDP_DATA",
+                    "socks5_field": "SRC.PORT",
                     "expected": "src_port in [0, 65535]",
                 },
                 hint="This is a caller bug in the session layer.",
@@ -509,7 +518,8 @@ class UdpRelay:
 
     @property
     def is_running(self) -> bool:
-        """``True`` once :meth:`start` has completed and before :meth:`close` is called."""
+        """``True`` once :meth:`start` has completed and before :meth:`close`
+        is called."""
         return (
             self._started
             and not self._closed
@@ -529,5 +539,6 @@ class UdpRelay:
 
     @property
     def foreign_client_count(self) -> int:
-        """Total datagrams dropped because they arrived from an unexpected client address."""
+        """Total datagrams dropped because they arrived from an unexpected
+        client address."""
         return self._foreign_client_count

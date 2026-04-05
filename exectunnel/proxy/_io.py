@@ -3,8 +3,13 @@
 Separated from :mod:`exectunnel.proxy._wire` so that the wire module remains
 purely synchronous and side-effect free.  Only this module performs stream I/O.
 
+:func:`read_exact` is defined here and is the single authorised implementation
+for exact-length stream reads within the proxy layer.  It is re-exported so
+that :mod:`exectunnel.proxy.server` can import it from one place.
+
 Public surface (package-internal only — not re-exported from ``__init__.py``)
 ------------------------------------------------------------------------------
+* :func:`read_exact`             — read exactly *n* bytes from an asyncio stream.
 * :func:`read_socks5_addr`       — read ATYP+addr+port from an asyncio stream.
 * :func:`close_writer`           — close a StreamWriter, suppressing OS errors.
 * :func:`write_and_drain_silent` — best-effort write+drain for error replies.
@@ -23,15 +28,41 @@ from exectunnel.proxy._wire import validate_socks5_domain
 
 __all__: list[str] = [
     "close_writer",
+    "read_exact",
     "read_socks5_addr",
     "write_and_drain_silent",
 ]
 
-# ---------------------------------------------------------------------------
-# Stream reader helper — imported from the internal stream module.
-# This is the single authorised import of _stream inside the proxy layer.
-# ---------------------------------------------------------------------------
-from exectunnel._stream import read_exact  # noqa: E402  (after __all__)
+
+async def read_exact(reader: asyncio.StreamReader, n: int) -> bytes:
+    """Read exactly *n* bytes from *reader*.
+
+    Args:
+        reader: The asyncio stream reader.
+        n:      Number of bytes to read.  Must be ≥ 1.
+
+    Returns:
+        Exactly *n* bytes.
+
+    Raises:
+        ProtocolError: If the stream is closed before *n* bytes are available
+                       (i.e. ``readexactly`` raises ``asyncio.IncompleteReadError``).
+    """
+    try:
+        return await reader.readexactly(n)
+    except asyncio.IncompleteReadError as exc:
+        raise ProtocolError(
+            f"SOCKS5 stream closed after {len(exc.partial)} byte(s); "
+            f"expected {n} byte(s).",
+            details={
+                "socks5_field": "stream",
+                "expected": f"{n} bytes",
+            },
+            hint=(
+                "The SOCKS5 client closed the connection mid-handshake. "
+                "This is usually benign — the client disconnected early."
+            ),
+        ) from exc
 
 
 async def read_socks5_addr(reader: asyncio.StreamReader) -> tuple[str, int]:
@@ -57,8 +88,8 @@ async def read_socks5_addr(reader: asyncio.StreamReader) -> tuple[str, int]:
             * Domain fails RFC 1123 / safety validation.
             * Domain bytes are not valid UTF-8.
             * Port is zero.
-        ProtocolError (via :func:`~exectunnel._stream.read_exact`):
-            Stream truncated at any point during the read.
+            * Stream truncated at any point during the read (via
+              :func:`read_exact`).
     """
     atyp_byte = await read_exact(reader, 1)
     atyp = atyp_byte[0]
@@ -78,7 +109,7 @@ async def read_socks5_addr(reader: asyncio.StreamReader) -> tuple[str, int]:
             raise ProtocolError(
                 "SOCKS5 DOMAIN address length must be greater than zero.",
                 details={
-                    "frame_type": "DOMAIN",
+                    "socks5_field": "DST.ADDR.LEN",
                     "expected": "domain length ≥ 1 (RFC 1928 §5)",
                 },
                 hint=(
@@ -93,6 +124,7 @@ async def read_socks5_addr(reader: asyncio.StreamReader) -> tuple[str, int]:
             raise ProtocolError(
                 "SOCKS5 DOMAIN address bytes are not valid UTF-8.",
                 details={
+                    "socks5_field": "DST.ADDR",
                     "raw_bytes": raw_host.hex()[:128],
                     "codec": "utf-8",
                 },
@@ -107,7 +139,7 @@ async def read_socks5_addr(reader: asyncio.StreamReader) -> tuple[str, int]:
         raise ProtocolError(
             f"Unsupported SOCKS5 address type: {atyp:#x}.",
             details={
-                "frame_type": "DOMAIN",
+                "socks5_field": "ATYP",
                 "expected": "ATYP 0x01 (IPv4), 0x03 (DOMAIN), or 0x04 (IPv6)",
             },
             hint=(
@@ -123,7 +155,7 @@ async def read_socks5_addr(reader: asyncio.StreamReader) -> tuple[str, int]:
         raise ProtocolError(
             f"SOCKS5 request destination port is 0 for host {host!r}.",
             details={
-                "frame_type": "DOMAIN",
+                "socks5_field": "DST.PORT",
                 "expected": "destination port in [1, 65535]",
             },
             hint="Port 0 is not a valid destination port in a SOCKS5 request.",
@@ -133,15 +165,18 @@ async def read_socks5_addr(reader: asyncio.StreamReader) -> tuple[str, int]:
 
 
 async def close_writer(writer: asyncio.StreamWriter) -> None:
-    """Close *writer*, suppressing ``OSError`` and ``RuntimeError``.
+    """Close *writer*, suppressing ``OSError``.
 
     Centralised so the identical close pattern is not repeated in every
     ``except`` branch of the server's connection handler.
 
+    ``RuntimeError`` is intentionally **not** suppressed — it indicates a
+    closed event loop or other abnormal condition that must propagate.
+
     Args:
         writer: The asyncio stream writer to close.
     """
-    with contextlib.suppress(OSError, RuntimeError):
+    with contextlib.suppress(OSError):
         writer.close()
         await writer.wait_closed()
 
@@ -150,15 +185,18 @@ async def write_and_drain_silent(
     writer: asyncio.StreamWriter,
     data: bytes,
 ) -> None:
-    """Write *data* and drain, suppressing ``OSError`` and ``RuntimeError``.
+    """Write *data* and drain, suppressing ``OSError``.
 
     Used for best-effort error-reply writes inside the SOCKS5 negotiation
     where the connection may already be half-closed.
+
+    ``RuntimeError`` is intentionally **not** suppressed — it indicates a
+    closed event loop or other abnormal condition that must propagate.
 
     Args:
         writer: The asyncio stream writer to write to.
         data:   Raw bytes to write.
     """
-    with contextlib.suppress(OSError, RuntimeError):
+    with contextlib.suppress(OSError):
         writer.write(data)
         await writer.drain()
