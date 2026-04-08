@@ -38,7 +38,7 @@ client-side ``encode_data_frame`` / ``decode_binary_payload`` helpers.
 
 Design notes
 ------------
-* Self-contained — no third-party deps; runs on any bare Python 3.13+ pod.
+* Self-contained — no third-party deps; runs on any bare Python 3.11+ pod.
 * TCP and UDP workers use threads with a self-pipe to avoid blocking the
   stdin-reader thread.
 * All TCP sends use a per-chunk write loop with ``select``-based blocking so
@@ -80,16 +80,26 @@ Protocol alignment
 
 from __future__ import annotations
 
+import sys
+
+# ── Python version guard ──────────────────────────────────────────────────────
+# match/case requires 3.10+; datetime.UTC requires 3.11+.
+if sys.version_info < (3, 11):
+    sys.stderr.write(
+        f"exectunnel agent requires Python 3.11+, got {sys.version}\n"
+    )
+    sys.exit(1)
+
 import base64
 import binascii
 import contextlib
 import errno
 import os
 import queue
+import re as _re
 import select
 import signal
 import socket
-import sys
 import termios
 import threading
 import time
@@ -168,6 +178,19 @@ _WRITER_JOIN_TIMEOUT_SECS: float = 5.0
 
 # How long to wait for the remote to close after SHUT_WR (half-close).
 _HALF_CLOSE_DEADLINE_SECS: float = 30.0
+
+# select() timeout used in _send_all_nonblocking() while waiting for a slow
+# remote TCP peer to become writable.  5 s is generous but bounded.
+_SEND_WRITABLE_TIMEOUT_SECS: float = 5.0
+
+# Maximum inbound frame length accepted by dispatch() — mirrors the client-side
+# MAX_FRAME_LEN constant in protocol/frames.py.  Frames longer than this are
+# silently dropped to prevent unbounded memory allocation.
+_MAX_INBOUND_FRAME_LEN: int = 8_192
+
+# Regex pattern for valid connection / flow IDs — mirrors the client-side
+# ID_RE = r"[cu][0-9a-f]{24}" in protocol/ids.py.
+_ID_RE: _re.Pattern[str] = _re.compile(r"^[cu][0-9a-f]{24}$")
 
 
 # ── SIGPIPE handler ───────────────────────────────────────────────────────────
@@ -545,7 +568,7 @@ def _send_all_nonblocking(sock: socket.socket, data: bytes) -> bool:
                 return False
             offset += sent
         except BlockingIOError:
-            _, writable, _ = select.select([], [sock], [], 5.0)
+            _, writable, _ = select.select([], [sock], [], _SEND_WRITABLE_TIMEOUT_SECS)
             if not writable:
                 return False
         except OSError:
@@ -925,6 +948,9 @@ class UdpFlowWorker:
 
     def _io_loop(self, sock: socket.socket, fid: str) -> None:
         """Main select loop — runs until ``_closed`` is set and pending sends drain."""
+        # Note: datagrams enqueued via feed() after _closed is set but before
+        # the loop checks the flag are silently dropped.  This is intentional
+        # — UDP is best-effort and draining on close is not required.
         while not self._closed:
             readable, _, errored = select.select(
                 [sock, self._notify_r], [], [sock], _SELECT_TIMEOUT_SECS
@@ -986,6 +1012,9 @@ class _Dispatcher:
 
     def dispatch(self, line: str) -> None:
         """Parse and dispatch one raw frame line."""
+        if len(line) > _MAX_INBOUND_FRAME_LEN:
+            _log("debug", "oversized frame dropped (%d chars)", len(line))
+            return
         if not (line.startswith(_FRAME_PREFIX) and line.endswith(_FRAME_SUFFIX)):
             return
 
@@ -1016,6 +1045,9 @@ class _Dispatcher:
         if len(parts) < 2:
             return
         cid = parts[1]
+        if not _ID_RE.match(cid):
+            _log("debug", "CONN_OPEN invalid conn_id format: %r", cid)
+            return
 
         with self._conn_lock:
             if cid in self._conn_map:
@@ -1049,6 +1081,14 @@ class _Dispatcher:
 
         worker = TcpConnectionWorker(cid, host, port, on_close=on_close)
         with self._conn_lock:
+            # Re-check inside the lock to close the window between the earlier
+            # duplicate check and this insert.  The dispatcher is single-
+            # threaded so this cannot race in practice, but the pattern is
+            # correct if concurrency is ever introduced.
+            if cid in self._conn_map:
+                _log("debug", "duplicate CONN_OPEN for %s (late check) — sending ERROR", cid)
+                _emit_ctrl(_make_error_frame(cid, "duplicate CONN_OPEN"))
+                return
             self._conn_map[cid] = worker
         worker.start()
 
@@ -1081,6 +1121,9 @@ class _Dispatcher:
         if len(parts) < 3:
             return
         fid = parts[1]
+        if not _ID_RE.match(fid):
+            _log("debug", "UDP_OPEN invalid flow_id format: %r", fid)
+            return
 
         with self._udp_lock:
             if fid in self._udp_map:
@@ -1171,7 +1214,8 @@ def main() -> None:
     try:
         _Dispatcher(fixed_host, fixed_port).run()
     finally:
-        _writer.stop()
+        if _writer is not None:
+            _writer.stop()
 
 
 if __name__ == "__main__":
