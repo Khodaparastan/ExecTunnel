@@ -141,7 +141,10 @@ _STDOUT_DATA_QUEUE_BACKPRESSURE_THRESHOLD: int = int(
 _WRITER_DATA_BATCH_SIZE: int = 64
 
 # TCP connect timeout in seconds.
-_TCP_CONNECT_TIMEOUT_SECS: float = 28.0
+# Must be shorter than the client-side CONN_ACK_TIMEOUT_SECS (10 s) so the
+# agent fails first and emits CONN_ERR before the client gives up waiting.
+# 8 s = 10 s - 2 s tunnel RTT budget, leaving time for CONN_ERR to arrive.
+_TCP_CONNECT_TIMEOUT_SECS: float = 8.0
 
 # TCP receive chunk size in bytes.
 _TCP_RECV_CHUNK_BYTES: int = 4_096
@@ -150,7 +153,9 @@ _TCP_RECV_CHUNK_BYTES: int = 4_096
 _MAX_UDP_DGRAM_BYTES: int = 65_535
 
 # Log a UDP drop warning every N drops.
-_UDP_DROP_WARN_EVERY: int = 100
+# 1,000 matches the client-side UDP_WARN_EVERY / DROP_WARN_INTERVAL policy
+# for consistent log volume across all drop-counting paths.
+_UDP_DROP_WARN_EVERY: int = 1_000
 
 # select() timeout — 10 ms balances interactive latency vs CPU overhead.
 _SELECT_TIMEOUT_SECS: float = 0.01
