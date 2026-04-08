@@ -142,7 +142,7 @@ class UserPassStatus(IntEnum):
     FAILURE = 0xFF
 
     @classmethod
-    def _missing_(cls, value: object) -> "UserPassStatus":
+    def _missing_(cls, value: object) -> UserPassStatus:
         # RFC 1929 §2: any non-zero value means failure.
         if isinstance(value, int) and 0x01 <= value <= 0xFE:
             return cls.FAILURE

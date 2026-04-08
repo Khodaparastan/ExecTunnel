@@ -166,7 +166,7 @@ METRICS = MetricsRegistry()
 # Listeners are called synchronously inside metrics_inc() after the counter
 # is incremented.  Keep listeners fast — no I/O, no blocking.
 
-from typing import Callable as _Callable  # noqa: E402
+from collections.abc import Callable as _Callable  # noqa: E402
 
 _listeners: list[_Callable[..., None]] = []
 
