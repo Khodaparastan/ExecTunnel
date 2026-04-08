@@ -44,7 +44,6 @@ from exectunnel.transport import TcpConnection, UdpFlow
 
 from ._state import AckStatus, PendingConnect
 
-__all__: list[str] = []  # internal module
 
 logger = logging.getLogger(__name__)
 

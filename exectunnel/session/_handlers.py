@@ -43,7 +43,6 @@ from ._payload import make_udp_socket
 from ._routing import is_host_excluded
 from ._state import AckStatus, PendingConnect
 
-__all__: list[str] = []  # internal module
 
 logger = logging.getLogger(__name__)
 

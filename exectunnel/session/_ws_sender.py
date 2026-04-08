@@ -31,7 +31,6 @@ from exectunnel.exceptions import (
 from exectunnel.observability import metrics_inc
 from exectunnel.protocol import FRAME_PREFIX, FRAME_SUFFIX
 
-__all__: list[str] = []  # internal module
 
 logger = logging.getLogger(__name__)
 

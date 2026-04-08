@@ -14,7 +14,6 @@ import socket
 
 from exectunnel.exceptions import ConfigurationError
 
-__all__: list[str] = []  # internal module — nothing exported
 
 
 @functools.lru_cache(maxsize=1)

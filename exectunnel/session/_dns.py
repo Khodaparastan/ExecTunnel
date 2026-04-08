@@ -26,7 +26,6 @@ from exectunnel.observability import metrics_inc, metrics_observe
 from exectunnel.protocol import new_flow_id
 from exectunnel.transport import UdpFlow, WsSendCallable
 
-__all__: list[str] = []  # internal module
 
 logger = logging.getLogger(__name__)
 
