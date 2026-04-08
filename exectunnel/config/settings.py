@@ -14,6 +14,9 @@ from exectunnel.config.defaults import (
     ACK_TIMEOUT_RECONNECT_THRESHOLD,
     ACK_TIMEOUT_WARN_EVERY,
     ACK_TIMEOUT_WINDOW_SECS,
+    BOOTSTRAP_AGENT_PATH,
+    BOOTSTRAP_GITHUB_AGENT_URL,
+    BOOTSTRAP_SYNTAX_OK_SENTINEL,
     CONN_ACK_TIMEOUT_SECS,
     CONNECT_MAX_PENDING,
     CONNECT_MAX_PENDING_PER_HOST,
@@ -95,6 +98,24 @@ class TunnelConfig:
     # Pre-ACK send buffer cap in bytes (overridable via env).
     pre_ack_buffer_cap_bytes: int = PRE_ACK_BUFFER_CAP_BYTES
     connect_pace_interval_secs: int = 3
+    # How the agent payload is delivered to the remote pod.
+    # "upload"  — encode and upload agent.py via printf chunks (default).
+    # "github"  — fetch agent.py from a raw GitHub URL using curl/wget.
+    bootstrap_delivery: str = "upload"
+    # Raw URL used when bootstrap_delivery="github".
+    github_agent_url: str = BOOTSTRAP_GITHUB_AGENT_URL
+    # If True and the agent file already exists on the pod, skip delivery
+    # (regardless of bootstrap_delivery mode) and go straight to exec.
+    # If False and the agent file exists, remove it and re-deliver.
+    bootstrap_skip_if_present: bool = False
+    # If True, run `python3 -m py_compile` on the agent before exec'ing it.
+    # When skip_if_present=True and the syntax-OK sentinel file is present
+    # on the pod, the syntax check is also skipped (cached result).
+    bootstrap_syntax_check: bool = True
+    # Path of the agent script inside the pod.
+    bootstrap_agent_path: str = BOOTSTRAP_AGENT_PATH
+    # Path of the syntax-OK sentinel file inside the pod.
+    bootstrap_syntax_ok_sentinel: str = BOOTSTRAP_SYNTAX_OK_SENTINEL
 
 
 # Module-level default bridge config
@@ -177,6 +198,12 @@ def get_tunnel_config(
     ready_timeout: float = TUNNEL_CONFIG.ready_timeout,
     conn_ack_timeout: float = TUNNEL_CONFIG.conn_ack_timeout,
     exclude: list[ipaddress.IPv4Network | ipaddress.IPv6Network] | None = None,
+    bootstrap_delivery: str = TUNNEL_CONFIG.bootstrap_delivery,
+    github_agent_url: str = TUNNEL_CONFIG.github_agent_url,
+    bootstrap_skip_if_present: bool = TUNNEL_CONFIG.bootstrap_skip_if_present,
+    bootstrap_syntax_check: bool = TUNNEL_CONFIG.bootstrap_syntax_check,
+    bootstrap_agent_path: str = TUNNEL_CONFIG.bootstrap_agent_path,
+    bootstrap_syntax_ok_sentinel: str = TUNNEL_CONFIG.bootstrap_syntax_ok_sentinel,
 ) -> TunnelConfig:
     """Build TunnelConfig, merging CLI args with environment overrides."""
     return TunnelConfig(
@@ -216,6 +243,22 @@ def get_tunnel_config(
             "EXECTUNNEL_PRE_ACK_BUFFER_CAP_BYTES",
             TUNNEL_CONFIG.pre_ack_buffer_cap_bytes,
             min_value=1024,
+        ),
+        bootstrap_delivery=os.getenv("EXECTUNNEL_BOOTSTRAP_DELIVERY", bootstrap_delivery),
+        github_agent_url=os.getenv("EXECTUNNEL_GITHUB_AGENT_URL", github_agent_url),
+        bootstrap_skip_if_present=parse_bool_env(
+            "EXECTUNNEL_BOOTSTRAP_SKIP_IF_PRESENT",
+            default=bootstrap_skip_if_present,
+        ),
+        bootstrap_syntax_check=parse_bool_env(
+            "EXECTUNNEL_BOOTSTRAP_SYNTAX_CHECK",
+            default=bootstrap_syntax_check,
+        ),
+        bootstrap_agent_path=os.getenv(
+            "EXECTUNNEL_BOOTSTRAP_AGENT_PATH", bootstrap_agent_path
+        ),
+        bootstrap_syntax_ok_sentinel=os.getenv(
+            "EXECTUNNEL_BOOTSTRAP_SYNTAX_OK_SENTINEL", bootstrap_syntax_ok_sentinel
         ),
     )
 

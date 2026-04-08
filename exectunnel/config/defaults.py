@@ -173,6 +173,29 @@ BOOTSTRAP_DIAG_MAX_LINES: int = 20
 # and avoids splitting multi-byte sequences in the base64 alphabet.
 BOOTSTRAP_CHUNK_SIZE_CHARS: int = 200
 
+# Default GitHub raw URL used to fetch the agent when bootstrap_delivery="github".
+# Points to the main branch of the canonical repository.  Override via
+# EXECTUNNEL_GITHUB_AGENT_URL to pin a specific commit or use a fork.
+BOOTSTRAP_GITHUB_AGENT_URL: str = (
+    "https://raw.githubusercontent.com/Khodaparastan/ExecTunnel/refs/heads/main/exectunnel/payload/agent.py"
+)
+
+# Fixed sleep after the curl/wget fetch command to allow the download to
+# complete before the syntax check reads the output file.  10 s is generous
+# for a ~50 KiB file over a typical cluster egress path (1–5 Mbit/s).
+# Increase via EXECTUNNEL_BOOTSTRAP_GITHUB_FETCH_DELAY if the pod's egress
+# is unusually slow.
+BOOTSTRAP_GITHUB_FETCH_DELAY_SECS: float = 10.0
+
+# Path of the sentinel file written inside the pod after a successful syntax
+# check.  When bootstrap_skip_if_present=True and bootstrap_syntax_check=True,
+# the bootstrapper checks for this file before running the syntax check again.
+# Avoids re-parsing a large agent script on every reconnect.
+BOOTSTRAP_SYNTAX_OK_SENTINEL: str = "/tmp/exectunnel_agent.syntax_ok"
+
+# Path of the agent script inside the pod.
+BOOTSTRAP_AGENT_PATH: str = "/tmp/exectunnel_agent.py"
+
 # TCP read chunk size for upstream copy and direct pipe.
 # 4 KiB is the standard Linux socket buffer quantum and matches the typical
 # TLS record size, minimising partial-record reads.
