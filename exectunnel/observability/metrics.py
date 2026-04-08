@@ -162,9 +162,32 @@ class MetricsRegistry:
 
 METRICS = MetricsRegistry()
 
+# ── Metric listeners ─────────────────────────────────────────────────────────
+# Listeners are called synchronously inside metrics_inc() after the counter
+# is incremented.  Keep listeners fast — no I/O, no blocking.
+
+from typing import Callable as _Callable  # noqa: E402
+
+_listeners: list[_Callable[..., None]] = []
+
+
+def register_metric_listener(fn: _Callable[..., None]) -> None:
+    """Register a callback invoked on every ``metrics_inc()`` call.
+
+    The callback receives ``(name: str, **tags)`` matching the arguments
+    passed to ``metrics_inc()``.  Exceptions raised by the callback are
+    silently suppressed to avoid disrupting the caller.
+    """
+    _listeners.append(fn)
+
 
 def metrics_inc(metric: str, value: int = 1, **tags: object) -> None:
     METRICS.inc(metric, value=value, tags=tags or None)
+    for _fn in _listeners:
+        try:
+            _fn(metric, **tags)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def metrics_observe(metric: str, value: float, **tags: object) -> None:
@@ -189,3 +212,4 @@ def metrics_snapshot() -> dict[str, object]:
 
 def metrics_reset() -> None:
     METRICS.reset()
+    _listeners.clear()

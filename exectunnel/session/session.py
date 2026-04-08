@@ -138,6 +138,7 @@ class TunnelSession:
                     async with connect(
                         self._app.wss_url,
                         ssl=ssl_ctx,
+                        additional_headers=self._app.ws_headers or None,
                         # Disable built-in ping — we implement our own via
                         # KeepaliveLoop which serialises through WsSender.
                         ping_interval=None,

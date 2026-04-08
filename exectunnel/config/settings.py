@@ -59,6 +59,7 @@ class AppConfig:
     insecure: bool
     bridge: BridgeConfig
     version: str = "1.0"
+    ws_headers: dict[str, str] = field(default_factory=dict)
 
     def ssl_context(self) -> ssl.SSLContext | None:
         """Return an SSL context for wss:// URLs, or None for plain ws://."""

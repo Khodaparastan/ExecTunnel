@@ -137,6 +137,7 @@ class AgentBootstrapper:
                 self._tun.socks_host,
                 self._tun.socks_port,
             )
+            metrics_inc("bootstrap.exec_done")
             metrics_inc("tunnel.bootstrap.ok")
             metrics_observe(
                 "session_bootstrap_duration_seconds",
@@ -175,6 +176,7 @@ class AgentBootstrapper:
         """Suppress terminal echo, upload the agent payload, and exec it."""
         await self._send_command("stty raw -echo", start=start)
         await asyncio.sleep(BOOTSTRAP_STTY_DELAY_SECS)
+        metrics_inc("bootstrap.stty_done")
 
         agent_b64 = load_agent_b64()
         chunk_count = len(range(0, len(agent_b64), BOOTSTRAP_CHUNK_SIZE_CHARS))
@@ -186,6 +188,7 @@ class AgentBootstrapper:
         )
         await asyncio.sleep(BOOTSTRAP_RM_DELAY_SECS)
 
+        metrics_inc("bootstrap.upload_started")
         for i in range(0, len(agent_b64), BOOTSTRAP_CHUNK_SIZE_CHARS):
             chunk = agent_b64[i : i + BOOTSTRAP_CHUNK_SIZE_CHARS]
             await self._send_command(
@@ -193,13 +196,17 @@ class AgentBootstrapper:
                 start=start,
             )
 
+        metrics_inc("bootstrap.upload_done")
         await self._send_command(
             "sed 's/-/+/g; s/_/\\//g' '/tmp/exectunnel_agent.b64'"
             " | base64 -d > '/tmp/exectunnel_agent.py'",
             start=start,
         )
+        metrics_inc("bootstrap.decode_started")
         await asyncio.sleep(BOOTSTRAP_DECODE_DELAY_SECS)
+        metrics_inc("bootstrap.decode_done")
 
+        metrics_inc("bootstrap.syntax_started")
         await self._send_command(
             "python3 -c '"
             'import ast,sys; ast.parse(open("/tmp/exectunnel_agent.py").read()); '
@@ -275,6 +282,8 @@ class AgentBootstrapper:
 
                     if stripped == "SYNTAX_OK":
                         logger.debug("bootstrap: remote syntax check passed")
+                        metrics_inc("bootstrap.syntax_done")
+                        metrics_inc("bootstrap.exec_started")
                         continue
 
                     if stripped:
