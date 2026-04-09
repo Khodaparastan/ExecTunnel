@@ -14,6 +14,11 @@ Entropy
 ───────
     12 bytes → 96-bit token → birthday bound ≈ 2^48 before 50 % collision
     probability; safe for high-concurrency, long-lived tunnel sessions.
+
+    ``secrets.token_hex`` is guaranteed to return lowercase hexadecimal, so
+    the post-generation assert in each generator is a development-time sanity
+    check only.  It is stripped in optimised builds (``python -O``) and will
+    never fire in practice.
 """
 
 from __future__ import annotations
@@ -44,6 +49,9 @@ _TOKEN_BYTES: Final[int] = 12
 # Session-level error sentinel: a valid conn_id-shaped value that is
 # deliberately outside the random space (all-zero token) so callers can
 # distinguish session-level errors from per-connection errors.
+#
+# Derived from _TOKEN_BYTES so that if the token length ever changes,
+# SESSION_CONN_ID stays structurally consistent with ID_RE automatically.
 SESSION_CONN_ID: Final[str] = _TCP_PREFIX + "0" * (_TOKEN_BYTES * 2)
 
 # Compiled pattern for validating conn_id / flow_id values.
@@ -59,6 +67,11 @@ def new_conn_id() -> str:
     Returns:
         A string of the form ``c<24 hex chars>``,
         e.g. ``ca1b2c3d4e5f6a7b8c9d0e1f2a3b``.
+
+    Note:
+        The assert is a development-time invariant check and is stripped in
+        optimised builds (``python -O``).  It will never fire in practice
+        because ``secrets.token_hex`` is guaranteed to return lowercase hex.
     """
     result = _TCP_PREFIX + secrets.token_hex(_TOKEN_BYTES)
     assert ID_RE.match(result), f"new_conn_id produced invalid ID: {result!r}"  # noqa: S101
@@ -71,6 +84,11 @@ def new_flow_id() -> str:
     Returns:
         A string of the form ``u<24 hex chars>``,
         e.g. ``ua1b2c3d4e5f6a7b8c9d0e1f2a3b``.
+
+    Note:
+        The assert is a development-time invariant check and is stripped in
+        optimised builds (``python -O``).  It will never fire in practice
+        because ``secrets.token_hex`` is guaranteed to return lowercase hex.
     """
     result = _UDP_PREFIX + secrets.token_hex(_TOKEN_BYTES)
     assert ID_RE.match(result), f"new_flow_id produced invalid ID: {result!r}"  # noqa: S101
