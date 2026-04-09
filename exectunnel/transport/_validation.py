@@ -95,6 +95,11 @@ def require_bytes(value: object, handler_id: str, method: str) -> bytes:
         },
         hint=(
             f"Ensure all callers of {method}() pass raw bytes. "
-            "str, bytearray, and memoryview are not accepted."
+            "str, bytearray, and memoryview are not accepted. "
+            "The bytes-only contract is intentional: bytearray is a valid "
+            "buffer-protocol type and base64.urlsafe_b64encode accepts it, "
+            "but accepting it here would silently widen the public API contract "
+            "and make future type-narrowing harder. Convert to bytes explicitly "
+            "with bytes(value) before calling this method if needed."
         ),
     )

@@ -216,7 +216,12 @@ class UdpFlow:
                 hint="Check WebSocket connectivity to the remote agent.",
             ) from exc
 
-        # Mark as opened only after successful send.
+        # Mark as opened only after successful send.  If the send raised
+        # WebSocketSendTimeoutError or ConnectionClosedError above, _opened
+        # remains False and the caller may retry.  On retry the frame is
+        # re-encoded and re-sent; the agent handles a duplicate UDP_OPEN for
+        # the same flow_id by emitting UDP_CLOSE and ignoring the second open,
+        # so duplicate opens are safe but should be avoided by the caller.
         self._opened = True
         metrics_inc("udp.flow.opened")
         logger.debug(
@@ -404,8 +409,11 @@ class UdpFlow:
         if get_task in done and not get_task.cancelled():
             return get_task.result()
 
-        # close_task won — drain one final time in case a datagram arrived
-        # between the close signal and the task cancellation.
+        # close_task won — drain all remaining items in case multiple datagrams
+        # arrived between the close signal and the task cancellation.  A single
+        # get_nowait() would only return the first; the caller (_drain_flow)
+        # loops recv_datagram() until None, but each extra call would re-enter
+        # the full asyncio.wait path unnecessarily.
         try:
             return self._inbound.get_nowait()
         except asyncio.QueueEmpty:
@@ -443,6 +451,12 @@ class UdpFlow:
         """
         require_bytes(data, self._id, "send_datagram")
 
+        # Guard against sending after close — the agent will silently drop
+        # UDP_DATA frames received after UDP_CLOSE, but skipping the send
+        # avoids a wasted frame on an already-torn-down flow.
+        if self._closed:
+            return
+
         frame = encode_udp_data_frame(self._id, data)
 
         try:
@@ -465,10 +479,7 @@ class UdpFlow:
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _evict(self) -> None:
-        """Remove this flow from the shared registry.
-
-        duplicating the registry pop.
-        """
+        """Remove this flow from the shared registry and decrement the active-flow gauge."""
         self._registry.pop(self._id, None)
         metrics_gauge_dec("session_active_udp_flows")
 

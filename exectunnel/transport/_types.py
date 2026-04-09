@@ -118,7 +118,17 @@ class TransportHandler(Protocol):
         ...
 
     def on_remote_closed(self) -> None:
-        """Signal that the remote agent has closed its side of the flow."""
+        """Signal that the remote agent has closed its side of the flow.
+
+        Note:
+            This method **must remain synchronous** on all concrete handlers.
+            Both :class:`~exectunnel.transport.tcp.TcpConnection` and
+            :class:`~exectunnel.transport.udp.UdpFlow` implement it as a plain
+            ``def``.  The session layer calls it from a synchronous dispatch
+            path and cannot ``await`` it.  If a future handler requires async
+            teardown, introduce a separate ``async def close()`` method rather
+            than changing this protocol.
+        """
         ...
 
 

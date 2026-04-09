@@ -204,6 +204,12 @@ def _log_task_exception(
             )
 
         case OSError():
+            # OSError is logged at DEBUG because the most common cause is a
+            # dead local socket (e.g. BrokenPipeError from _downstream), which
+            # is expected and not actionable.  Note that an OSError raised by
+            # ws.send() inside _upstream also reaches this branch at DEBUG —
+            # if ws.send() OSErrors become a concern, _upstream should catch
+            # them separately before they propagate here.
             metrics_inc(f"tcp.connection.{direction}.error", error="os_error")
             logger.debug(
                 "conn %s: %s socket error: %s",
@@ -869,8 +875,9 @@ class TcpConnection:
                             )
                             return
                     # If close_task fired (or both fired), loop back to the
-                    # batch-drain path which will empty the queue before
-                    # honouring the close flag.
+                    # batch-drain path.  The close flag is only honoured after
+                    # the queue is fully drained — the batch-drain path empties
+                    # the queue first, then checks _remote_closed.is_set().
 
             except asyncio.CancelledError:
                 metrics_inc("tcp.connection.downstream.cancelled")
@@ -1072,6 +1079,19 @@ class TcpConnection:
                 task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+            # Log any unhandled exception that was not caught by
+            # _log_task_exception (e.g. a new exception type added in a future
+            # Python version).  _on_cleanup_done covers the cleanup task itself
+            # but not the tasks being awaited here.
+            if not task.cancelled() and task.exception() is not None:
+                logger.warning(
+                    "conn %s task %s raised an unhandled exception during cleanup: %s",
+                    self._id,
+                    task.get_name(),
+                    task.exception(),
+                    exc_info=task.exception(),
+                    extra={"conn_id": self._id},
+                )
 
         self._registry.pop(self._id, None)
         metrics_gauge_dec("session_active_tcp_connections")
