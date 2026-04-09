@@ -57,21 +57,23 @@ import contextlib
 import logging
 from typing import Final
 
-from exectunnel.config.defaults import (
-    PIPE_READ_CHUNK_BYTES,
-    PRE_ACK_BUFFER_CAP_BYTES,
-    TCP_INBOUND_QUEUE_CAP,
-)
+from exectunnel.config.defaults import Defaults
 from exectunnel.exceptions import (
     ConnectionClosedError,
     ExecTunnelError,
     TransportError,
     WebSocketSendTimeoutError,
 )
-from exectunnel.observability import metrics_gauge_dec, metrics_inc, metrics_observe, span
+from exectunnel.observability import (
+    metrics_gauge_dec,
+    metrics_inc,
+    metrics_observe,
+    span,
+)
 from exectunnel.protocol import encode_conn_close_frame, encode_data_frame
-from exectunnel.transport._types import TcpRegistry, WsSendCallable
-from exectunnel.transport._validation import require_bytes
+
+from ._types import TcpRegistry, WsSendCallable
+from ._validation import require_bytes
 
 __all__ = ["TcpConnection"]
 
@@ -88,7 +90,7 @@ _WRITER_CLOSE_TIMEOUT_SECS: Final[float] = 5.0
 _DOWNSTREAM_BATCH_SIZE: Final[int] = 16
 
 # Minimum sensible pre-ACK buffer cap — one full read chunk.
-_MIN_PRE_ACK_BUFFER_CAP: Final[int] = PIPE_READ_CHUNK_BYTES
+_MIN_PRE_ACK_BUFFER_CAP: Final[int] = Defaults.PIPE_READ_CHUNK_BYTES
 
 # Maximum raw bytes per DATA chunk that fit within MAX_FRAME_LEN after
 # base64url encoding (no padding).  Derivation:
@@ -99,8 +101,8 @@ _MIN_PRE_ACK_BUFFER_CAP: Final[int] = PIPE_READ_CHUNK_BYTES
 #   conn_id    = "c" + token_hex(12) = 1 + 24 = 25 chars
 _MAX_DATA_CHUNK_BYTES: Final[int] = 6_108
 
-assert PIPE_READ_CHUNK_BYTES <= _MAX_DATA_CHUNK_BYTES, (
-    f"PIPE_READ_CHUNK_BYTES ({PIPE_READ_CHUNK_BYTES}) exceeds the protocol "
+assert Defaults.PIPE_READ_CHUNK_BYTES <= _MAX_DATA_CHUNK_BYTES, (
+    f"PIPE_READ_CHUNK_BYTES ({Defaults.PIPE_READ_CHUNK_BYTES}) exceeds the protocol "
     f"maximum of {_MAX_DATA_CHUNK_BYTES} bytes per DATA chunk. "
     "Reduce PIPE_READ_CHUNK_BYTES or the agent will reject oversized frames as FrameDecodingError."
 )
@@ -163,9 +165,7 @@ def _log_task_exception(
             )
 
         case ConnectionClosedError():
-            metrics_inc(
-                f"tcp.connection.{direction}.error", error="connection_closed"
-            )
+            metrics_inc(f"tcp.connection.{direction}.error", error="connection_closed")
             logger.warning(
                 "conn %s: %s ended — tunnel connection closed "
                 "[%s] (%s=%d, error_id=%s)",
@@ -302,7 +302,7 @@ class TcpConnection:
         ws_send: WsSendCallable,
         registry: TcpRegistry,
         *,
-        pre_ack_buffer_cap_bytes: int = PRE_ACK_BUFFER_CAP_BYTES,
+        pre_ack_buffer_cap_bytes: int = Defaults.PRE_ACK_BUFFER_CAP_BYTES,
     ) -> None:
         self._id = conn_id
         self._reader = reader
@@ -312,7 +312,7 @@ class TcpConnection:
 
         # Inbound queue: agent → local TCP.
         self._inbound: asyncio.Queue[bytes] = asyncio.Queue(
-            maxsize=TCP_INBOUND_QUEUE_CAP
+            maxsize=Defaults.TCP_INBOUND_QUEUE_CAP
         )
 
         # Named task references — single source of truth.
@@ -495,7 +495,7 @@ class TcpConnection:
                 error_code="transport.inbound_queue_full",
                 details={
                     "conn_id": self._id,
-                    "queue_cap": TCP_INBOUND_QUEUE_CAP,
+                    "queue_cap": Defaults.TCP_INBOUND_QUEUE_CAP,
                     "drop_count": self._drop_count,
                 },
                 hint=(
@@ -678,7 +678,7 @@ class TcpConnection:
             _cancelled = False
             try:
                 while True:
-                    chunk = await self._reader.read(PIPE_READ_CHUNK_BYTES)
+                    chunk = await self._reader.read(Defaults.PIPE_READ_CHUNK_BYTES)
                     if not chunk:
                         # Local client sent EOF.
                         break
@@ -877,9 +877,7 @@ class TcpConnection:
                 raise
 
             except Exception as exc:
-                _log_task_exception(
-                    self._id, "downstream", exc, self._bytes_downstream
-                )
+                _log_task_exception(self._id, "downstream", exc, self._bytes_downstream)
 
             finally:
                 # Always cancel the reused close_task on exit so it does not
@@ -931,8 +929,7 @@ class TcpConnection:
             )
         except ConnectionClosedError as exc:
             logger.debug(
-                "conn %s: CONN_CLOSE skipped — connection already closed "
-                "(error_id=%s)",
+                "conn %s: CONN_CLOSE skipped — connection already closed (error_id=%s)",
                 self._id,
                 exc.error_id,
                 extra={"conn_id": self._id, "error_id": exc.error_id},
@@ -1032,9 +1029,7 @@ class TcpConnection:
 
         # Schedule cleanup only when both tasks are finished, cleanup has not
         # already been scheduled, and the closed gate has not been set.
-        both_done = (
-            self._upstream_task is None or self._upstream_task.done()
-        ) and (
+        both_done = (self._upstream_task is None or self._upstream_task.done()) and (
             self._downstream_task is None or self._downstream_task.done()
         )
         if both_done and not self._closed.is_set() and self._cleanup_task is None:

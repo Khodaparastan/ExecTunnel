@@ -122,13 +122,5 @@ class TransportHandler(Protocol):
         ...
 
 
-# ── Registry type aliases ─────────────────────────────────────────────────────
-#
-# Defined with the ``type`` statement (Python 3.12+) so they are lazily
-# evaluated — forward references to TcpConnection / UdpFlow resolve at
-# static-analysis time without triggering a circular import at runtime.
-# The TYPE_CHECKING guard above ensures the concrete imports are erased
-# entirely at runtime.
-
-type TcpRegistry = dict[str, "TcpConnection"]
-type UdpRegistry = dict[str, "UdpFlow"]
+type TcpRegistry = dict[str, TcpConnection]
+type UdpRegistry = dict[str, UdpFlow]

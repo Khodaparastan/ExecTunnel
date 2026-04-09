@@ -10,31 +10,9 @@ from dataclasses import dataclass, field
 from typing import Final
 from urllib.parse import urlparse
 
-from exectunnel.config.defaults import (
-    ACK_TIMEOUT_RECONNECT_THRESHOLD,
-    ACK_TIMEOUT_WARN_EVERY,
-    ACK_TIMEOUT_WINDOW_SECS,
-    BOOTSTRAP_AGENT_PATH,
-    BOOTSTRAP_GITHUB_AGENT_URL,
-    BOOTSTRAP_SYNTAX_OK_SENTINEL,
-    CONN_ACK_TIMEOUT_SECS,
-    CONNECT_MAX_PENDING,
-    CONNECT_MAX_PENDING_PER_HOST,
-    DNS_LOCAL_PORT,
-    DNS_MAX_INFLIGHT,
-    PRE_ACK_BUFFER_CAP_BYTES,
-    READY_TIMEOUT_SECS,
-    SOCKS_DEFAULT_HOST,
-    SOCKS_DEFAULT_PORT,
-    WS_PING_INTERVAL_SECS,
-    WS_RECONNECT_BASE_DELAY_SECS,
-    WS_RECONNECT_MAX_DELAY_SECS,
-    WS_RECONNECT_MAX_RETRIES,
-    WS_SEND_QUEUE_CAP,
-    WS_SEND_TIMEOUT_SECS,
-)
-from exectunnel.config.env import parse_bool_env, parse_float_env, parse_int_env
-from exectunnel.config.exclusions import get_default_exclusion_networks
+from .defaults import Defaults
+from .env import parse_bool_env, parse_float_env, parse_int_env
+from .exclusions import get_default_exclusion_networks
 
 logger = logging.getLogger("exectunnel")
 
@@ -43,15 +21,15 @@ logger = logging.getLogger("exectunnel")
 class BridgeConfig:
     """Runtime tunables for the WebSocket bridge."""
 
-    ping_interval: float = WS_PING_INTERVAL_SECS
+    ping_interval: float = Defaults.WS_PING_INTERVAL_SECS
     # Maximum time (seconds) to wait for a single ws.send() call.
-    send_timeout: float = WS_SEND_TIMEOUT_SECS
+    send_timeout: float = Defaults.WS_SEND_TIMEOUT_SECS
     # Maximum number of frames queued for the outbound send loop.
-    send_queue_cap: int = WS_SEND_QUEUE_CAP
-    reconnect_max_retries: int = WS_RECONNECT_MAX_RETRIES
-    reconnect_base_delay: float = WS_RECONNECT_BASE_DELAY_SECS
-    reconnect_max_delay: float = WS_RECONNECT_MAX_DELAY_SECS
-    dns_max_inflight: int = DNS_MAX_INFLIGHT
+    send_queue_cap: int = Defaults.WS_SEND_QUEUE_CAP
+    reconnect_max_retries: int = Defaults.WS_RECONNECT_MAX_RETRIES
+    reconnect_base_delay: float = Defaults.WS_RECONNECT_BASE_DELAY_SECS
+    reconnect_max_delay: float = Defaults.WS_RECONNECT_MAX_DELAY_SECS
+    dns_max_inflight: int = Defaults.DNS_MAX_INFLIGHT
 
 
 @dataclass(slots=True, frozen=True)
@@ -75,47 +53,54 @@ class AppConfig:
 class TunnelConfig:
     """Configuration for the SOCKS5 tunnel command."""
 
-    socks_host: str = SOCKS_DEFAULT_HOST
-    socks_port: int = SOCKS_DEFAULT_PORT
+    socks_host: str = Defaults.SOCKS_DEFAULT_HOST
+    socks_port: int = Defaults.SOCKS_DEFAULT_PORT
     # Optional upstream DNS IP forwarded through the tunnel (e.g. "10.96.0.10").
     dns_upstream: str | None = None
-    dns_local_port: int = DNS_LOCAL_PORT
+    dns_local_port: int = Defaults.DNS_LOCAL_PORT
     # How long to wait for the remote agent to emit AGENT_READY.
-    ready_timeout: float = READY_TIMEOUT_SECS
+    ready_timeout: float = Defaults.READY_TIMEOUT_SECS
     # How long to wait for the remote agent to ACK a CONN_OPEN (per connection).
-    conn_ack_timeout: float = CONN_ACK_TIMEOUT_SECS
+    conn_ack_timeout: float = Defaults.CONN_ACK_TIMEOUT_SECS
     # CIDRs that bypass the tunnel and connect directly.
     exclude: list[ipaddress.IPv4Network | ipaddress.IPv6Network] | None = field(
         default_factory=get_default_exclusion_networks
     )
     # ACK-timeout tunables (overridable via env).
-    ack_timeout_warn_every: int = ACK_TIMEOUT_WARN_EVERY
-    ack_timeout_window_secs: float = ACK_TIMEOUT_WINDOW_SECS
-    ack_timeout_reconnect_threshold: int = ACK_TIMEOUT_RECONNECT_THRESHOLD
+    ack_timeout_warn_every: int = Defaults.ACK_TIMEOUT_WARN_EVERY
+    ack_timeout_window_secs: float = Defaults.ACK_TIMEOUT_WINDOW_SECS
+    ack_timeout_reconnect_threshold: int = Defaults.ACK_TIMEOUT_RECONNECT_THRESHOLD
     # Connect-hardening tunables (overridable via env).
-    connect_max_pending: int = CONNECT_MAX_PENDING
-    connect_max_pending_per_host: int = CONNECT_MAX_PENDING_PER_HOST
+    connect_max_pending: int = Defaults.CONNECT_MAX_PENDING
+    connect_max_pending_per_host: int = Defaults.CONNECT_MAX_PENDING_PER_HOST
     # Pre-ACK send buffer cap in bytes (overridable via env).
-    pre_ack_buffer_cap_bytes: int = PRE_ACK_BUFFER_CAP_BYTES
+    pre_ack_buffer_cap_bytes: int = Defaults.PRE_ACK_BUFFER_CAP_BYTES
     connect_pace_interval_secs: int = 3
     # How the agent payload is delivered to the remote pod.
     # "upload"  — encode and upload agent.py via printf chunks (default).
     # "github"  — fetch agent.py from a raw GitHub URL using curl/wget.
     bootstrap_delivery: str = "upload"
     # Raw URL used when bootstrap_delivery="github".
-    github_agent_url: str = BOOTSTRAP_GITHUB_AGENT_URL
+    github_agent_url: str = Defaults.BOOTSTRAP_GITHUB_AGENT_URL
     # If True and the agent file already exists on the pod, skip delivery
     # (regardless of bootstrap_delivery mode) and go straight to exec.
     # If False and the agent file exists, remove it and re-deliver.
-    bootstrap_skip_if_present: bool = False
+    bootstrap_skip_if_present: bool = True
     # If True, run `python3 -m py_compile` on the agent before exec'ing it.
     # When skip_if_present=True and the syntax-OK sentinel file is present
     # on the pod, the syntax check is also skipped (cached result).
     bootstrap_syntax_check: bool = True
     # Path of the agent script inside the pod.
-    bootstrap_agent_path: str = BOOTSTRAP_AGENT_PATH
+    bootstrap_agent_path: str = Defaults.BOOTSTRAP_AGENT_PATH
     # Path of the syntax-OK sentinel file inside the pod.
-    bootstrap_syntax_ok_sentinel: str = BOOTSTRAP_SYNTAX_OK_SENTINEL
+    bootstrap_syntax_ok_sentinel: str = Defaults.BOOTSTRAP_SYNTAX_OK_SENTINEL
+    # If True, upload and run the pre-built Go agent binary instead of agent.py.
+    # The binary must be at exectunnel/payload/go_agent/agent_linux_amd64 —
+    # build it with: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o agent_linux_amd64 .
+    bootstrap_use_go_agent: bool = False
+    # Path of the Go agent binary inside the pod.
+    # Override via EXECTUNNEL_BOOTSTRAP_GO_AGENT_PATH if /tmp is noexec.
+    bootstrap_go_agent_path: str = Defaults.BOOTSTRAP_GO_AGENT_PATH
 
 
 # Module-level default bridge config
@@ -204,6 +189,8 @@ def get_tunnel_config(
     bootstrap_syntax_check: bool = TUNNEL_CONFIG.bootstrap_syntax_check,
     bootstrap_agent_path: str = TUNNEL_CONFIG.bootstrap_agent_path,
     bootstrap_syntax_ok_sentinel: str = TUNNEL_CONFIG.bootstrap_syntax_ok_sentinel,
+    bootstrap_use_go_agent: bool = TUNNEL_CONFIG.bootstrap_use_go_agent,
+    bootstrap_go_agent_path: str = TUNNEL_CONFIG.bootstrap_go_agent_path,
 ) -> TunnelConfig:
     """Build TunnelConfig, merging CLI args with environment overrides."""
     return TunnelConfig(
@@ -244,7 +231,9 @@ def get_tunnel_config(
             TUNNEL_CONFIG.pre_ack_buffer_cap_bytes,
             min_value=1024,
         ),
-        bootstrap_delivery=os.getenv("EXECTUNNEL_BOOTSTRAP_DELIVERY", bootstrap_delivery),
+        bootstrap_delivery=os.getenv(
+            "EXECTUNNEL_BOOTSTRAP_DELIVERY", bootstrap_delivery
+        ),
         github_agent_url=os.getenv("EXECTUNNEL_GITHUB_AGENT_URL", github_agent_url),
         bootstrap_skip_if_present=parse_bool_env(
             "EXECTUNNEL_BOOTSTRAP_SKIP_IF_PRESENT",
@@ -259,6 +248,13 @@ def get_tunnel_config(
         ),
         bootstrap_syntax_ok_sentinel=os.getenv(
             "EXECTUNNEL_BOOTSTRAP_SYNTAX_OK_SENTINEL", bootstrap_syntax_ok_sentinel
+        ),
+        bootstrap_use_go_agent=parse_bool_env(
+            "EXECTUNNEL_BOOTSTRAP_USE_GO_AGENT",
+            default=bootstrap_use_go_agent,
+        ),
+        bootstrap_go_agent_path=os.getenv(
+            "EXECTUNNEL_BOOTSTRAP_GO_AGENT_PATH", bootstrap_go_agent_path
         ),
     )
 

@@ -46,14 +46,13 @@ import asyncio
 import contextlib
 import logging
 
-from exectunnel.config.defaults import UDP_INBOUND_QUEUE_CAP, UDP_WARN_EVERY
+from exectunnel.config.defaults import Defaults
 from exectunnel.exceptions import (
     ConnectionClosedError,
-    ProtocolError,
     TransportError,
     WebSocketSendTimeoutError,
 )
-from exectunnel.observability import metrics_gauge_dec, metrics_inc, span
+from exectunnel.observability import metrics_gauge_dec, metrics_inc
 from exectunnel.protocol import (
     encode_udp_close_frame,
     encode_udp_data_frame,
@@ -126,7 +125,7 @@ class UdpFlow:
 
         # Inbound queue: agent → local relay.
         self._inbound: asyncio.Queue[bytes] = asyncio.Queue(
-            maxsize=UDP_INBOUND_QUEUE_CAP
+            maxsize=Defaults.UDP_INBOUND_QUEUE_CAP
         )
 
         # Unified close event — set by both close() (local) and
@@ -332,7 +331,7 @@ class UdpFlow:
         except asyncio.QueueFull:
             self._drop_count += 1
             metrics_inc("udp.flow.inbound_queue.drop")
-            if self._drop_count == 1 or self._drop_count % UDP_WARN_EVERY == 0:
+            if self._drop_count == 1 or self._drop_count % Defaults.UDP_WARN_EVERY == 0:
                 logger.warning(
                     "udp flow %s inbound queue full, dropping datagram "
                     "(total_drops=%d)",
