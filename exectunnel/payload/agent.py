@@ -85,9 +85,7 @@ import sys
 # ── Python version guard ──────────────────────────────────────────────────────
 # match/case requires 3.10+; datetime.UTC requires 3.11+.
 if sys.version_info < (3, 11):
-    sys.stderr.write(
-        f"exectunnel agent requires Python 3.11+, got {sys.version}\n"
-    )
+    sys.stderr.write(f"exectunnel agent requires Python 3.11+, got {sys.version}\n")
     sys.exit(1)
 
 import base64
@@ -115,10 +113,10 @@ _AGENT_VERSION: str = "1"
 # ── Logging ───────────────────────────────────────────────────────────────────
 
 _LOG_LEVELS: dict[str, int] = {
-    "debug":   10,
-    "info":    20,
+    "debug": 10,
+    "info": 20,
     "warning": 30,
-    "error":   40,
+    "error": 40,
 }
 _LOG_LEVEL: int = _LOG_LEVELS.get(
     os.getenv("EXECTUNNEL_AGENT_LOG_LEVEL", "warning").lower(),
@@ -803,9 +801,7 @@ class TcpConnectionWorker:
                     still_pending = bool(self._inbound)
                 if not still_pending and not pending:
                     local_shut = True
-                    local_shut_deadline = (
-                        time.monotonic() + _HALF_CLOSE_DEADLINE_SECS
-                    )
+                    local_shut_deadline = time.monotonic() + _HALF_CLOSE_DEADLINE_SECS
                     with contextlib.suppress(OSError):
                         sock.shutdown(socket.SHUT_WR)
 
@@ -874,8 +870,7 @@ class UdpFlowWorker:
                 ):
                     _log(
                         "warning",
-                        "udp flow %s inbound saturated; dropping datagram "
-                        "(drops=%d)",
+                        "udp flow %s inbound saturated; dropping datagram (drops=%d)",
                         self._id,
                         self._drop_count,
                     )
@@ -898,9 +893,7 @@ class UdpFlowWorker:
         fid = self._id
 
         try:
-            infos = socket.getaddrinfo(
-                self._host, self._port, type=socket.SOCK_DGRAM
-            )
+            infos = socket.getaddrinfo(self._host, self._port, type=socket.SOCK_DGRAM)
             if not infos:
                 raise OSError(f"could not resolve {self._host!r}")
         except OSError as exc:
@@ -1064,9 +1057,7 @@ class _Dispatcher:
             result = _parse_host_port(parts[2], cid, "CONN_OPEN")
             if result is None:
                 _emit_ctrl(
-                    _make_error_frame(
-                        cid, f"invalid CONN_OPEN host:port: {parts[2]!r}"
-                    )
+                    _make_error_frame(cid, f"invalid CONN_OPEN host:port: {parts[2]!r}")
                 )
                 return
             host, port = result
@@ -1086,7 +1077,11 @@ class _Dispatcher:
             # threaded so this cannot race in practice, but the pattern is
             # correct if concurrency is ever introduced.
             if cid in self._conn_map:
-                _log("debug", "duplicate CONN_OPEN for %s (late check) — sending ERROR", cid)
+                _log(
+                    "debug",
+                    "duplicate CONN_OPEN for %s (late check) — sending ERROR",
+                    cid,
+                )
                 _emit_ctrl(_make_error_frame(cid, "duplicate CONN_OPEN"))
                 return
             self._conn_map[cid] = worker
