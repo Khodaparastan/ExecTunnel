@@ -1,19 +1,26 @@
 # ExecTunnel — Protocol Package Architecture Document
 
 ```
-exectunnel/protocol/  |  arch-doc v1.0  |  Python 3.13+
+exectunnel/protocol/  |  arch-doc v1.1  |  Python 3.13+
 ```
 
 ---
 
 ## 1. Purpose & Scope
 
-The `protocol` package is the **lowest layer** of the ExecTunnel stack. It owns exactly two concerns:
+The `protocol` package is the **lowest layer** of the ExecTunnel stack. It owns
+exactly two concerns:
 
-1. **Wire encoding / decoding** — transforming typed Python values into newline-terminated ASCII frame strings and back.
-2. **SOCKS5 enumeration** — providing RFC 1928 / RFC 1929 integer constants as typed Python enums.
+1. **Wire encoding / decoding** — transforming typed Python values into
+   newline-terminated ASCII frame strings and back.
+2. **SOCKS5 enumeration** — providing RFC 1928 / RFC 1929 integer constants as
+   typed Python enums.
 
-It has **zero I/O dependencies**. No sockets, no asyncio, no WebSocket, no DNS, no threads. Every function is a pure transformation: bytes/strings in, bytes/strings/structs out. This makes the entire package synchronously testable in isolation and safe to import in any execution context including the in-pod agent.
+It has **zero I/O dependencies**. No sockets, no asyncio, no WebSocket, no DNS,
+no threads. Every function is a pure transformation: bytes/strings in,
+bytes/strings/structs out. This makes the entire package synchronously testable
+in isolation and safe to import in any execution context including the in-pod
+agent.
 
 ---
 
@@ -58,18 +65,18 @@ Any import of an upper layer into `protocol` is an architecture violation.
 exectunnel/protocol/
 ├── __init__.py     Public re-export surface — no logic
 ├── frames.py       Wire codec: encode_*, parse_frame, host/port helpers
-├── enums.py        SOCKS5 IntEnum definitions
+├── enums.py        SOCKS5 IntEnum definitions + _StrictIntEnum base
 └── ids.py          Cryptographic ID generation + ID_RE validator
 ```
 
 ### Responsibility Matrix
 
-| Module | Owns | Does not own |
-|---|---|---|
-| `frames.py` | Frame constants, wire format, encode/decode, host/port codec | ID generation, SOCKS5 semantics, I/O |
-| `enums.py` | SOCKS5 RFC integer constants | Frame format, ID format, I/O |
-| `ids.py` | ID generation, ID validation regex | Frame format, SOCKS5, I/O |
-| `__init__.py` | Public API surface, `__all__` | All logic — zero lines of code beyond imports |
+| Module        | Owns                                                         | Does not own                                  |
+|---------------|--------------------------------------------------------------|-----------------------------------------------|
+| `frames.py`   | Frame constants, wire format, encode/decode, host/port codec | ID generation, SOCKS5 semantics, I/O          |
+| `enums.py`    | SOCKS5 RFC integer constants, `_StrictIntEnum` mixin         | Frame format, ID format, I/O                  |
+| `ids.py`      | ID generation, ID validation regex                           | Frame format, SOCKS5, I/O                     |
+| `__init__.py` | Public API surface, `__all__`                                | All logic — zero lines of code beyond imports |
 
 ---
 
@@ -78,30 +85,42 @@ exectunnel/protocol/
 ### 4.1 Frame Grammar
 
 ```
-frame       ::= FRAME_PREFIX msg_type [ ":" conn_id [ ":" payload ] ] FRAME_SUFFIX LF
+frame        ::= FRAME_PREFIX msg_type [ ":" conn_id [ ":" payload ] ] FRAME_SUFFIX LF
 FRAME_PREFIX ::= "<<<EXECTUNNEL:"
 FRAME_SUFFIX ::= ">>>"
 LF           ::= "\n"
-msg_type    ::= "AGENT_READY" | "CONN_OPEN" | "CONN_CLOSE" | "DATA"
-              | "UDP_OPEN"   | "UDP_DATA"  | "UDP_CLOSE"  | "ERROR"
-conn_id     ::= [cu][0-9a-f]{24}
-payload     ::= host_port | base64url_nopad
-host_port   ::= bare_host ":" port | "[" ipv6_addr "]" ":" port
+msg_type     ::= "AGENT_READY" | "CONN_OPEN" | "CONN_CLOSE" | "DATA"
+               | "UDP_OPEN"   | "UDP_DATA"  | "UDP_CLOSE"  | "ERROR"
+conn_id      ::= [cu][0-9a-f]{24}
+payload      ::= host_port | base64url_nopad
+host_port    ::= bare_host ":" port | "[" ipv6_addr "]" ":" port
 base64url_nopad ::= [A-Za-z0-9\-_]*
 ```
 
+**Transport contract:** `parse_frame` expects a single complete line. The
+trailing `\n` may be present or absent — `strip()` handles both. The transport
+layer is responsible for buffering the byte stream and splitting on `\n` before
+calling `parse_frame`. Passing a raw WebSocket message payload that contains
+multiple newline-separated frames will silently misparse.
+
 ### 4.2 Frame Catalogue
 
-| Frame | conn_id | Payload | Direction | Meaning |
-|---|---|---|---|---|
-| `AGENT_READY` | — | — | Agent → Client | Bootstrap complete; agent is ready |
-| `CONN_OPEN` | TCP conn ID | `host:port` | Client → Agent | Open a TCP connection to target |
-| `CONN_CLOSE` | TCP conn ID | — | Both | Explicit TCP teardown |
-| `DATA` | TCP conn ID | base64url bytes | Both | TCP data chunk |
-| `UDP_OPEN` | UDP flow ID | `host:port` | Client → Agent | Open a UDP flow to target |
-| `UDP_DATA` | UDP flow ID | base64url bytes | Both | UDP datagram |
-| `UDP_CLOSE` | UDP flow ID | — | Both | Explicit UDP flow teardown |
-| `ERROR` | conn/flow ID or `SESSION_CONN_ID` | base64url UTF-8 | Both | Error report |
+| Frame         | conn_id                           | Payload         | Direction      | Meaning                                              |
+|---------------|-----------------------------------|-----------------|----------------|------------------------------------------------------|
+| `AGENT_READY` | —                                 | —               | Agent → Client | Bootstrap complete; agent is ready                   |
+| `CONN_OPEN`   | TCP conn ID                       | `host:port`     | Client → Agent | Open a TCP connection to target                      |
+| `CONN_CLOSE`  | TCP conn ID                       | —               | Both           | Explicit TCP teardown                                |
+| `DATA`        | TCP conn ID                       | base64url bytes | Both           | TCP data chunk                                       |
+| `UDP_OPEN`    | UDP flow ID                       | `host:port`     | Client → Agent | Open a UDP flow to target                            |
+| `UDP_DATA`    | UDP flow ID                       | base64url bytes | Both           | UDP datagram                                         |
+| `UDP_CLOSE`   | UDP flow ID                       | —               | Both           | Explicit UDP flow teardown (advisory — no handshake) |
+| `ERROR`       | conn/flow ID or `SESSION_CONN_ID` | base64url UTF-8 | Both           | Error report                                         |
+
+**`UDP_CLOSE` ordering note:** `UDP_CLOSE` is an advisory close with no
+handshake. The protocol makes no ordering guarantee between a `UDP_CLOSE` frame
+and `UDP_DATA` frames already in flight. The session layer must be prepared to
+receive `UDP_DATA` frames after sending or receiving `UDP_CLOSE` and must
+discard them silently rather than treating them as errors.
 
 ### 4.3 Concrete Frame Examples
 
@@ -133,24 +152,29 @@ base64url_nopad ::= [A-Za-z0-9\-_]*
 ```
 MAX_FRAME_LEN = 8,192 characters  (content only, excluding trailing \n)
 
-Breakdown for a DATA frame at the limit:
-  FRAME_PREFIX  = 14 chars   "<<<EXECTUNNEL:"
-  msg_type      =  4 chars   "DATA"
-  separator     =  1 char    ":"
-  conn_id       = 25 chars   "c" + 24 hex
-  separator     =  1 char    ":"
-  payload       = 8,147 chars  base64url
-  FRAME_SUFFIX  =  3 chars   ">>>"
-  ─────────────────────────────────────
-  Total content = 8,195 chars  → exceeds limit → ProtocolError
-
 Maximum safe DATA payload:
   available_for_payload = 8192 - 14 - 4 - 1 - 25 - 1 - 3 = 8,144 chars
+                          ^^^^   ^^   ^   ^^   ^    ^^
+                          PREFIX DATA : conn : SUFFIX
   base64url overhead    = 4/3 ratio
   max raw bytes         = floor(8144 * 3 / 4) = 6,108 bytes
 ```
 
-> **Transport note:** `PIPE_READ_CHUNK_BYTES` (4,096) is deliberately set below this limit. It lives in the transport/session layer, not here.
+Derivation:
+
+| Component      | Chars     | Value                    |
+|----------------|-----------|--------------------------|
+| `FRAME_PREFIX` | 14        | `<<<EXECTUNNEL:`         |
+| `msg_type`     | 4         | `DATA`                   |
+| separator      | 1         | `:`                      |
+| `conn_id`      | 25        | `c` + 24 hex             |
+| separator      | 1         | `:`                      |
+| `payload`      | **8,144** | base64url (maximum safe) |
+| `FRAME_SUFFIX` | 3         | `>>>`                    |
+| **Total**      | **8,192** | exactly at limit         |
+
+> **Transport note:** `PIPE_READ_CHUNK_BYTES` (4,096) is deliberately set below
+> this limit. It lives in the transport/session layer, not here.
 
 ---
 
@@ -176,7 +200,9 @@ At 10,000 concurrent connections/s:
 
 ### 5.3 Prefix Namespace Isolation
 
-The `c` / `u` prefix ensures that a TCP conn_id and a UDP flow_id can **never collide** even if their 96-bit tokens are identical. This matters in the session layer's connection table, which stores both types under the same dict.
+The `c` / `u` prefix ensures that a TCP conn_id and a UDP flow_id can **never
+collide** even if their 96-bit tokens are identical. This matters in the session
+layer's connection table, which stores both types under the same dict.
 
 ```
 "c" + token_hex(12)  →  TCP namespace
@@ -189,7 +215,14 @@ The `c` / `u` prefix ensures that a TCP conn_id and a UDP flow_id can **never co
 SESSION_CONN_ID = "c" + "0" * 24   # = "c000000000000000000000000"
 ```
 
-This is a **structurally valid** conn_id (passes `ID_RE`) that is **semantically reserved** — it can never be produced by `new_conn_id()` because `secrets.token_hex` never returns all-zero output for a 12-byte token (probability \(2^{-96}\), effectively impossible).
+This is a **structurally valid** conn_id (passes `ID_RE`) that is **semantically
+reserved** — it can never be produced by `new_conn_id()` because
+`secrets.token_hex` never returns all-zero output for a 12-byte token
+(probability \(2^{-96}\), effectively impossible).
+
+`SESSION_CONN_ID` is derived from `_TOKEN_BYTES` so that if the token length
+ever changes, the sentinel stays structurally consistent with `ID_RE`
+automatically.
 
 Callers use it to distinguish:
 
@@ -198,6 +231,16 @@ conn_id == SESSION_CONN_ID  →  session-level error (affects all connections)
 conn_id != SESSION_CONN_ID  →  per-connection error (affects one connection)
 ```
 
+### 5.5 Development-time Assert
+
+Each generator function (`new_conn_id`, `new_flow_id`) contains an `assert`
+that verifies the produced ID matches `ID_RE`. This assert:
+
+* Is a **development-time sanity check only** — it will never fire in practice
+  because `secrets.token_hex` is guaranteed to return lowercase hex.
+* Is **stripped in optimised builds** (`python -O`) and must not be relied upon
+  as a runtime guard.
+
 ---
 
 ## 6. Host / Port Codec
@@ -205,12 +248,14 @@ conn_id != SESSION_CONN_ID  →  per-connection error (affects one connection)
 ### 6.1 Encoding Rules
 
 ```
-IPv4 literal   →  bare:          "192.168.1.1:8080"
+IPv4 literal   →  bare:           "192.168.1.1:8080"
 IPv6 literal   →  bracket-quoted: "[2001:db8::1]:8080"
-Domain name    →  bare:          "redis.default.svc:6379"
+Domain name    →  bare:           "redis.default.svc:6379"
 ```
 
-IPv6 addresses are **always** normalised to compressed form via `ipaddress.IPv6Address.compressed` before embedding. This prevents ambiguity between `::1` and `0:0:0:0:0:0:0:1`.
+IPv6 addresses are **always** normalised to compressed form via
+`ipaddress.IPv6Address.compressed` before embedding. This prevents ambiguity
+between `::1` and `0:0:0:0:0:0:0:1`.
 
 ### 6.2 Domain Name Validation
 
@@ -228,17 +273,31 @@ It accepts:
 It rejects:
 * Empty string (caught before regex)
 * Labels starting/ending with `-`
-* Any of `:`, `<`, `>` (frame-unsafe, caught before regex)
+* Consecutive dots `..` (caught before regex — explicit `".." in host` check)
+* Any of `:`, `<`, `>` (frame-unsafe, caught before regex by `_FRAME_UNSAFE_RE`)
 
-Full RFC 1123 compliance (label length ≤ 63, total ≤ 253) is **deliberately delegated** to the resolver. The protocol layer's job is only to ensure the host string cannot corrupt the frame wire format.
+Full RFC 1123 compliance (label length ≤ 63, total ≤ 253) is **deliberately
+delegated** to the resolver. The protocol layer's job is only to ensure the host
+string cannot corrupt the frame wire format.
 
-### 6.3 Codec Symmetry Contract
+### 6.3 Port Range
+
+Both `encode_host_port` and `parse_host_port` enforce `[1, 65535]`. Port `0`
+is explicitly excluded because it is not a valid destination port for `OPEN`
+frames. `build_socks5_reply` in the proxy layer accepts port `0` as the RFC
+1928 §6 "unspecified" sentinel for error replies — that is a separate,
+asymmetric use-case that does not go through these functions.
+
+### 6.4 Codec Symmetry Contract
 
 ```
 parse_host_port(encode_host_port(host, port)) == (normalised_host, port)
 ```
 
-The `host` returned by `parse_host_port` may differ from the input to `encode_host_port` for IPv6 addresses because `ipaddress` normalises them. Callers must not assume round-trip identity of the raw string — only of the semantic value.
+The `host` returned by `parse_host_port` may differ from the input to
+`encode_host_port` for IPv6 addresses because `ipaddress` normalises them.
+Callers must not assume round-trip identity of the raw string — only of the
+semantic value.
 
 ---
 
@@ -271,7 +330,14 @@ base64url string with padding restored
 raw bytes
 ```
 
-Padding restoration formula: `(4 - len(s) % 4) % 4` produces `0, 1, 2, or 3` padding chars. The `% 4` at the end ensures that a string already aligned to 4 chars gets `0` padding, not `4`.
+Padding restoration formula: `(4 - len(s) % 4) % 4` produces `0`, `1`, or `2`
+padding chars. The outer `% 4` ensures a string already aligned to 4 chars gets
+`0` padding, not `4`.
+
+**Note:** base64url payloads never contain `:`. The `maxsplit=2` in
+`parse_frame`'s `inner.split(":", 2)` is not needed for base64url safety — it
+exists solely to preserve colons inside bracket-quoted IPv6 addresses in `OPEN`
+frame payloads (e.g. `[2001:db8::1]:443`).
 
 ### 7.3 Typed Decode Functions
 
@@ -280,23 +346,47 @@ Padding restoration formula: `(4 - len(s) % 4) % 4` produces `0, 1, 2, or 3` pad
 | `decode_binary_payload` | base64url `str` | `bytes` | `DATA`, `UDP_DATA` frames |
 | `decode_error_payload` | base64url `str` | `str` (UTF-8) | `ERROR` frames |
 
-`decode_error_payload` chains two decode steps and raises `FrameDecodingError` at either step, preserving the original cause via `from exc`.
+`decode_error_payload` chains two decode steps and raises `FrameDecodingError`
+at either step, preserving the original cause via `from exc`.
 
 ---
 
 ## 8. SOCKS5 Enumerations
 
-### 8.1 RFC Coverage
+### 8.1 `_StrictIntEnum` Base Mixin
 
-| Enum | RFC | Section | Values |
-|---|---|---|---|
-| `AuthMethod` | RFC 1928 | §3 | `NO_AUTH`, `GSSAPI`, `USERNAME_PASSWORD`, `NO_ACCEPT` |
-| `Cmd` | RFC 1928 | §4 | `CONNECT`, `BIND`, `UDP_ASSOCIATE` |
-| `AddrType` | RFC 1928 | §4 | `IPV4`, `DOMAIN`, `IPV6` |
-| `Reply` | RFC 1928 | §6 | `SUCCESS` … `ADDR_NOT_SUPPORTED` (9 codes) |
-| `UserPassStatus` | RFC 1929 | §2 | `SUCCESS`, `FAILURE` |
+All SOCKS5 enums except `UserPassStatus` inherit from `_StrictIntEnum`, a
+private `IntEnum` subclass that provides a shared `_missing_` implementation:
 
-### 8.2 Unsupported-but-defined Values
+```python
+class _StrictIntEnum(IntEnum):
+    @classmethod
+    def _missing_(cls, value: object) -> Never:
+        raise ValueError(
+            f"{value!r} is not a valid {cls.__name__} "
+            f"(expected one of {[m.value for m in cls]})"
+        )
+```
+
+This eliminates four identical `_missing_` implementations and makes
+`AddrType` and `Reply` — which have no other methods — read as pure data.
+
+`UserPassStatus` inherits directly from `IntEnum` because RFC 1929 §2 requires
+a **permissive** `_missing_` that maps any non-zero byte to `FAILURE` rather
+than rejecting it. Overriding `_StrictIntEnum` for this case would be more
+confusing than not inheriting it.
+
+### 8.2 RFC Coverage
+
+| Enum             | Base             | RFC      | Section | Values                                                |
+|------------------|------------------|----------|---------|-------------------------------------------------------|
+| `AuthMethod`     | `_StrictIntEnum` | RFC 1928 | §3      | `NO_AUTH`, `GSSAPI`, `USERNAME_PASSWORD`, `NO_ACCEPT` |
+| `Cmd`            | `_StrictIntEnum` | RFC 1928 | §4      | `CONNECT`, `BIND`, `UDP_ASSOCIATE`                    |
+| `AddrType`       | `_StrictIntEnum` | RFC 1928 | §4      | `IPV4`, `DOMAIN`, `IPV6`                              |
+| `Reply`          | `_StrictIntEnum` | RFC 1928 | §6      | `SUCCESS` … `ADDR_NOT_SUPPORTED` (9 codes)            |
+| `UserPassStatus` | `IntEnum`        | RFC 1929 | §2      | `SUCCESS`, `FAILURE`                                  |
+
+### 8.3 Unsupported-but-defined Values
 
 Two values are defined for **wire-format completeness** but are not implemented:
 
@@ -305,84 +395,119 @@ Two values are defined for **wire-format completeness** but are not implemented:
 | `GSSAPI` | `AuthMethod` | RFC 1928 §3 requires it in the negotiation byte | Proxy layer responds with `NO_ACCEPT` |
 | `BIND` | `Cmd` | RFC 1928 §4 defines it | Proxy layer responds with `CMD_NOT_SUPPORTED` |
 
-### 8.3 `_missing_` Contract
-
-All enums override `_missing_` to raise `ValueError` immediately on unknown wire values rather than returning `None`. This surfaces protocol violations at the earliest possible point — the moment the byte is read off the wire — rather than propagating a `None` that causes a confusing `AttributeError` later.
+### 8.4 `_missing_` Contract
 
 ```python
 # Without _missing_ override:
 AuthMethod(0x99)   # → None  (silent, dangerous)
 
-# With _missing_ override:
+# With _StrictIntEnum:
 AuthMethod(0x99)   # → ValueError: 0x99 is not a valid AuthMethod ...
                    #   (immediate, informative)
+
+# UserPassStatus permissive mapping (RFC 1929 §2):
+UserPassStatus(0x01)  # → UserPassStatus.FAILURE  (any non-zero byte)
+UserPassStatus(0xFE)  # → UserPassStatus.FAILURE
+UserPassStatus(0x00)  # → UserPassStatus.SUCCESS
 ```
 
-The proxy layer catches this `ValueError` and maps it to the appropriate SOCKS5 reply code.
+The proxy layer catches `ValueError` from `_StrictIntEnum` subclasses and maps
+it to the appropriate SOCKS5 reply code.
+
+### 8.5 `is_supported()` Method
+
+`AuthMethod` and `Cmd` expose `is_supported()` on the concrete class (not on
+the mixin) because each method closes over a **different** module-level
+`frozenset`:
+
+```python
+_AUTH_METHOD_UNSUPPORTED: Final[frozenset[AuthMethod]] = frozenset({AuthMethod.GSSAPI})
+_CMD_UNSUPPORTED: Final[frozenset[Cmd]] = frozenset({Cmd.BIND})
+```
+
+Hoisting `is_supported()` into `_StrictIntEnum` would require injecting the
+unsupported set via a class variable or abstract property, adding complexity
+that outweighs the savings. The two concrete implementations are intentionally
+kept on their respective classes.
 
 ---
 
 ## 9. Exception Contract
 
-The protocol layer raises exactly two exception types, both from `exectunnel.exceptions`:
+The protocol layer raises exactly two exception types, both from
+`exectunnel.exceptions`:
 
 ### 9.1 `ProtocolError` — encoder-side faults
 
-Raised when a **caller passes invalid arguments** to an encoder. This indicates a programming error in the calling layer (session, proxy, transport), not a wire-format violation from a remote peer.
+Raised when a **caller passes invalid arguments** to an encoder. This indicates
+a programming error in the calling layer (session, proxy, transport), not a
+wire-format violation from a remote peer.
 
-| Trigger | Function | `details` keys |
-|---|---|---|
-| Unknown `msg_type` | `_validate_msg_type` | `frame_type`, `expected` |
-| Malformed `conn_id` / `flow_id` | `_validate_id` | `frame_type`, `expected` |
-| Empty host | `encode_host_port` | `frame_type`, `expected` |
-| Port out of range | `encode_host_port` | `frame_type`, `expected` |
-| Frame-unsafe chars in host | `encode_host_port` | `frame_type`, `expected` |
-| Invalid hostname structure | `encode_host_port` | `frame_type`, `expected` |
-| Payload contains frame suffix/prefix | `_encode_frame` | `frame_type`, `expected` |
-| Encoded frame exceeds `MAX_FRAME_LEN` | `_encode_frame` | `frame_type`, `expected` |
+| Trigger                                       | Function           | `details` keys           |
+|-----------------------------------------------|--------------------|--------------------------|
+| Unknown `msg_type`                            | `_encode_frame`    | `frame_type`, `expected` |
+| Non-`AGENT_READY` frame missing `conn_id`     | `_encode_frame`    | `frame_type`, `expected` |
+| `AGENT_READY` frame with unexpected `conn_id` | `_encode_frame`    | `frame_type`, `expected` |
+| Malformed `conn_id` / `flow_id`               | `_validate_id`     | `frame_type`, `expected` |
+| Empty host                                    | `encode_host_port` | `frame_type`, `expected` |
+| Port out of range `[1, 65535]`                | `encode_host_port` | `frame_type`, `expected` |
+| Frame-unsafe chars in host                    | `encode_host_port` | `frame_type`, `expected` |
+| Consecutive dots in hostname                  | `encode_host_port` | `frame_type`, `expected` |
+| Invalid hostname structure                    | `encode_host_port` | `frame_type`, `expected` |
+| Payload contains frame suffix/prefix          | `_encode_frame`    | `frame_type`, `expected` |
+| Encoded frame exceeds `MAX_FRAME_LEN`         | `_encode_frame`    | `frame_type`, `expected` |
 
 ### 9.2 `FrameDecodingError` — decoder-side faults
 
-Raised when **data arriving from the wire** is structurally corrupt. This indicates a remote peer violation or channel corruption, not a local programming error.
+Raised when **data arriving from the wire** is structurally corrupt. This
+indicates a remote peer violation or channel corruption, not a local programming
+error.
 
-| Trigger | Function | `details` keys |
-|---|---|---|
-| Malformed bracketed IPv6 in OPEN payload | `parse_host_port` | `raw_bytes`, `codec="host:port"` |
-| Missing port separator in OPEN payload | `parse_host_port` | `raw_bytes`, `codec="host:port"` |
-| Empty host in OPEN payload | `parse_host_port` | `raw_bytes`, `codec="host:port"` |
-| Non-numeric port in OPEN payload | `parse_host_port` | `raw_bytes`, `codec="host:port"` |
-| Port out of range in OPEN payload | `parse_host_port` | `raw_bytes`, `codec="host:port"` |
-| Invalid base64url in DATA/UDP_DATA | `decode_binary_payload` | `raw_bytes`, `codec="base64url"` |
-| Non-UTF-8 bytes in ERROR payload | `decode_error_payload` | `raw_bytes`, `codec="utf-8"` |
-| Unrecognised `msg_type` in tunnel frame | `parse_frame` | `raw_bytes`, `codec="frame"` |
-| Malformed `conn_id` in tunnel frame | `parse_frame` | `raw_bytes`, `codec="frame"` |
+| Trigger                                  | Function                | `details` keys                   |
+|------------------------------------------|-------------------------|----------------------------------|
+| Malformed bracketed IPv6 in OPEN payload | `parse_host_port`       | `raw_bytes`, `codec="host:port"` |
+| Missing port separator in OPEN payload   | `parse_host_port`       | `raw_bytes`, `codec="host:port"` |
+| Empty host in OPEN payload               | `parse_host_port`       | `raw_bytes`, `codec="host:port"` |
+| Non-numeric port in OPEN payload         | `parse_host_port`       | `raw_bytes`, `codec="host:port"` |
+| Port out of range in OPEN payload        | `parse_host_port`       | `raw_bytes`, `codec="host:port"` |
+| Invalid base64url in DATA/UDP_DATA       | `decode_binary_payload` | `raw_bytes`, `codec="base64url"` |
+| Non-UTF-8 bytes in ERROR payload         | `decode_error_payload`  | `raw_bytes`, `codec="utf-8"`     |
+| Unrecognised `msg_type` in tunnel frame  | `parse_frame`           | `raw_bytes`, `codec="frame"`     |
+| Malformed `conn_id` in tunnel frame      | `parse_frame`           | `raw_bytes`, `codec="frame"`     |
+| Oversized tunnel frame                   | `parse_frame`           | `raw_bytes`, `codec="frame"`     |
 
 ### 9.3 `None` Return — not-a-frame
 
-`parse_frame` returns `None` (never raises) when the input line does not carry the tunnel prefix/suffix. This is the normal case for shell noise, blank lines, and bootstrap stdout during agent startup.
+`parse_frame` returns `None` (never raises) when the input line does not carry
+the tunnel prefix/suffix. This is the normal case for shell noise, blank lines,
+and bootstrap stdout during agent startup.
 
 ```
-Input line                          parse_frame result
-──────────────────────────────────  ──────────────────────────────────
-""                                  None   (blank line)
-"bash-5.1$"                         None   (shell prompt)
-"<<<EXECTUNNEL:AGENT_READY>>>"      ParsedFrame(msg_type="AGENT_READY", ...)
-"<<<EXECTUNNEL:BADTYPE:cXXX>>>"     FrameDecodingError  (tunnel frame, bad type)
-"<<<EXECTUNNEL:DATA:BADID:abc>>>"   FrameDecodingError  (tunnel frame, bad ID)
-"<<<EXECTUNNEL:DATA:cXXX:abc>>>"    ParsedFrame(msg_type="DATA", ...)
+Input line                              parse_frame result
+──────────────────────────────────────  ──────────────────────────────────────
+""                                      None   (blank line)
+"bash-5.1$"                             None   (shell prompt)
+"<<<EXECTUNNEL:AGENT_READY>>>"          ParsedFrame(msg_type="AGENT_READY", ...)
+"<<<EXECTUNNEL:BADTYPE:cXXX>>>"         FrameDecodingError  (tunnel frame, bad type)
+"<<<EXECTUNNEL:DATA:BADID:abc>>>"       FrameDecodingError  (tunnel frame, bad ID)
+"<<<EXECTUNNEL:DATA:cXXX:abc>>>"        ParsedFrame(msg_type="DATA", ...)
+"x" * 9000                              None + debug log  (oversized non-frame)
+"<<<EXECTUNNEL:" + "x"*9000 + ">>>"    FrameDecodingError  (oversized tunnel frame)
 ```
 
 ### 9.4 Exception Chaining
 
-All `FrameDecodingError` raises that wrap a stdlib exception use `raise ... from exc`:
+All `FrameDecodingError` raises that wrap a stdlib exception use
+`raise ... from exc`:
 
 ```
-binascii.Error          →  FrameDecodingError  (decode_binary_payload)
-ValueError (int())      →  FrameDecodingError  (parse_host_port)
-UnicodeDecodeError      →  FrameDecodingError  (decode_error_payload)
+binascii.Error        →  FrameDecodingError  (decode_binary_payload)
+ValueError (int())    →  FrameDecodingError  (parse_host_port)
+UnicodeDecodeError    →  FrameDecodingError  (decode_error_payload)
 ```
 
-This preserves the full traceback chain for structured logging via `exc.to_dict()`.
+This preserves the full traceback chain for structured logging via
+`exc.to_dict()`.
 
 ---
 
@@ -398,13 +523,19 @@ Session / Proxy layer
         │  encode_udp_data_frame(flow_id, data)
         │  ...
         ▼
-  encode_host_port(host, port)          ← validates host/port, returns wire string
-  base64.urlsafe_b64encode(data)        ← encodes bytes to ASCII-safe string
+  encode_host_port(host, port)
+        │  rejects empty host, port ∉ [1,65535], frame-unsafe chars,
+        │  consecutive dots, invalid hostname structure
+        │  normalises IPv6 to compressed bracket-quoted form
+        ▼
+  base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
         │
         ▼
   _encode_frame(msg_type, conn_id, payload)
-        │  validates msg_type, conn_id
-        │  checks payload for injection chars
+        │  validates msg_type ∈ _VALID_MSG_TYPES
+        │  enforces conn_id presence/absence per _NO_CONN_ID_TYPES
+        │  validates conn_id against ID_RE
+        │  defence-in-depth: rejects payload containing FRAME_PREFIX/SUFFIX
         │  checks total length ≤ MAX_FRAME_LEN
         ▼
   "<<<EXECTUNNEL:DATA:c1a2b3...:UEVSR1xy>>>\n"
@@ -416,16 +547,17 @@ Session / Proxy layer
 ### 10.2 Inbound Path (Agent → Client)
 
 ```
-Transport layer  (receives from WebSocket)
+Transport layer  (receives from WebSocket, splits on \n)
         │
         │  raw line: "<<<EXECTUNNEL:DATA:c1a2b3...:UEVSR1xy>>>"
         ▼
   parse_frame(line)
-        │  strips whitespace
-        │  checks prefix / suffix  →  None if absent (not a tunnel frame)
-        │  checks length ≤ MAX_FRAME_LEN  →  FrameDecodingError if tunnel frame is oversized
-        │  validates msg_type      →  FrameDecodingError if unknown
-        │  validates conn_id       →  FrameDecodingError if malformed
+        │  1. strip()
+        │  2. check prefix + suffix  →  None if absent (non-frame, never an error)
+        │  3. check length ≤ MAX_FRAME_LEN  →  FrameDecodingError if tunnel frame oversized
+        │  4. split(":", 2) on inner content
+        │  5. validate msg_type  →  FrameDecodingError if unknown
+        │  6. validate conn_id   →  FrameDecodingError if malformed
         ▼
   ParsedFrame(msg_type="DATA", conn_id="c1a2b3...", payload="UEVSR1xy")
         │
@@ -462,6 +594,23 @@ Client                                    Agent (exec'd into pod)
   │ ─────────────────────────────────────►   │
 ```
 
+**Bootstrap loop pattern** (session/transport layer responsibility):
+
+```python
+async for line in channel:
+    try:
+        if is_ready_frame(line):
+            break
+        # Optionally call parse_frame(line) here to detect and log
+        # early protocol faults before the tunnel is up.
+    except FrameDecodingError:
+        log.warning("corrupt frame during bootstrap: %r", line)
+```
+
+`is_ready_frame` is a **pure string predicate** — it never raises. The decision
+to propagate or swallow `FrameDecodingError` during the pre-ready scan belongs
+to the bootstrap layer, not to `is_ready_frame`.
+
 ---
 
 ## 11. `ParsedFrame` Design
@@ -476,20 +625,20 @@ class ParsedFrame:
 
 ### Design Decisions
 
-| Decision | Rationale |
-|---|---|
-| `frozen=True` | Frames are immutable value objects; mutation after parsing is a bug |
-| `slots=True` | Eliminates `__dict__` per instance; significant on the hot inbound path where thousands of frames/second may be parsed |
-| `dataclass` over `NamedTuple` | Better `repr`, supports `field()` metadata, forward-compatible with `__post_init__` validation if needed |
-| `conn_id` is `str | None` | `None` makes the absence of an ID explicit for `AGENT_READY`; callers cannot accidentally treat an absent ID as a valid empty string |
+| Decision                      | Rationale                                                                                                                                                                              |
+|-------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `frozen=True`                 | Frames are immutable value objects; mutation after parsing is a bug                                                                                                                    |
+| `slots=True`                  | Eliminates `__dict__` per instance; significant on the hot inbound path where thousands of frames/second may be parsed                                                                 |
+| `dataclass` over `NamedTuple` | Better `repr`, supports `field()` metadata, forward-compatible with `__post_init__` validation if needed                                                                               |
+| `conn_id: str \| None`        | `None` makes the absence of an ID explicit for `AGENT_READY`; callers cannot accidentally treat an absent ID as a valid empty string; type checkers correctly flag missing None-checks |
 
 ### Field Invariants
 
-| Field | Value | Meaning |
-|---|---|---|
-| `msg_type` | Never empty (validated) | One of `_VALID_MSG_TYPES` |
-| `conn_id` | `None` for `AGENT_READY`; `str` otherwise | Validated against `ID_RE` when present |
-| `payload` | `""` when absent | Raw string; not yet decoded |
+| Field      | Value                                     | Meaning                                                                                    |
+|------------|-------------------------------------------|--------------------------------------------------------------------------------------------|
+| `msg_type` | Never empty (validated)                   | One of `_VALID_MSG_TYPES`                                                                  |
+| `conn_id`  | `None` for `AGENT_READY`; `str` otherwise | Validated against `ID_RE` when present                                                     |
+| `payload`  | `""` when absent                          | Raw string; not yet decoded — callers must pass it through the appropriate decode function |
 
 ---
 
@@ -497,13 +646,13 @@ class ParsedFrame:
 
 ### Constants
 
-| Name | Type | Value | Purpose |
-|---|---|---|---|
-| `FRAME_PREFIX` | `str` | `"<<<EXECTUNNEL:"` | Frame start sentinel |
-| `FRAME_SUFFIX` | `str` | `">>>"` | Frame end sentinel |
-| `READY_FRAME` | `str` | `"<<<EXECTUNNEL:AGENT_READY>>>"` | Bootstrap complete sentinel |
-| `SESSION_CONN_ID` | `str` | `"c" + "0"×24` | Session-level error conn_id |
-| `MAX_FRAME_LEN` | `int` | `8_192` | Max frame content chars |
+| Name              | Type  | Value                            | Purpose                              |
+|-------------------|-------|----------------------------------|--------------------------------------|
+| `FRAME_PREFIX`    | `str` | `"<<<EXECTUNNEL:"`               | Frame start sentinel                 |
+| `FRAME_SUFFIX`    | `str` | `">>>"`                          | Frame end sentinel                   |
+| `READY_FRAME`     | `str` | `"<<<EXECTUNNEL:AGENT_READY>>>"` | Bootstrap complete sentinel          |
+| `SESSION_CONN_ID` | `str` | `"c" + "0"×24`                   | Session-level error conn_id          |
+| `MAX_FRAME_LEN`   | `int` | `8_192`                          | Max frame content chars (excl. `\n`) |
 
 ### Frame Encoders
 
@@ -519,10 +668,10 @@ class ParsedFrame:
 
 ### Frame Decoder
 
-| Function | Arguments | Returns | Raises |
-|---|---|---|---|
-| `parse_frame` | `line: str` | `ParsedFrame \| None` | `FrameDecodingError` |
-| `is_ready_frame` | `line: str` | `bool` | `FrameDecodingError` |
+| Function         | Arguments   | Returns               | Raises               |
+|------------------|-------------|-----------------------|----------------------|
+| `parse_frame`    | `line: str` | `ParsedFrame \| None` | `FrameDecodingError` |
+| `is_ready_frame` | `line: str` | `bool`                | — (never raises)     |
 
 ### Payload Helpers
 
@@ -544,13 +693,13 @@ class ParsedFrame:
 
 ### SOCKS5 Enums
 
-| Enum | Members | RFC | Notes |
-|---|---|---|---|
-| `AuthMethod` | `NO_AUTH`, `GSSAPI`, `USERNAME_PASSWORD`, `NO_ACCEPT` | RFC 1928 §3 | `GSSAPI` wire-only; `is_supported()` returns `False` |
-| `Cmd` | `CONNECT`, `BIND`, `UDP_ASSOCIATE` | RFC 1928 §4 | `BIND` wire-only; `is_supported()` returns `False` |
-| `AddrType` | `IPV4`, `DOMAIN`, `IPV6` | RFC 1928 §4 | — |
-| `Reply` | `SUCCESS` … `ADDR_NOT_SUPPORTED` | RFC 1928 §6 | — |
-| `UserPassStatus` | `SUCCESS`, `FAILURE` | RFC 1929 §2 | Any non-zero byte maps to `FAILURE` per RFC 1929 §2 |
+| Enum             | Base             | Members                                               | RFC         | Notes                                                                        |
+|------------------|------------------|-------------------------------------------------------|-------------|------------------------------------------------------------------------------|
+| `AuthMethod`     | `_StrictIntEnum` | `NO_AUTH`, `GSSAPI`, `USERNAME_PASSWORD`, `NO_ACCEPT` | RFC 1928 §3 | `GSSAPI` wire-only; `is_supported()` → `False`                               |
+| `Cmd`            | `_StrictIntEnum` | `CONNECT`, `BIND`, `UDP_ASSOCIATE`                    | RFC 1928 §4 | `BIND` wire-only; `is_supported()` → `False`                                 |
+| `AddrType`       | `_StrictIntEnum` | `IPV4`, `DOMAIN`, `IPV6`                              | RFC 1928 §4 | —                                                                            |
+| `Reply`          | `_StrictIntEnum` | `SUCCESS` … `ADDR_NOT_SUPPORTED` (9 codes)            | RFC 1928 §6 | —                                                                            |
+| `UserPassStatus` | `IntEnum`        | `SUCCESS`, `FAILURE`                                  | RFC 1929 §2 | Any non-zero byte → `FAILURE`; inherits plain `IntEnum` not `_StrictIntEnum` |
 
 ---
 
@@ -564,9 +713,11 @@ These are hard invariants that all layers must respect:
 
 2.  parse_frame(line) returns None  iff  line has no FRAME_PREFIX+FRAME_SUFFIX
     — None is exclusively "not a tunnel frame", never "corrupt tunnel frame"
+    — this holds regardless of line length
 
 3.  FrameDecodingError is raised  iff  line IS a tunnel frame but is corrupt
     — the distinction between None and FrameDecodingError is load-bearing
+    — the prefix/suffix check in parse_frame MUST precede the length check
 
 4.  encode_host_port / parse_host_port are strict inverses on the semantic value
     — parse_host_port(encode_host_port(h, p))[1] == p  always
@@ -582,7 +733,14 @@ These are hard invariants that all layers must respect:
     — the payload field of ParsedFrame is always safe to pass to decode_binary_payload
 
 8.  No frame field ever contains FRAME_PREFIX or FRAME_SUFFIX
-    — enforced by _encode_frame; violation raises ProtocolError
+    — enforced by _encode_frame as defence-in-depth; raises ProtocolError
+
+9.  AGENT_READY is the only frame type with no conn_id
+    — _encode_frame enforces this via _NO_CONN_ID_TYPES
+    — ParsedFrame.conn_id is None if and only if msg_type == "AGENT_READY"
+
+10. is_ready_frame never raises
+    — it is a pure string predicate; bootstrap policy is the caller's concern
 ```
 
 ---
@@ -593,45 +751,90 @@ These are hard invariants that all layers must respect:
 
 ```
 1.  Add the string to _VALID_MSG_TYPES in frames.py
-2.  Add a typed encode_<name>_frame() function
-3.  Add the new function to __all__ in frames.py and __init__.py
-4.  Update the frame catalogue docstring in frames.py
-5.  Update the Frame Catalogue table in this document (§4.2)
-6.  Update the session layer dispatcher to handle the new msg_type
-7.  Update the agent to emit / consume the new frame type
+2.  If the new frame carries no conn_id, add it to _NO_CONN_ID_TYPES in frames.py
+3.  Add a typed encode_<name>_frame() function
+4.  Add the new function to __all__ in frames.py and __init__.py
+5.  Update the frame catalogue docstring in frames.py
+6.  Update the Frame Catalogue table in this document (§4.2)
+7.  Update the session layer dispatcher to handle the new msg_type
+8.  Update the agent to emit / consume the new frame type
 ```
 
 ### Adding a New SOCKS5 Auth Method
 
 ```
 1.  Add the value to AuthMethod in enums.py
-2.  Add a note if it is defined-but-not-implemented (like GSSAPI)
+2.  If it is defined-but-not-implemented (like GSSAPI), document it in the
+    class docstring and add it to _AUTH_METHOD_UNSUPPORTED
 3.  Update the proxy layer negotiation handler
-4.  Update §8.1 and §8.2 in this document
+4.  Update §8.3 and §8.4 in this document
 ```
 
 ### Changing the ID Format
 
 ```
 1.  Update _TCP_PREFIX, _UDP_PREFIX, _TOKEN_BYTES in ids.py
-2.  Update ID_RE and SESSION_CONN_ID in ids.py  ← both are public constants defined there
+2.  ID_RE and SESSION_CONN_ID are derived from these constants and update
+    automatically — verify they still satisfy ID_RE after the change
 3.  Verify SESSION_CONN_ID still cannot be produced by new_conn_id()
 4.  Update §5 in this document
 5.  Bump the agent version — ID format is part of the wire protocol
+```
+
+### Adding a New No-conn_id Frame Type
+
+```
+1.  Add the string to _VALID_MSG_TYPES in frames.py
+2.  Add the string to _NO_CONN_ID_TYPES in frames.py
+3.  Follow the remaining steps in "Adding a New Frame Type" above
+4.  Update invariant 9 in §13 of this document
 ```
 
 ---
 
 ## 15. Security Considerations
 
-| Threat | Mitigation |
-|---|---|
-| Frame injection via crafted payload | `_encode_frame` rejects payloads containing `FRAME_PREFIX` or `FRAME_SUFFIX` → `ProtocolError` |
-| Frame injection via crafted hostname | `encode_host_port` rejects `:`, `<`, `>` in domain names → `ProtocolError` |
-| Memory exhaustion via oversized frame | `parse_frame` raises `FrameDecodingError` for oversized tunnel frames; silently drops oversized non-frame lines → `None` |
-| ID collision / prediction | `secrets.token_hex` (CSPRNG); 96-bit entropy; birthday bound ≈ 2^48 |
-| IPv6 ambiguity / confusion | All IPv6 literals normalised to compressed form and bracket-quoted by `encode_host_port` |
-| Corrupt base64url crashing decoder | `binascii.Error` caught and re-raised as `FrameDecodingError` with truncated hex excerpt |
-| Non-UTF-8 error messages crashing decoder | `UnicodeDecodeError` caught and re-raised as `FrameDecodingError` |
-| `SESSION_CONN_ID` collision with real ID | All-zero token is outside CSPRNG output space; probability ≈ \(2^{-96}\) |
+| Threat                                    | Mitigation                                                                                                                           |
+|-------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------|
+| Frame injection via crafted payload       | `_encode_frame` defence-in-depth check rejects payloads containing `FRAME_PREFIX` or `FRAME_SUFFIX` → `ProtocolError`                |
+| Frame injection via crafted hostname      | `encode_host_port` rejects `:`, `<`, `>` and consecutive dots in domain names → `ProtocolError`                                      |
+| Memory exhaustion via oversized frame     | `parse_frame` raises `FrameDecodingError` for oversized tunnel frames; silently drops oversized non-frame lines → `None` + debug log |
+| Memory exhaustion check order             | Prefix/suffix check precedes length check — oversized non-frame lines can never trigger `FrameDecodingError`                         |
+| ID collision / prediction                 | `secrets.token_hex` (CSPRNG); 96-bit entropy; birthday bound ≈ 2^48                                                                  |
+| IPv6 ambiguity / confusion                | All IPv6 literals normalised to compressed form and bracket-quoted by `encode_host_port`                                             |
+| Corrupt base64url crashing decoder        | `binascii.Error` caught and re-raised as `FrameDecodingError` with truncated hex excerpt                                             |
+| Non-UTF-8 error messages crashing decoder | `UnicodeDecodeError` caught and re-raised as `FrameDecodingError`                                                                    |
+| `SESSION_CONN_ID` collision with real ID  | All-zero token is outside CSPRNG output space; probability ≈ \(2^{-96}\)                                                             |
+| Missing conn_id on non-AGENT_READY frame  | `_encode_frame` raises `ProtocolError` — cannot produce a structurally ambiguous frame                                               |
+| Unexpected conn_id on AGENT_READY frame   | `_encode_frame` raises `ProtocolError` — enforced via `_NO_CONN_ID_TYPES`                                                            |
+
+---
+
+## Summary of Changes from v1.0
+
+| Section                     | Change                                                                                                       |
+|-----------------------------|--------------------------------------------------------------------------------------------------------------|
+| §3 Responsibility Matrix    | Added `_StrictIntEnum` mixin to `enums.py` row                                                               |
+| §4.1 Frame Grammar          | Added transport contract note on line-buffering                                                              |
+| §4.2 Frame Catalogue        | Added `UDP_CLOSE` advisory-close ordering note                                                               |
+| §4.4 Frame Length Budget    | Fixed payload figure (`8,147` → `8,144`); replaced narrative with derivation table                           |
+| §5.4 SESSION_CONN_ID        | Added note on `_TOKEN_BYTES` derivation                                                                      |
+| §5.5 (new)                  | Development-time assert behaviour documented                                                                 |
+| §6.2 Domain Name Validation | Added consecutive-dot rejection                                                                              |
+| §6.3 (new) Port Range       | Documented `[1, 65535]` enforcement and port `0` asymmetry                                                   |
+| §6.3→6.4 Codec Symmetry     | Renumbered                                                                                                   |
+| §7.2 Decoding               | Corrected padding formula produces `0`, `1`, or `2` (not `3`) chars                                          |
+| §7.3 (note)                 | Clarified `maxsplit=2` is for IPv6, not base64url                                                            |
+| §8 SOCKS5 Enumerations      | Added `_StrictIntEnum` §8.1; added Base column to table; added `is_supported()` §8.5; renumbered subsections |
+| §9.1 ProtocolError table    | Added three new triggers: missing conn_id, unexpected conn_id on AGENT_READY, consecutive dots               |
+| §9.3 None Return table      | Added oversized non-frame and oversized tunnel frame rows                                                    |
+| §10.1 Outbound diagram      | Expanded `_encode_frame` step detail                                                                         |
+| §10.2 Inbound diagram       | Added explicit numbered steps matching `parse_frame` check order                                             |
+| §10.3 Bootstrap Sequence    | Added bootstrap loop pattern code example                                                                    |
+| §11 ParsedFrame             | Updated `conn_id` annotation to `str \| None`; added note on type-checker benefit                            |
+| §12 Frame Decoder table     | `is_ready_frame` raises column changed from `FrameDecodingError` to `—`                                      |
+| §12 SOCKS5 Enums table      | Added Base column                                                                                            |
+| §13 Invariants              | Added invariants 9 and 10                                                                                    |
+| §14 Extension Points        | Added "Adding a New No-conn_id Frame Type" section; updated step 2 of "Adding a New Frame Type"              |
+| §15 Security                | Added three new rows: check order, missing conn_id, unexpected conn_id                                       |
 

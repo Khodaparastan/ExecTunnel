@@ -1,7 +1,7 @@
 # ExecTunnel — Protocol Package API Reference
 
 ```
-exectunnel/protocol/  |  api-doc v1.0  |  Python 3.13+
+exectunnel/protocol/  |  api-doc v1.1  |  Python 3.13+
 audience: developers building transport / proxy / session / agent layers
 ```
 
@@ -9,7 +9,8 @@ audience: developers building transport / proxy / session / agent layers
 
 ## How to Read This Document
 
-This reference is written for developers who **consume** the protocol package from an upper layer. It answers three questions for every symbol:
+This reference is written for developers who **consume** the protocol package
+from an upper layer. It answers three questions for every symbol:
 
 1. **What does it do** — precise contract, not implementation detail
 2. **What can go wrong** — every exception, when it fires, what `details` carries
@@ -39,7 +40,8 @@ from exectunnel.protocol import (
 )
 ```
 
-Never import from sub-modules directly — the sub-module layout is an implementation detail and may change.
+Never import from sub-modules directly — the sub-module layout is an
+implementation detail and may change.
 
 ---
 
@@ -62,7 +64,7 @@ ENCODE FRAMES ──────────────────────
 
 DECODE FRAMES ─────────────────────────────────────────────────────────────────
   parse_frame(line)                 →  ParsedFrame | None
-  is_ready_frame(line)              →  bool
+  is_ready_frame(line)              →  bool           never raises
 
 DECODE PAYLOADS ───────────────────────────────────────────────────────────────
   decode_binary_payload(payload)    →  bytes         DATA / UDP_DATA frames
@@ -91,7 +93,9 @@ Example: `"ca1b2c3d4e5f6a7b8c9d0e1f2a3b"`
 
 **Raises:** Nothing.
 
-**When to call it:** Once per accepted SOCKS5 `CONNECT` request, before calling `encode_conn_open_frame`. Store the returned ID as the key in your connection table for the lifetime of that TCP connection.
+**When to call it:** Once per accepted SOCKS5 `CONNECT` request, before calling
+`encode_conn_open_frame`. Store the returned ID as the key in your connection
+table for the lifetime of that TCP connection.
 
 ```python
 conn_id = new_conn_id()
@@ -111,7 +115,8 @@ Example: `"ua1b2c3d4e5f6a7b8c9d0e1f2a3b"`
 
 **Raises:** Nothing.
 
-**When to call it:** Once per accepted SOCKS5 `UDP_ASSOCIATE` request, before calling `encode_udp_open_frame`.
+**When to call it:** Once per accepted SOCKS5 `UDP_ASSOCIATE` request, before
+calling `encode_udp_open_frame`.
 
 ```python
 flow_id = new_flow_id()
@@ -132,9 +137,12 @@ Both functions share the same format guarantee:
 └─────────────── "c" for TCP, "u" for UDP
 ```
 
-**Never construct IDs manually.** The format is validated by every encoder — a hand-crafted string that fails `ID_RE` will raise `ProtocolError` immediately.
+**Never construct IDs manually.** The format is validated by every encoder — a
+hand-crafted string that fails `ID_RE` will raise `ProtocolError` immediately.
 
-**`SESSION_CONN_ID` is not a real ID.** It is a reserved sentinel (`"c" + "0" * 24`) used exclusively in `encode_error_frame` for session-level errors. Do not store it in your connection table.
+**`SESSION_CONN_ID` is not a real ID.** It is a reserved sentinel
+(`"c" + "0" * 24`) used exclusively in `encode_error_frame` for session-level
+errors. Do not store it in your connection table.
 
 ```python
 # ✓ correct — session-level error
@@ -150,9 +158,12 @@ connections[SESSION_CONN_ID] = writer
 
 All encoders share the same contract:
 
-* **Return:** a newline-terminated ASCII string ready to write to the WebSocket channel.
-* **Raise:** `ProtocolError` if any argument is invalid. This always indicates a bug in the calling layer, never a remote peer fault.
-* **Thread / async safety:** all encoders are pure functions with no shared state — safe to call from any thread or coroutine concurrently.
+* **Return:** a newline-terminated ASCII string ready to write to the WebSocket
+  channel.
+* **Raise:** `ProtocolError` if any argument is invalid. This always indicates a
+  bug in the calling layer, never a remote peer fault.
+* **Thread / async safety:** all encoders are pure functions with no shared
+  state — safe to call from any thread or coroutine concurrently.
 
 ---
 
@@ -168,7 +179,9 @@ Encodes a `CONN_OPEN` frame instructing the agent to open a TCP connection.
 | `host` | `str` | Non-empty hostname, IPv4, or IPv6 literal |
 | `port` | `int` | `1 ≤ port ≤ 65535` |
 
-**Raises:** `ProtocolError` — bad `conn_id`, empty host, unsafe host chars, port out of range, or encoded frame exceeds `MAX_FRAME_LEN`.
+**Raises:** `ProtocolError` — bad `conn_id`, empty host, unsafe host chars
+(`:`/`<`/`>`), consecutive dots in hostname, invalid hostname structure, port
+out of range `[1, 65535]`, or encoded frame exceeds `MAX_FRAME_LEN`.
 
 ```python
 # IPv4
@@ -177,9 +190,9 @@ frame = encode_conn_open_frame(new_conn_id(), "10.0.0.5", 5432)
 # Domain (Kubernetes service)
 frame = encode_conn_open_frame(new_conn_id(), "postgres.default.svc", 5432)
 
-# IPv6 — bracket-quoting is handled automatically
+# IPv6 — bracket-quoting and compression are handled automatically
 frame = encode_conn_open_frame(new_conn_id(), "2001:db8::1", 443)
-# wire: <<<EXECTUNNEL:CONN_OPEN:c...:[ 2001:db8::1]:443>>>
+# wire: <<<EXECTUNNEL:CONN_OPEN:c...:[2001:db8::1]:443>>>
 ```
 
 ---
@@ -196,7 +209,10 @@ Encodes a `CONN_CLOSE` frame signalling explicit TCP teardown.
 
 **Raises:** `ProtocolError` — bad `conn_id`.
 
-**Important:** Always emit this frame when closing a connection. The agent releases its socket and connection-table entry only on receiving `CONN_CLOSE`. Omitting it causes resource leaks on the agent side that only resolve on timeout.
+**Important:** Always emit this frame when closing a connection. The agent
+releases its socket and connection-table entry only on receiving `CONN_CLOSE`.
+Omitting it causes resource leaks on the agent side that only resolve on
+timeout.
 
 ```python
 # On SOCKS5 client disconnect:
@@ -218,9 +234,11 @@ Encodes a `DATA` frame carrying a TCP data chunk.
 | `conn_id` | `str` | Must match `[cu][0-9a-f]{24}` |
 | `data` | `bytes` | Non-empty recommended; empty bytes produces a valid but useless frame |
 
-**Raises:** `ProtocolError` — bad `conn_id`, or base64url-encoded payload causes frame to exceed `MAX_FRAME_LEN`.
+**Raises:** `ProtocolError` — bad `conn_id`, or base64url-encoded payload causes
+frame to exceed `MAX_FRAME_LEN`.
 
-**Maximum safe `data` size:** 6,108 bytes per frame. Larger chunks must be split by the caller before encoding.
+**Maximum safe `data` size:** 6,108 bytes per frame. Larger chunks must be split
+by the caller before encoding.
 
 ```python
 CHUNK = 4096   # kept in transport/session layer config, not here
@@ -230,7 +248,10 @@ while chunk := reader.read(CHUNK):
     await ws.send(frame)
 ```
 
-> **Why 6,108 bytes?** Base64url expands 3 bytes → 4 chars. The frame envelope consumes 48 chars (prefix + msg_type + separators + conn_id + suffix). Available payload chars: `8192 − 48 = 8144`. Max raw bytes: `⌊8144 × 3/4⌋ = 6,108`.
+> **Why 6,108 bytes?** Base64url expands 3 bytes → 4 chars. The frame envelope
+> consumes 48 chars (`FRAME_PREFIX` + `msg_type` + separators + `conn_id` +
+> `FRAME_SUFFIX`). Available payload chars: `8192 − 48 = 8144`. Max raw bytes:
+> `⌊8144 × 3/4⌋ = 6,108`.
 
 ---
 
@@ -238,7 +259,8 @@ while chunk := reader.read(CHUNK):
 
 Encodes a `UDP_OPEN` frame instructing the agent to open a UDP flow.
 
-Same argument constraints and error behaviour as `encode_conn_open_frame`. Use `new_flow_id()` (not `new_conn_id()`) for the first argument.
+Same argument constraints and error behaviour as `encode_conn_open_frame`. Use
+`new_flow_id()` (not `new_conn_id()`) for the first argument.
 
 ```python
 flow_id = new_flow_id()
@@ -252,7 +274,11 @@ await ws.send(frame)
 
 Encodes a `UDP_DATA` frame carrying a UDP datagram.
 
-Same argument constraints and error behaviour as `encode_data_frame`. The `data` argument should be a **complete datagram** — UDP framing is the caller's responsibility.
+Same argument constraints and error behaviour as `encode_data_frame`. The `data`
+argument should be a **complete datagram** — UDP framing is the caller's
+responsibility. UDP datagrams are never split; a datagram larger than 6,108
+bytes raises `ProtocolError`. The proxy layer must enforce MTU limits before
+calling this function.
 
 ```python
 datagram = build_dns_query("example.com")
@@ -267,6 +293,11 @@ await ws.send(frame)
 Encodes a `UDP_CLOSE` frame signalling explicit UDP flow teardown.
 
 Same argument constraints and error behaviour as `encode_conn_close_frame`.
+
+`UDP_CLOSE` is an **advisory close with no handshake**. The protocol makes no
+ordering guarantee between a `UDP_CLOSE` frame and `UDP_DATA` frames already in
+flight. The session layer must silently discard `UDP_DATA` frames received after
+`UDP_CLOSE` rather than treating them as errors.
 
 ```python
 frame = encode_udp_close_frame(flow_id)
@@ -287,7 +318,8 @@ Encodes an `ERROR` frame carrying a human-readable error message.
 | `conn_id` | `str` | Must match `[cu][0-9a-f]{24}`, or use `SESSION_CONN_ID` for session-level errors |
 | `message` | `str` | Any UTF-8 string; newlines and non-ASCII are safe |
 
-**Raises:** `ProtocolError` — bad `conn_id`, or encoded frame exceeds `MAX_FRAME_LEN`.
+**Raises:** `ProtocolError` — bad `conn_id`, or encoded frame exceeds
+`MAX_FRAME_LEN`.
 
 ```python
 # Per-connection error
@@ -306,9 +338,9 @@ await ws.send(frame)
 ```python
 # ✗ wrong — hand-crafted ID bypasses validation until the encoder catches it
 frame = encode_data_frame("myconn", data)
-# → ProtocolError: Invalid tunnel id 'myconn': must match [cu][0-9a-f]{24}
+# → ProtocolError: Invalid tunnel DATA ID 'myconn': must match [cu][0-9a-f]{24}
 
-# ✗ wrong — port 0 is rejected
+# ✗ wrong — port 0 is rejected (not a valid destination port for OPEN frames)
 frame = encode_conn_open_frame(conn_id, "redis", 0)
 # → ProtocolError: Port 0 is out of range [1, 65535]
 
@@ -316,9 +348,17 @@ frame = encode_conn_open_frame(conn_id, "redis", 0)
 frame = encode_conn_open_frame(conn_id, "bad:host", 80)
 # → ProtocolError: Host 'bad:host' contains frame-unsafe characters
 
+# ✗ wrong — consecutive dots are not a valid hostname
+frame = encode_conn_open_frame(conn_id, "redis..default", 6379)
+# → ProtocolError: Host 'redis..default' contains consecutive dots
+
 # ✓ correct — IPv6 passed as a plain string, bracket-quoting is automatic
 frame = encode_conn_open_frame(conn_id, "::1", 8080)
 # wire payload: [::1]:8080
+
+# ✗ wrong — AGENT_READY is a constant, never encoded via _encode_frame
+# There is no encode_agent_ready_frame() function — use READY_FRAME directly
+sys.stdout.write(READY_FRAME + "\n")
 ```
 
 ---
@@ -329,7 +369,8 @@ frame = encode_conn_open_frame(conn_id, "::1", 8080)
 
 Parses one line of text from the tunnel channel into a structured frame.
 
-**Argument:** `line` — a single line from the WebSocket channel, with or without a trailing newline. Leading/trailing whitespace is stripped before parsing.
+**Argument:** `line` — a single line from the WebSocket channel, with or without
+a trailing newline. Leading/trailing whitespace is stripped before parsing.
 
 **Returns:**
 
@@ -338,46 +379,68 @@ Parses one line of text from the tunnel channel into a structured frame.
 | `None` | Line is not a tunnel frame (shell noise, blank line, bootstrap stdout) | Ignore silently |
 | `ParsedFrame` | Structurally valid, recognised tunnel frame | Dispatch on `msg_type` |
 
-**Raises:** `FrameDecodingError` — the line **is** a tunnel frame (has `FRAME_PREFIX` + `FRAME_SUFFIX`) but its internal structure is corrupt. This is a protocol violation from the remote peer. Do **not** catch and ignore — propagate upward.
+**Raises:** `FrameDecodingError` — the line **is** a tunnel frame (has
+`FRAME_PREFIX` + `FRAME_SUFFIX`) but its internal structure is corrupt. This is
+a protocol violation from the remote peer. Do **not** catch and ignore —
+propagate upward.
+
+**Check order (load-bearing):**
+
+1. Strip whitespace
+2. Check for `FRAME_PREFIX` + `FRAME_SUFFIX` — if absent, return `None`
+   regardless of line length
+3. Check length against `MAX_FRAME_LEN` — oversized tunnel frames raise
+   `FrameDecodingError`; oversized non-frame lines are logged at DEBUG and
+   return `None`
+4. Parse `msg_type`, `conn_id`, `payload`
+
+**Transport contract:** expects a single complete line. The transport layer is
+responsible for buffering the byte stream and splitting on `\n`. Passing a raw
+WebSocket message containing multiple newline-separated frames will silently
+misparse.
 
 ```python
 # Canonical inbound dispatch loop (transport / session layer)
 async for message in websocket:
-    try:
-        frame = parse_frame(message)
-    except FrameDecodingError as exc:
-        log.error("corrupt tunnel frame", extra={"error": exc.to_dict()})
-        raise ConnectionClosedError(
-            "Remote peer sent a corrupt tunnel frame",
-            details={"close_code": 1002, "close_reason": exc.message},
-        ) from exc
+    for line in message.splitlines():
+        try:
+            frame = parse_frame(line)
+        except FrameDecodingError as exc:
+            log.error("corrupt tunnel frame", extra={"error": exc.to_dict()})
+            raise ConnectionClosedError(
+                "Remote peer sent a corrupt tunnel frame",
+                details={"close_code": 1002, "close_reason": exc.message},
+            ) from exc
 
-    if frame is None:
-        continue   # shell noise — normal during bootstrap
+        if frame is None:
+            continue  # shell noise — normal during bootstrap
 
-    match frame.msg_type:
-        case "DATA":
-            data = decode_binary_payload(frame.payload)
-            await connections[frame.conn_id].write(data)
-        case "CONN_CLOSE":
-            await _close_connection(frame.conn_id)
-        case "AGENT_READY":
-            session.mark_ready()
-        case "ERROR":
-            msg = decode_error_payload(frame.payload)
-            await _handle_agent_error(frame.conn_id, msg)
-        case "UDP_DATA":
-            data = decode_binary_payload(frame.payload)
-            await udp_flows[frame.flow_id].sendto(data)
-        case "UDP_CLOSE":
-            await _close_udp_flow(frame.flow_id)
-        case _:
-            # Should never happen — parse_frame already validated msg_type.
-            # Raise rather than silently drop.
-            raise UnexpectedFrameError(
-                f"Unhandled msg_type {frame.msg_type!r} in dispatch",
-                details={"state": session.state, "frame_type": frame.msg_type},
-            )
+        match frame.msg_type:
+            case "DATA":
+                data = decode_binary_payload(frame.payload)
+                await connections[frame.conn_id].write(data)
+            case "CONN_CLOSE":
+                await _close_connection(frame.conn_id)
+            case "AGENT_READY":
+                session.mark_ready()
+            case "ERROR":
+                msg = decode_error_payload(frame.payload)
+                await _handle_agent_error(frame.conn_id, msg)
+            case "UDP_DATA":
+                data = decode_binary_payload(frame.payload)
+                await udp_flows[frame.conn_id].sendto(data)
+            case "UDP_CLOSE":
+                await _close_udp_flow(frame.conn_id)
+            case _:
+                # parse_frame already validated msg_type — this branch
+                # should never be reached. Raise rather than silently drop.
+                raise UnexpectedFrameError(
+                    f"Unhandled msg_type {frame.msg_type!r} in dispatch",
+                    details={
+                        "state": session.state,
+                        "frame_type": frame.msg_type,
+                    },
+                )
 ```
 
 ---
@@ -388,32 +451,41 @@ Returns `True` if `line` is the `AGENT_READY` bootstrap sentinel.
 
 **Argument:** `line` — a single line from the WebSocket channel.
 
-**Returns:** `True` only for `<<<EXECTUNNEL:AGENT_READY>>>` (after whitespace stripping).
+**Returns:** `True` only for `<<<EXECTUNNEL:AGENT_READY>>>` (after whitespace
+stripping). `False` for everything else.
 
-**Raises:** `FrameDecodingError` — propagated from `parse_frame` if the line has the tunnel prefix/suffix but is structurally corrupt.
+**Raises:** Nothing. This is a **pure string predicate** — it never raises.
 
-**When to use:** In the bootstrap loop, before the session is established. Once `is_ready_frame` returns `True`, switch to `parse_frame` for all subsequent lines.
+**Design note:** `is_ready_frame` does not call `parse_frame` internally. The
+bootstrap scanner must be maximally tolerant of garbage lines, including lines
+that accidentally carry the tunnel prefix/suffix. Raising during the pre-ready
+scan would be incorrect. The decision to propagate or log-and-skip
+`FrameDecodingError` during bootstrap belongs to the **bootstrap layer**, not
+to this function.
+
+**When to use:** In the bootstrap loop, before the session is established. Once
+`is_ready_frame` returns `True`, switch to `parse_frame` for all subsequent
+lines.
 
 ```python
 # Bootstrap loop (session / transport layer)
 async with asyncio.timeout(AGENT_READY_TIMEOUT):
     async for line in websocket:
+        if is_ready_frame(line):
+            break
+        # Optionally detect early protocol faults during bootstrap:
         try:
-            if is_ready_frame(line):
-                break
+            parse_frame(line)
         except FrameDecodingError as exc:
             raise BootstrapError(
                 "Agent sent a corrupt frame during bootstrap",
-                details={"host": pod_host, "elapsed_s": elapsed()},
+                details={
+                    "host": pod_host,
+                    "elapsed_s": elapsed(),
+                },
             ) from exc
-        # Non-tunnel lines during bootstrap are normal
-        # (agent startup output, shell prompts, etc.) — log at DEBUG only
+        # Non-tunnel lines during bootstrap are normal — log at DEBUG only
         log.debug("bootstrap noise: %r", line)
-else:
-    raise AgentReadyTimeoutError(
-        "Agent did not send AGENT_READY within timeout",
-        details={"timeout_s": AGENT_READY_TIMEOUT, "host": pod_host},
-    )
 ```
 
 ---
@@ -432,18 +504,23 @@ class ParsedFrame:
 
 **Immutable** — `frozen=True` prevents accidental mutation after parsing.
 
-**`payload` is always raw** — it is never decoded by `parse_frame`. Call the appropriate payload helper based on `msg_type`:
+**`conn_id` is `str | None`** — it is `None` if and only if
+`msg_type == "AGENT_READY"`. Type checkers correctly flag missing `None`-checks
+and will not produce false positives on `if frame.conn_id is None` guards.
 
-| `msg_type` | `conn_id` present | Payload helper |
-|---|---|---|
-| `AGENT_READY` | No (`conn_id` is `None`) | — (no payload) |
-| `CONN_OPEN` | Yes | `parse_host_port(frame.payload)` |
-| `CONN_CLOSE` | Yes | — (no payload) |
-| `DATA` | Yes | `decode_binary_payload(frame.payload)` |
-| `UDP_OPEN` | Yes | `parse_host_port(frame.payload)` |
-| `UDP_DATA` | Yes | `decode_binary_payload(frame.payload)` |
-| `UDP_CLOSE` | Yes | — (no payload) |
-| `ERROR` | Yes | `decode_error_payload(frame.payload)` |
+**`payload` is always raw** — it is never decoded by `parse_frame`. Call the
+appropriate payload helper based on `msg_type`:
+
+| `msg_type`    | `conn_id` | Payload helper                         |
+|---------------|-----------|----------------------------------------|
+| `AGENT_READY` | `None`    | — (no payload)                         |
+| `CONN_OPEN`   | `str`     | `parse_host_port(frame.payload)`       |
+| `CONN_CLOSE`  | `str`     | — (no payload)                         |
+| `DATA`        | `str`     | `decode_binary_payload(frame.payload)` |
+| `UDP_OPEN`    | `str`     | `parse_host_port(frame.payload)`       |
+| `UDP_DATA`    | `str`     | `decode_binary_payload(frame.payload)` |
+| `UDP_CLOSE`   | `str`     | — (no payload)                         |
+| `ERROR`       | `str`     | `decode_error_payload(frame.payload)`  |
 
 ---
 
@@ -453,7 +530,8 @@ class ParsedFrame:
 
 Decodes the base64url (no-padding) payload of a `DATA` or `UDP_DATA` frame.
 
-**Argument:** `payload` — the `ParsedFrame.payload` string from a `DATA` or `UDP_DATA` frame.
+**Argument:** `payload` — the `ParsedFrame.payload` string from a `DATA` or
+`UDP_DATA` frame.
 
 **Returns:** Raw decoded bytes.
 
@@ -482,13 +560,17 @@ case "DATA":
 
 ### `decode_error_payload(payload: str) → str`
 
-Decodes the base64url UTF-8 payload of an `ERROR` frame into a human-readable string.
+Decodes the base64url UTF-8 payload of an `ERROR` frame into a human-readable
+string.
 
-**Argument:** `payload` — the `ParsedFrame.payload` string from an `ERROR` frame.
+**Argument:** `payload` — the `ParsedFrame.payload` string from an `ERROR`
+frame.
 
 **Returns:** Decoded UTF-8 error message string.
 
-**Raises:** `FrameDecodingError` — `payload` is not valid base64url, or the decoded bytes are not valid UTF-8.
+**Raises:** `FrameDecodingError` — `payload` is not valid base64url, or the
+decoded bytes are not valid UTF-8. The original exception is chained via
+`raise ... from exc`.
 
 ```python
 details = {
@@ -502,7 +584,7 @@ case "ERROR":
     try:
         msg = decode_error_payload(frame.payload)
     except FrameDecodingError as exc:
-        # Even if we can't decode the message, we know an error occurred
+        # Even if we cannot decode the message, we know an error occurred
         msg = f"<undecodable error payload: {exc.details.get('raw_bytes', '?')}>"
     await _handle_agent_error(frame.conn_id, msg)
 ```
@@ -511,28 +593,46 @@ case "ERROR":
 
 ### `encode_host_port(host: str, port: int) → str`
 
-Encodes a host + port into the canonical wire payload string for `CONN_OPEN` / `UDP_OPEN` frames.
+Encodes a host + port into the canonical wire payload string for `CONN_OPEN` /
+`UDP_OPEN` frames.
 
-**You rarely need this directly.** `encode_conn_open_frame` and `encode_udp_open_frame` call it internally. Use it only when building a custom OPEN payload outside the standard encoders.
+**You rarely need this directly.** `encode_conn_open_frame` and
+`encode_udp_open_frame` call it internally. Use it only when building a custom
+OPEN payload outside the standard encoders.
 
 **Returns:**
-* IPv6: `"[2001:db8::1]:8080"` (bracket-quoted, compressed)
+
+* IPv6: `"[2001:db8::1]:8080"` (bracket-quoted, compressed form)
 * IPv4: `"192.168.1.1:8080"`
 * Domain: `"redis.default.svc:6379"`
 
-**Raises:** `ProtocolError` — empty host, port out of range, frame-unsafe characters in host, or invalid hostname structure.
+**Port range:** `[1, 65535]`. Port `0` is rejected — it is not a valid
+destination port for `OPEN` frames. See `build_socks5_reply` in the proxy layer
+for the separate use-case where port `0` is the RFC 1928 §6 "unspecified"
+sentinel.
+
+**Raises:** `ProtocolError` — empty host, port out of range, frame-unsafe
+characters (`:`/`<`/`>`) in host, consecutive dots in hostname, or invalid
+hostname structure.
 
 ---
 
 ### `parse_host_port(payload: str) → tuple[str, int]`
 
-Parses a `[host]:port` or `host:port` payload string from a `CONN_OPEN` or `UDP_OPEN` frame.
+Parses a `[host]:port` or `host:port` payload string from a `CONN_OPEN` or
+`UDP_OPEN` frame.
 
-**Argument:** `payload` — the `ParsedFrame.payload` string from a `CONN_OPEN` or `UDP_OPEN` frame.
+**Argument:** `payload` — the `ParsedFrame.payload` string from a `CONN_OPEN`
+or `UDP_OPEN` frame.
 
-**Returns:** `(host, port)` tuple where `host` is a plain string (no brackets) and `port` is an integer.
+**Returns:** `(host, port)` tuple where `host` is a plain string (no brackets)
+and `port` is an integer in `[1, 65535]`.
 
-**Raises:** `FrameDecodingError` — malformed payload, empty host, non-numeric port, or port out of range.
+**Port range:** `[1, 65535]`. Port `0` is rejected for the same reason as in
+`encode_host_port`.
+
+**Raises:** `FrameDecodingError` — malformed payload, empty host, non-numeric
+port, or port out of range.
 
 ```python
 details = {
@@ -570,13 +670,36 @@ host_out, port_out = parse_host_port(payload)
 assert port_out == port_in                       # always True
 assert host_out == "2001:db8::1"                 # normalised, no brackets
 # host_out may differ from host_in for IPv6 (compressed form)
+# For domain names: host_out == host_in exactly
 ```
 
 ---
 
 ## Section 5 — SOCKS5 Enumerations
 
-All enums are `IntEnum` — they compare equal to their integer wire values and can be used directly in `struct.pack` / byte comparisons.
+All enums are `IntEnum` — they compare equal to their integer wire values and
+can be used directly in `struct.pack` / byte comparisons.
+
+### Enum Hierarchy
+
+`AuthMethod`, `Cmd`, `AddrType`, and `Reply` inherit from `_StrictIntEnum`, a
+private base that provides a shared `_missing_` raising `ValueError` immediately
+on unknown wire values. `UserPassStatus` inherits directly from `IntEnum`
+because RFC 1929 §2 requires a **permissive** `_missing_` that maps any non-zero
+byte to `FAILURE`.
+
+```python
+# _StrictIntEnum behaviour (AuthMethod, Cmd, AddrType, Reply):
+AuthMethod(0x99)
+# → ValueError: 0x99 is not a valid AuthMethod (expected one of [0, 1, 2, 255])
+
+# UserPassStatus permissive mapping (RFC 1929 §2):
+UserPassStatus(0x01)  # → UserPassStatus.FAILURE  (any non-zero byte)
+UserPassStatus(0xFE)  # → UserPassStatus.FAILURE
+UserPassStatus(0x00)  # → UserPassStatus.SUCCESS
+```
+
+---
 
 ### `AuthMethod`
 
@@ -589,19 +712,17 @@ RFC 1928 §3 — authentication method negotiation.
 | `USERNAME_PASSWORD` | `0x02` | ✓ |
 | `NO_ACCEPT` | `0xFF` | ✓ (sent to reject) |
 
-Use `is_supported()` to programmatically check whether a method is implemented before attempting negotiation:
-
-```python
-# Reject any method the tunnel does not implement
-for method in client_methods:
-    if not method.is_supported():
-        writer.write(bytes([0x05, AuthMethod.NO_ACCEPT]))
-        return
-```
+Use `is_supported()` to programmatically check whether a method is implemented
+before attempting negotiation:
 
 ```python
 # Proxy layer — method selection
-client_methods = {AuthMethod(b) for b in offered_bytes}
+client_methods = set()
+for b in offered_bytes:
+    try:
+        client_methods.add(AuthMethod(b))
+    except ValueError:
+        pass  # unknown method bytes are ignored per RFC 1928 §3
 
 if AuthMethod.USERNAME_PASSWORD in client_methods:
     chosen = AuthMethod.USERNAME_PASSWORD
@@ -610,7 +731,7 @@ elif AuthMethod.NO_AUTH in client_methods:
 else:
     chosen = AuthMethod.NO_ACCEPT
 
-writer.write(bytes([0x05, chosen]))
+writer.write(bytes([0x05, int(chosen)]))
 ```
 
 ---
@@ -628,14 +749,15 @@ RFC 1928 §4 — client command codes.
 Use `is_supported()` to guard dispatch before the `match` statement:
 
 ```python
-cmd = Cmd(request_bytes[1])
-if not cmd.is_supported():
-    writer.write(_build_socks5_reply(Reply.CMD_NOT_SUPPORTED))
+try:
+    cmd = Cmd(request_bytes[1])
+except ValueError:
+    writer.write(_reply_bytes(Reply.CMD_NOT_SUPPORTED))
     return
-```
 
-```python
-cmd = Cmd(request_bytes[1])
+if not cmd.is_supported():
+    writer.write(_reply_bytes(Reply.CMD_NOT_SUPPORTED))
+    return
 
 match cmd:
     case Cmd.CONNECT:
@@ -647,8 +769,8 @@ match cmd:
         frame   = encode_udp_open_frame(flow_id, host, port)
         await ws.send(frame)
     case Cmd.BIND:
-        reply = _build_socks5_reply(Reply.CMD_NOT_SUPPORTED)
-        writer.write(reply)
+        # is_supported() already caught this — unreachable
+        writer.write(_reply_bytes(Reply.CMD_NOT_SUPPORTED))
 ```
 
 ---
@@ -664,7 +786,11 @@ RFC 1928 §4 — address type codes in SOCKS5 requests.
 | `IPV6` | `0x04` | 16-byte IPv6 address follows |
 
 ```python
-atyp = AddrType(request_bytes[3])
+try:
+    atyp = AddrType(request_bytes[3])
+except ValueError:
+    writer.write(_reply_bytes(Reply.ADDR_NOT_SUPPORTED))
+    return
 
 match atyp:
     case AddrType.IPV4:
@@ -698,15 +824,15 @@ RFC 1928 §6 — reply codes sent back to the SOCKS5 client.
 | `ADDR_NOT_SUPPORTED` | `0x08` | Address type not supported |
 
 ```python
-def _build_socks5_reply(
+def _reply_bytes(
     reply: Reply,
     bind_addr: str = "0.0.0.0",
-    bind_port: int = 0,
+    bind_port: int = 0,       # port 0 is valid here — RFC 1928 §6 "unspecified"
 ) -> bytes:
     addr_bytes = ipaddress.IPv4Address(bind_addr).packed
     return bytes([
         0x05,           # SOCKS version
-        reply,          # reply code
+        int(reply),     # reply code
         0x00,           # reserved
         0x01,           # ATYP: IPv4
         *addr_bytes,    # BND.ADDR
@@ -725,13 +851,17 @@ RFC 1929 §2 — username/password sub-negotiation reply.
 | `SUCCESS` | `0x00` | Credentials accepted |
 | `FAILURE` | `0xFF` | Credentials rejected (canonical wire value) |
 
-> **RFC 1929 §2 note:** Any non-zero status byte indicates failure, not just `0xFF`. `UserPassStatus._missing_` maps any value in `[0x01, 0xFE]` to `FAILURE` so that non-standard peers are handled correctly rather than raising `ValueError`.
+> **RFC 1929 §2 note:** Any non-zero status byte indicates failure, not just
+> `0xFF`. `UserPassStatus._missing_` maps any value in `[0x01, 0xFE]` to
+> `FAILURE` so that non-standard peers are handled correctly rather than raising
+> `ValueError`. This is why `UserPassStatus` inherits plain `IntEnum` rather
+> than `_StrictIntEnum`.
 
 ```python
 if await _verify_credentials(username, password):
-    writer.write(bytes([0x01, UserPassStatus.SUCCESS]))
+    writer.write(bytes([0x01, int(UserPassStatus.SUCCESS)]))
 else:
-    writer.write(bytes([0x01, UserPassStatus.FAILURE]))
+    writer.write(bytes([0x01, int(UserPassStatus.FAILURE)]))
     raise AuthenticationError(
         "SOCKS5 username/password authentication failed",
         details={"host": peer_addr, "auth_method": "username_password"},
@@ -740,28 +870,22 @@ else:
 
 ---
 
-### `_missing_` Behaviour
+### `_missing_` Behaviour Summary
 
-All five enums raise `ValueError` immediately on unknown wire values:
-
-```python
-AuthMethod(0x99)
-# ValueError: 0x99 is not a valid AuthMethod (expected one of [0, 1, 2, 255])
-```
-
-The proxy layer must catch this and map it to the appropriate SOCKS5 reply:
+The proxy layer must catch `ValueError` from `_StrictIntEnum` subclasses and
+map it to the appropriate SOCKS5 reply:
 
 ```python
 try:
     cmd = Cmd(request_bytes[1])
-except ValueError as exc:
-    writer.write(_build_socks5_reply(Reply.CMD_NOT_SUPPORTED))
+except ValueError:
+    writer.write(_reply_bytes(Reply.CMD_NOT_SUPPORTED))
     return
 
 try:
     atyp = AddrType(request_bytes[3])
-except ValueError as exc:
-    writer.write(_build_socks5_reply(Reply.ADDR_NOT_SUPPORTED))
+except ValueError:
+    writer.write(_reply_bytes(Reply.ADDR_NOT_SUPPORTED))
     return
 ```
 
@@ -771,12 +895,12 @@ except ValueError as exc:
 
 ### Frame Delimiters
 
-| Constant | Value | Use |
-|---|---|---|
-| `FRAME_PREFIX` | `"<<<EXECTUNNEL:"` | Start sentinel — check with `line.startswith(FRAME_PREFIX)` |
-| `FRAME_SUFFIX` | `">>>"` | End sentinel — check with `line.endswith(FRAME_SUFFIX)` |
-| `READY_FRAME` | `"<<<EXECTUNNEL:AGENT_READY>>>"` | Compare directly with `is_ready_frame()` — do not string-compare manually |
-| `MAX_FRAME_LEN` | `8_192` | Maximum frame content length in characters, excluding `\n` |
+| Constant        | Value                            | Use                                                     |
+|-----------------|----------------------------------|---------------------------------------------------------|
+| `FRAME_PREFIX`  | `"<<<EXECTUNNEL:"`               | Start sentinel                                          |
+| `FRAME_SUFFIX`  | `">>>"`                          | End sentinel                                            |
+| `READY_FRAME`   | `"<<<EXECTUNNEL:AGENT_READY>>>"` | Use `is_ready_frame()` — do not string-compare manually |
+| `MAX_FRAME_LEN` | `8_192`                          | Maximum frame content length in chars, excluding `\n`   |
 
 ### Sentinel IDs
 
@@ -825,7 +949,10 @@ from exectunnel.exceptions import (
     BootstrapError,
     AgentReadyTimeoutError,
 )
-from exectunnel.protocol import parse_frame, decode_binary_payload, decode_error_payload
+from exectunnel.protocol import (
+    parse_frame, is_ready_frame,
+    decode_binary_payload, decode_error_payload,
+)
 
 # ── Inbound (decoding) ────────────────────────────────────────────────────────
 
@@ -833,7 +960,6 @@ async def handle_inbound(line: str) -> None:
     try:
         frame = parse_frame(line)
     except FrameDecodingError as exc:
-        # Corrupt tunnel frame from remote peer — log and escalate
         log.error("protocol violation from agent", extra={"error": exc.to_dict()})
         raise ConnectionClosedError(
             "Agent sent a structurally corrupt tunnel frame",
@@ -850,7 +976,6 @@ async def handle_inbound(line: str) -> None:
         try:
             data = decode_binary_payload(frame.payload)
         except FrameDecodingError as exc:
-            # Bad payload in an otherwise valid frame — close this connection
             log.warning(
                 "bad DATA payload for conn %s",
                 frame.conn_id,
@@ -874,9 +999,11 @@ async def wait_for_agent(websocket, pod_host: str) -> None:
     try:
         async with asyncio.timeout(AGENT_READY_TIMEOUT):
             async for line in websocket:
+                if is_ready_frame(line):
+                    return
+                # Optionally detect early protocol faults:
                 try:
-                    if is_ready_frame(line):
-                        return
+                    parse_frame(line)
                 except FrameDecodingError as exc:
                     raise BootstrapError(
                         "Agent sent corrupt frame during bootstrap",
@@ -920,6 +1047,22 @@ except FrameDecodingError as exc:
     match exc.error_code:
         case "protocol.frame_decoding_error":
             ...
+
+# ✗ wrong — is_ready_frame is a pure predicate, wrapping it in
+#   try/except FrameDecodingError is unnecessary and misleading
+try:
+    if is_ready_frame(line):  # never raises
+        break
+except FrameDecodingError:
+    ...  # WRONG — dead code
+
+# ✓ correct — call parse_frame separately if you want fault detection
+if is_ready_frame(line):
+    break
+try:
+    parse_frame(line)
+except FrameDecodingError as exc:
+    ...
 ```
 
 ---
@@ -934,12 +1077,14 @@ IDs
   □  Call new_flow_id() once per UDP flow — never reuse IDs
   □  Store IDs as dict keys — they are hashable strings
   □  Use SESSION_CONN_ID only for session-level encode_error_frame calls
+  □  Never store SESSION_CONN_ID in the connection or flow table
 
 ENCODING
   □  Never construct frame strings manually — always use encode_*_frame()
   □  Never construct IDs manually — always use new_conn_id() / new_flow_id()
   □  Always emit CONN_CLOSE / UDP_CLOSE on teardown — never rely on timeout alone
   □  Split data > 6,108 bytes before calling encode_data_frame()
+  □  Never split UDP datagrams — enforce MTU limits before encode_udp_data_frame()
 
 DECODING
   □  Call parse_frame() on every inbound line
@@ -947,6 +1092,12 @@ DECODING
   □  Treat FrameDecodingError as a protocol violation — always propagate
   □  Always call the correct payload helper for each msg_type
   □  Always check frame.conn_id == SESSION_CONN_ID in ERROR handler
+  □  Never pass a multi-line string to parse_frame() — split on \n first
+
+BOOTSTRAP
+  □  Use is_ready_frame() in the pre-ready scan — it never raises
+  □  Call parse_frame() separately if you want early fault detection
+  □  The bootstrap layer owns the FrameDecodingError policy during pre-ready scan
 
 EXCEPTIONS
   □  Always chain: raise XxxError(...) from exc
@@ -958,18 +1109,23 @@ SOCKS5 ENUMS
   □  Wrap Cmd(...) / AddrType(...) / AuthMethod(...) in try/except ValueError
   □  Map ValueError from _missing_ to the appropriate Reply code
   □  Never use raw integer literals where an enum member exists
+  □  Note: UserPassStatus never raises ValueError for valid byte values
 ```
 
+---
 
 ## Section 9 — Complete Layer Integration Examples
 
-These are full, copy-paste-ready patterns showing exactly how the protocol package is consumed at each layer boundary.
+These are full, copy-paste-ready patterns showing exactly how the protocol
+package is consumed at each layer boundary.
 
 ---
 
 ### 9.1 Transport Layer — Inbound Frame Pump
 
-The transport layer's sole job with respect to the protocol package is to split the raw WebSocket text stream into lines and hand each line to `parse_frame`. It must not decode payloads — that is the session layer's responsibility.
+The transport layer's sole job with respect to the protocol package is to split
+the raw WebSocket text stream into lines and hand each line to `parse_frame`. It
+must not decode payloads — that is the session layer's responsibility.
 
 ```python
 """
@@ -1031,7 +1187,7 @@ async def run_frame_pump(
                         "close_reason": exc.message,
                         "host": ws_host,
                         "port": ws_port,
-                        "url":  ws_url,
+                        "url": ws_url,
                     },
                 ) from exc
 
@@ -1121,7 +1277,8 @@ async def send_frame(
 
 ### 9.3 Session Layer — Full Inbound Dispatcher
 
-The session layer receives `ParsedFrame` objects from the transport layer and is responsible for all payload decoding and connection-table dispatch.
+The session layer receives `ParsedFrame` objects from the transport layer and is
+responsible for all payload decoding and connection-table dispatch.
 
 ```python
 """
@@ -1238,10 +1395,7 @@ class InboundDispatcher:
     async def _handle_data(self, frame: ParsedFrame) -> None:
         writer = self._connections.get(frame.conn_id)
         if writer is None:
-            log.warning(
-                "DATA for unknown conn_id %.8s… — dropping",
-                frame.conn_id,
-            )
+            log.warning("DATA for unknown conn_id %.8s… — dropping", frame.conn_id)
             return
 
         try:
@@ -1252,7 +1406,6 @@ class InboundDispatcher:
                 frame.conn_id,
                 extra={"error": exc.to_dict()},
             )
-            # Data integrity is compromised — close this connection only.
             await self._close_connection(frame.conn_id)
             return
 
@@ -1262,10 +1415,10 @@ class InboundDispatcher:
     async def _handle_udp_data(self, frame: ParsedFrame) -> None:
         flow = self._udp_flows.get(frame.conn_id)
         if flow is None:
-            log.warning(
-                "UDP_DATA for unknown flow_id %.8s… — dropping",
-                frame.conn_id,
-            )
+            # UDP_DATA after UDP_CLOSE is expected due to in-flight ordering —
+            # drop silently rather than logging at WARNING.
+            log.debug("UDP_DATA for unknown/closed flow_id %.8s… — dropping",
+                      frame.conn_id)
             return
 
         try:
@@ -1303,7 +1456,6 @@ class InboundDispatcher:
         try:
             message = decode_error_payload(frame.payload)
         except FrameDecodingError as exc:
-            # We know an error occurred even if we cannot decode the message.
             message = (
                 f"<undecodable error payload — "
                 f"raw_bytes={exc.details.get('raw_bytes', '?')!r}>"
@@ -1315,17 +1467,12 @@ class InboundDispatcher:
             )
 
         if frame.conn_id == SESSION_CONN_ID:
-            # Session-level error — the entire tunnel is compromised.
             log.error("agent reported session-level error: %s", message)
             raise ConnectionClosedError(
                 f"Agent reported a session-level error: {message}",
-                details={
-                    "close_code":   1011,
-                    "close_reason": message,
-                },
+                details={"close_code": 1011, "close_reason": message},
             )
 
-        # Per-connection error — close only the affected connection.
         log.warning(
             "agent reported error for conn %.8s…: %s",
             frame.conn_id,
@@ -1386,11 +1533,9 @@ from exectunnel.protocol import (
 
 log = logging.getLogger(__name__)
 
-# Injected by the session — calls transport/sender.send_frame
 SendCallback = Callable[[str], Awaitable[None]]
 
-# Maximum raw bytes per DATA / UDP_DATA frame.
-# Derived from MAX_FRAME_LEN budget — see architecture doc §4.4.
+# Maximum raw bytes per DATA frame — derived from MAX_FRAME_LEN budget (§4.4).
 _MAX_DATA_BYTES: int = 6_108
 
 
@@ -1434,11 +1579,7 @@ class OutboundFrameBuilder:
         for offset in range(0, max(len(data), 1), _MAX_DATA_BYTES):
             chunk = data[offset : offset + _MAX_DATA_BYTES]
             frame = encode_data_frame(conn_id, chunk)
-            log.debug(
-                "session: DATA       %.8s…  %d bytes",
-                conn_id,
-                len(chunk),
-            )
+            log.debug("session: DATA       %.8s…  %d bytes", conn_id, len(chunk))
             await self._send(frame)
 
     # ── UDP ───────────────────────────────────────────────────────────────────
@@ -1466,15 +1607,11 @@ class OutboundFrameBuilder:
 
         Note:
             UDP datagrams are not split — a datagram larger than
-            ``_MAX_DATA_BYTES`` will raise ``ProtocolError``. The proxy
-            layer must enforce MTU limits before calling this method.
+            ``_MAX_DATA_BYTES`` raises ``ProtocolError``. The proxy layer
+            must enforce MTU limits before calling this method.
         """
         frame = encode_udp_data_frame(flow_id, data)
-        log.debug(
-            "session: UDP_DATA   %.8s…  %d bytes",
-            flow_id,
-            len(data),
-        )
+        log.debug("session: UDP_DATA   %.8s…  %d bytes", flow_id, len(data))
         await self._send(frame)
 
     # ── Errors ────────────────────────────────────────────────────────────────
@@ -1487,11 +1624,7 @@ class OutboundFrameBuilder:
             message: Human-readable error description.
         """
         frame = encode_error_frame(conn_id, message)
-        log.debug(
-            "session: ERROR      %.8s…  %r",
-            conn_id,
-            message[:60],
-        )
+        log.debug("session: ERROR      %.8s…  %r", conn_id, message[:60])
         await self._send(frame)
 
     async def send_session_error(self, message: str) -> None:
@@ -1502,8 +1635,6 @@ class OutboundFrameBuilder:
 ---
 
 ### 9.5 Proxy Layer — SOCKS5 Request Parser
-
-The proxy layer uses the SOCKS5 enums to parse client requests and then calls the session layer's outbound builder. It never touches frame encoding directly.
 
 ```python
 """
@@ -1542,7 +1673,7 @@ _USERPASS_VERSION = 0x01
 def _reply_bytes(
     reply: Reply,
     bind_host: str = "0.0.0.0",
-    bind_port: int = 0,
+        bind_port: int = 0,  # port 0 valid here — RFC 1928 §6 "unspecified"
 ) -> bytes:
     """Build a SOCKS5 reply packet (RFC 1928 §6)."""
     addr = ipaddress.IPv4Address(bind_host).packed
@@ -1585,12 +1716,14 @@ async def handle_socks5_client(
     n_methods = header[1]
     method_bytes = await reader.readexactly(n_methods)
 
-    try:
-        offered = {AuthMethod(b) for b in method_bytes}
-    except ValueError:
-        # Unknown method bytes are simply ignored during negotiation —
-        # RFC 1928 §3 says the server picks from the offered list.
-        offered = {AuthMethod(b) for b in method_bytes if b in AuthMethod._value2member_map_}
+    # Unknown method bytes are ignored per RFC 1928 §3 — the server picks
+    # from the offered list; unrecognised values are simply not considered.
+    offered: set[AuthMethod] = set()
+    for b in method_bytes:
+        try:
+            offered.add(AuthMethod(b))
+        except ValueError:
+            pass
 
     if require_auth and AuthMethod.USERNAME_PASSWORD in offered:
         chosen = AuthMethod.USERNAME_PASSWORD
@@ -1625,10 +1758,7 @@ async def handle_socks5_client(
             writer.close()
             raise AuthenticationError(
                 "SOCKS5 username/password authentication failed.",
-                details={
-                    "host":        str(peer),
-                    "auth_method": "username_password",
-                },
+                details={"host": str(peer), "auth_method": "username_password"},
             )
 
     # ── Phase 3: Request ──────────────────────────────────────────────────────
@@ -1640,15 +1770,17 @@ async def handle_socks5_client(
         return None
 
     try:
-        cmd  = Cmd(req_header[1])
+        cmd = Cmd(req_header[1])
+    except ValueError:
+        writer.write(_reply_bytes(Reply.CMD_NOT_SUPPORTED))
+        await writer.drain()
+        writer.close()
+        return None
+
+    try:
         atyp = AddrType(req_header[3])
-    except ValueError as exc:
-        code = (
-            Reply.CMD_NOT_SUPPORTED
-            if "Cmd" in str(type(exc).__name__)
-            else Reply.ADDR_NOT_SUPPORTED
-        )
-        writer.write(_reply_bytes(code))
+    except ValueError:
+        writer.write(_reply_bytes(Reply.ADDR_NOT_SUPPORTED))
         await writer.drain()
         writer.close()
         return None
@@ -1675,7 +1807,7 @@ async def handle_socks5_client(
             writer.write(_reply_bytes(Reply.SUCCESS))
             await writer.drain()
             log.info(
-                "SOCKS5 CONNECT  %.8s… → %s:%d  peer=%s",
+                "SOCKS5 CONNECT   %.8s… → %s:%d  peer=%s",
                 tunnel_id, host, port, peer,
             )
             return tunnel_id
@@ -1702,8 +1834,6 @@ async def handle_socks5_client(
 
 ### 9.6 Agent Side — Inbound Frame Handler
 
-The agent runs inside the pod. It uses the same protocol package (no asyncio, no websockets) and reads/writes frames over `stdin`/`stdout`.
-
 ```python
 """
 agent/handler.py — agent-side inbound frame handler
@@ -1719,9 +1849,9 @@ Responsibilities
 
 from __future__ import annotations
 
+import logging
 import socket
 import sys
-import logging
 
 from exectunnel.exceptions import FrameDecodingError
 from exectunnel.protocol import (
@@ -1770,19 +1900,14 @@ class AgentFrameHandler:
         """Parse and dispatch one line from stdin.
 
         Non-tunnel lines are silently ignored.
-        FrameDecodingError causes an ERROR frame to be emitted and the
-        affected connection to be closed — the agent never crashes on
-        a single bad frame.
+        ``FrameDecodingError`` causes an ERROR frame to be emitted and the
+        affected connection to be closed — the agent never crashes on a
+        single bad frame.
         """
         try:
             frame = parse_frame(line)
         except FrameDecodingError as exc:
-            # We cannot associate this with a specific connection — use
-            # SESSION_CONN_ID so the client knows the whole session is at risk.
-            log.error(
-                "corrupt frame from client",
-                extra={"error": exc.to_dict()},
-            )
+            log.error("corrupt frame from client", extra={"error": exc.to_dict()})
             _emit_error(SESSION_CONN_ID, f"Corrupt frame received: {exc.message}")
             return
 
@@ -1803,10 +1928,8 @@ class AgentFrameHandler:
             case "UDP_CLOSE":
                 self._handle_udp_close(frame)
             case "ERROR":
-                # Client sent an error — log and close the connection.
                 log.warning(
-                    "client reported error for conn %.8s…",
-                    frame.conn_id,
+                    "client reported error for conn %.8s…", frame.conn_id
                 )
                 self._close_tcp(frame.conn_id)
             case _:
@@ -1875,7 +1998,10 @@ class AgentFrameHandler:
     def _handle_udp_data(self, frame: ParsedFrame) -> None:
         sock = self._udp.get(frame.conn_id)
         if sock is None:
-            _emit_error(frame.conn_id, "UDP_DATA for unknown flow")
+            # UDP_DATA after UDP_CLOSE is expected — drop silently.
+            log.debug(
+                "UDP_DATA for unknown/closed flow %.8s… — dropping", frame.conn_id
+            )
             return
 
         try:
@@ -1923,18 +2049,23 @@ class AgentFrameHandler:
 
 ## Section 10 — Testing Patterns
 
-Canonical patterns for unit-testing code that uses the protocol package.
-
 ### 10.1 Frame Round-Trip Tests
 
 ```python
+import ipaddress
 import pytest
 from exectunnel.protocol import (
-    encode_conn_open_frame, encode_data_frame, encode_error_frame,
-    encode_udp_open_frame, encode_udp_data_frame,
-    parse_frame, decode_binary_payload, decode_error_payload,
-    parse_host_port, new_conn_id, new_flow_id,
     SESSION_CONN_ID,
+    decode_binary_payload,
+    decode_error_payload,
+    encode_conn_open_frame,
+    encode_data_frame,
+    encode_error_frame,
+    encode_udp_open_frame,
+    new_conn_id,
+    new_flow_id,
+    parse_frame,
+    parse_host_port,
 )
 from exectunnel.exceptions import FrameDecodingError, ProtocolError
 
@@ -1956,8 +2087,6 @@ def test_conn_open_round_trip(host: str, port: int) -> None:
 
     decoded_host, decoded_port = parse_host_port(parsed.payload)
     assert decoded_port == port
-    # Host may be normalised (IPv6 compression) — compare semantically
-    import ipaddress
     try:
         assert ipaddress.ip_address(decoded_host) == ipaddress.ip_address(host)
     except ValueError:
@@ -1994,12 +2123,21 @@ def test_parse_frame_returns_none_for_noise() -> None:
         assert parse_frame(line) is None
 
 
+def test_parse_frame_returns_none_for_oversized_non_frame() -> None:
+    # Oversized line with no tunnel markers — must return None, never raise
+    assert parse_frame("x" * 9000) is None
+
+
+def test_parse_frame_raises_on_oversized_tunnel_frame() -> None:
+    oversized = "<<<EXECTUNNEL:DATA:c" + "a" * 24 + ":" + "x" * 9000 + ">>>"
+    with pytest.raises(FrameDecodingError) as exc_info:
+        parse_frame(oversized)
+    assert exc_info.value.details["codec"] == "frame"
+
+
 def test_parse_frame_raises_on_corrupt_tunnel_frame() -> None:
-    # Has prefix+suffix but unknown msg_type
     with pytest.raises(FrameDecodingError) as exc_info:
         parse_frame("<<<EXECTUNNEL:BADTYPE:ca1b2c3d4e5f6a7b8c9d0e1f2a3b>>>")
-    assert exc_info.value.error_code == "protocol.frame_decoding_error"
-    assert "raw_bytes" in exc_info.value.details
     assert exc_info.value.details["codec"] == "frame"
 
 
@@ -2008,9 +2146,15 @@ def test_parse_frame_raises_on_malformed_conn_id() -> None:
         parse_frame("<<<EXECTUNNEL:DATA:NOTANID:abc>>>")
 
 
-def test_parse_frame_drops_oversized_line() -> None:
-    oversized = "<<<EXECTUNNEL:DATA:c" + "a" * 24 + ":" + "x" * 9000 + ">>>"
-    assert parse_frame(oversized) is None
+def test_is_ready_frame_never_raises() -> None:
+    # Must not raise even for corrupt tunnel frames
+    for line in [
+        "",
+        "<<<EXECTUNNEL:BADTYPE>>>",
+        "<<<EXECTUNNEL:DATA:BADID:abc>>>",
+        "x" * 9000,
+    ]:
+        assert is_ready_frame(line) is False  # no exception
 ```
 
 ### 10.3 Encoder Validation Tests
@@ -2019,7 +2163,8 @@ def test_parse_frame_drops_oversized_line() -> None:
 def test_encoder_rejects_bad_conn_id() -> None:
     with pytest.raises(ProtocolError) as exc_info:
         encode_data_frame("not-an-id", b"hello")
-    assert exc_info.value.error_code == "protocol.error"
+    assert "frame_type" in exc_info.value.details
+    assert "expected" in exc_info.value.details
 
 
 def test_encoder_rejects_port_zero() -> None:
@@ -2032,16 +2177,28 @@ def test_encoder_rejects_frame_unsafe_host() -> None:
         encode_conn_open_frame(new_conn_id(), "bad:host", 80)
 
 
+def test_encoder_rejects_consecutive_dots() -> None:
+    with pytest.raises(ProtocolError):
+        encode_conn_open_frame(new_conn_id(), "redis..default", 6379)
+
+
 def test_encoder_rejects_oversized_data() -> None:
     with pytest.raises(ProtocolError):
         encode_data_frame(new_conn_id(), b"x" * 10_000)
+
+
+def test_encoder_accepts_session_conn_id_for_error_frame() -> None:
+    # SESSION_CONN_ID must be accepted by encode_error_frame
+    frame = encode_error_frame(SESSION_CONN_ID, "test session error")
+    parsed = parse_frame(frame.strip())
+    assert parsed is not None
+    assert parsed.conn_id == SESSION_CONN_ID
 ```
 
 ### 10.4 Exception Contract Tests
 
 ```python
 def test_frame_decoding_error_is_chained() -> None:
-    """FrameDecodingError must chain the original stdlib exception."""
     with pytest.raises(FrameDecodingError) as exc_info:
         decode_binary_payload("!!!not-base64!!!")
     assert exc_info.value.__cause__ is not None
@@ -2064,11 +2221,47 @@ def test_protocol_error_details_keys() -> None:
     assert "expected"   in details
 
 
-def test_session_conn_id_is_structurally_valid() -> None:
-    """SESSION_CONN_ID must pass parse_frame without raising."""
-    frame  = encode_error_frame(SESSION_CONN_ID, "test")
-    parsed = parse_frame(frame.strip())
-    assert parsed is not None
-    assert parsed.conn_id == SESSION_CONN_ID
+def test_session_conn_id_passes_id_re() -> None:
+    from exectunnel.protocol import ID_RE, SESSION_CONN_ID
+    assert ID_RE.match(SESSION_CONN_ID) is not None
+
+
+def test_conn_id_and_flow_id_never_collide() -> None:
+    # Prefix namespace isolation — same token, different prefix
+    from exectunnel.protocol.ids import _TCP_PREFIX, _UDP_PREFIX
+    assert _TCP_PREFIX != _UDP_PREFIX
+```
+
+## Summary of Changes from v1.0
+
+| Section                            | Change                                                                                                                                |
+|------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------|
+| Quick-Reference Card               | `is_ready_frame` annotated as "never raises"                                                                                          |
+| §2 Encoder intro                   | Added thread/async safety note                                                                                                        |
+| §2 `encode_conn_open_frame` raises | Added consecutive dots and `[1, 65535]` range to raises list                                                                          |
+| §2 `encode_udp_data_frame`         | Added MTU note; documented no-split behaviour                                                                                         |
+| §2 `encode_udp_close_frame`        | Added advisory-close / in-flight ordering note                                                                                        |
+| §2 Common Encoder Mistakes         | Added consecutive-dot example; added AGENT_READY note                                                                                 |
+| §3 `parse_frame`                   | Added "Check order" section; added transport contract note; updated dispatch example to use `splitlines()`                            |
+| §3 `is_ready_frame`                | Rewritten — now documented as pure predicate that never raises; design note explains why; bootstrap loop example updated              |
+| §3 `ParsedFrame`                   | `conn_id: str \| None` — added type-checker benefit note                                                                              |
+| §4 `encode_host_port`              | Added port `0` note and asymmetry with `build_socks5_reply`                                                                           |
+| §4 `parse_host_port`               | Added port `0` note                                                                                                                   |
+| §5 Enum Hierarchy                  | New subsection documenting `_StrictIntEnum` vs `IntEnum` split                                                                        |
+| §5 `AuthMethod`                    | Replaced `is_supported()` example with method-selection pattern using per-byte `try/except`                                           |
+| §5 `Cmd`                           | Separated `is_supported()` guard from `match` dispatch                                                                                |
+| §5 `AddrType`                      | Wrapped in `try/except ValueError`                                                                                                    |
+| §5 `Reply`                         | Added port `0` comment to `_reply_bytes`                                                                                              |
+| §5 `UserPassStatus`                | Added note explaining why it uses plain `IntEnum`                                                                                     |
+| §5 `_missing_` section             | Renamed to "Behaviour Summary"; simplified to proxy-layer pattern only                                                                |
+| §7 What Not To Do                  | Added `is_ready_frame` try/except anti-pattern                                                                                        |
+| §8 Checklist                       | Added bootstrap section; added `SESSION_CONN_ID` table note; added UDP datagram no-split note; added multi-line `parse_frame` warning |
+| §9.1 Frame pump                    | Added `splitlines()` loop                                                                                                             |
+| §9.3 `_handle_udp_data`            | Changed unknown flow_id log from WARNING to DEBUG with UDP_CLOSE ordering note                                                        |
+| §9.5 Proxy                         | Split `Cmd` and `AddrType` into separate `try/except` blocks; cleaned up `AuthMethod` negotiation loop                                |
+| §9.6 Agent `_handle_udp_data`      | Changed unknown flow_id to DEBUG with ordering note                                                                                   |
+| §10.2 Tests                        | Added `test_is_ready_frame_never_raises`; added oversized non-frame test; fixed oversized tunnel frame test                           |
+| §10.3 Tests                        | Added consecutive-dot test; added `SESSION_CONN_ID` acceptance test                                                                   |
+| §10.4 Tests                        | Added `SESSION_CONN_ID` passes `ID_RE` test; added prefix namespace isolation test                                                    |
 ```
 
