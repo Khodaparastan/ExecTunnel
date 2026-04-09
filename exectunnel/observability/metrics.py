@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 
@@ -140,12 +141,15 @@ class MetricsRegistry:
             prefix = _render_metric_key(name, tags)
             out[f"{prefix}.count"] = hist.count
             out[f"{prefix}.sum"] = round(hist.total, 6)
-            if hist.avg is not None:
-                out[f"{prefix}.avg"] = round(hist.avg, 6)
-            if hist.min is not None:
-                out[f"{prefix}.min"] = round(hist.min, 6)
-            if hist.max is not None:
-                out[f"{prefix}.max"] = round(hist.max, 6)
+            avg = hist.avg
+            if avg is not None:
+                out[f"{prefix}.avg"] = round(avg, 6)
+            h_min = hist.min
+            if h_min is not None:
+                out[f"{prefix}.min"] = round(h_min, 6)
+            h_max = hist.max
+            if h_max is not None:
+                out[f"{prefix}.max"] = round(h_max, 6)
         for (name, tags), gauge in gauges.items():
             out[_render_metric_key(name, tags)] = round(gauge.value, 6)
         return out
@@ -156,22 +160,17 @@ class MetricsRegistry:
             self._hists.clear()
             self._gauges.clear()
 
-    # Keep backward-compat alias
-    clear = reset
-
 
 METRICS = MetricsRegistry()
-
 # ── Metric listeners ─────────────────────────────────────────────────────────
 # Listeners are called synchronously inside metrics_inc() after the counter
 # is incremented.  Keep listeners fast — no I/O, no blocking.
 
-from collections.abc import Callable as _Callable  # noqa: E402
 
-_listeners: list[_Callable[..., None]] = []
+_listeners: list[Callable[..., None]] = []
 
 
-def register_metric_listener(fn: _Callable[..., None]) -> None:
+def register_metric_listener(fn: Callable[..., None]) -> None:
     """Register a callback invoked on every ``metrics_inc()`` call.
 
     The callback receives ``(name: str, **tags)`` matching the arguments
@@ -186,7 +185,7 @@ def metrics_inc(metric: str, value: int = 1, **tags: object) -> None:
     for _fn in _listeners:
         try:
             _fn(metric, **tags)
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
 

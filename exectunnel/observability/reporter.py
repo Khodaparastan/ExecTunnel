@@ -37,9 +37,10 @@ async def run_metrics_reporter(
     stop_event:
         Signals the reporter to flush a final snapshot and exit.  When
         *None* a private event is created (the reporter runs until cancelled).
+    logger_name:
+        Logger name for debug messages.  Defaults to ``exectunnel.metrics``.
     """
-    if stop_event is None:
-        stop_event = asyncio.Event()
+    event: asyncio.Event = stop_event if stop_event is not None else asyncio.Event()
 
     if interval_sec is None:
         interval_sec = parse_float_env(
@@ -57,7 +58,9 @@ async def run_metrics_reporter(
     log_fn = logger.info if log_level_env else logger.debug
 
     obs_platform = os.getenv("EXECTUNNEL_OBS_PLATFORM", "generic").strip() or "generic"
-    obs_service = os.getenv("EXECTUNNEL_OBS_SERVICE", "exectunnel").strip() or "exectunnel"
+    obs_service = (
+        os.getenv("EXECTUNNEL_OBS_SERVICE", "exectunnel").strip() or "exectunnel"
+    )
 
     def emit_log(snapshot: dict[str, object], payload: dict[str, object]) -> None:
         final = bool(payload.get("final", False))
@@ -130,9 +133,9 @@ async def run_metrics_reporter(
                         exc_info=True,
                     )
 
-    while not stop_event.is_set():
+    while not event.is_set():
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=interval_sec)
+            await asyncio.wait_for(event.wait(), timeout=interval_sec)
             break
         except TimeoutError:
             await emit_snapshot(final=False)

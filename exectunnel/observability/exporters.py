@@ -160,9 +160,7 @@ def build_exporters(
             try:
                 with urllib_request.urlopen(req, timeout=http_timeout) as resp:
                     if resp.status >= 400:
-                        raise RuntimeError(
-                            f"HTTP exporter error status: {resp.status}"
-                        )
+                        raise RuntimeError(f"HTTP exporter error status: {resp.status}")
                 return  # success
             except (urllib_error.URLError, OSError, RuntimeError) as exc:
                 last_exc = exc
