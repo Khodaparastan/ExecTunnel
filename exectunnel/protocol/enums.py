@@ -1,14 +1,18 @@
 """SOCKS5 protocol enumerations (RFC 1928 / RFC 1929).
 
-All enums use ``_missing_`` to raise an informative ``ValueError`` on unknown
-wire values rather than silently returning ``None``.  This surfaces protocol
-violations at the earliest possible point.
+All enums except ``UserPassStatus`` inherit from ``_StrictIntEnum``, which
+raises an informative ``ValueError`` on unknown wire values rather than
+silently returning ``None``.  This surfaces protocol violations at the
+earliest possible point — the moment the byte is read off the wire.
+
+``UserPassStatus`` uses a custom ``_missing_`` that maps any non-zero byte
+to ``FAILURE`` per RFC 1929 §2, so it cannot share the strict base.
 """
 
 from __future__ import annotations
 
 from enum import IntEnum
-from typing import Never
+from typing import Final, Never
 
 __all__ = [
     "AddrType",
@@ -19,7 +23,29 @@ __all__ = [
 ]
 
 
-class AuthMethod(IntEnum):
+# ── Base mixin ────────────────────────────────────────────────────────────────
+
+
+class _StrictIntEnum(IntEnum):
+    """``IntEnum`` that raises ``ValueError`` immediately on unknown wire values.
+
+    Subclasses inherit this ``_missing_`` automatically.  Do **not** override
+    ``_missing_`` in a subclass unless the RFC explicitly requires a different
+    mapping for unknown values (see ``UserPassStatus`` for the one exception).
+    """
+
+    @classmethod
+    def _missing_(cls, value: object) -> Never:
+        raise ValueError(
+            f"{value!r} is not a valid {cls.__name__} "
+            f"(expected one of {[m.value for m in cls]})"
+        )
+
+
+# ── Enumerations ──────────────────────────────────────────────────────────────
+
+
+class AuthMethod(_StrictIntEnum):
     """SOCKS5 authentication method codes (RFC 1928 §3).
 
     Note:
@@ -36,13 +62,6 @@ class AuthMethod(IntEnum):
     USERNAME_PASSWORD = 0x02
     NO_ACCEPT = 0xFF
 
-    @classmethod
-    def _missing_(cls, value: object) -> Never:
-        raise ValueError(
-            f"{value!r} is not a valid {cls.__name__} "
-            f"(expected one of {[m.value for m in cls]})"
-        )
-
     def is_supported(self) -> bool:
         """Return ``True`` if this method is implemented by this tunnel.
 
@@ -52,11 +71,10 @@ class AuthMethod(IntEnum):
         return self not in _AUTH_METHOD_UNSUPPORTED
 
 
-# Populated after class definition to avoid forward-reference issues.
-_AUTH_METHOD_UNSUPPORTED: frozenset[AuthMethod] = frozenset({AuthMethod.GSSAPI})
+_AUTH_METHOD_UNSUPPORTED: Final[frozenset[AuthMethod]] = frozenset({AuthMethod.GSSAPI})
 
 
-class Cmd(IntEnum):
+class Cmd(_StrictIntEnum):
     """SOCKS5 command codes (RFC 1928 §4).
 
     Note:
@@ -72,13 +90,6 @@ class Cmd(IntEnum):
     BIND = 0x02
     UDP_ASSOCIATE = 0x03
 
-    @classmethod
-    def _missing_(cls, value: object) -> Never:
-        raise ValueError(
-            f"{value!r} is not a valid {cls.__name__} "
-            f"(expected one of {[m.value for m in cls]})"
-        )
-
     def is_supported(self) -> bool:
         """Return ``True`` if this command is implemented by this tunnel.
 
@@ -88,26 +99,18 @@ class Cmd(IntEnum):
         return self not in _CMD_UNSUPPORTED
 
 
-# Populated after class definition to avoid forward-reference issues.
-_CMD_UNSUPPORTED: frozenset[Cmd] = frozenset({Cmd.BIND})
+_CMD_UNSUPPORTED: Final[frozenset[Cmd]] = frozenset({Cmd.BIND})
 
 
-class AddrType(IntEnum):
+class AddrType(_StrictIntEnum):
     """SOCKS5 address type codes (RFC 1928 §4)."""
 
     IPV4 = 0x01
     DOMAIN = 0x03
     IPV6 = 0x04
 
-    @classmethod
-    def _missing_(cls, value: object) -> Never:
-        raise ValueError(
-            f"{value!r} is not a valid {cls.__name__} "
-            f"(expected one of {[m.value for m in cls]})"
-        )
 
-
-class Reply(IntEnum):
+class Reply(_StrictIntEnum):
     """SOCKS5 reply codes (RFC 1928 §6)."""
 
     SUCCESS = 0x00
@@ -120,22 +123,14 @@ class Reply(IntEnum):
     CMD_NOT_SUPPORTED = 0x07
     ADDR_NOT_SUPPORTED = 0x08
 
-    @classmethod
-    def _missing_(cls, value: object) -> Never:
-        raise ValueError(
-            f"{value!r} is not a valid {cls.__name__} "
-            f"(expected one of {[m.value for m in cls]})"
-        )
-
 
 class UserPassStatus(IntEnum):
     """RFC 1929 §2 username/password sub-negotiation reply codes.
 
-    Note:
-        RFC 1929 §2 states that any non-zero status value indicates failure,
-        not just ``0xFF``.  ``_missing_`` therefore maps any non-zero byte
-        value in ``[0x01, 0xFE]`` to ``FAILURE`` so that non-standard peers
-        are handled correctly rather than raising ``ValueError``.
+    Inherits directly from ``IntEnum`` rather than ``_StrictIntEnum`` because
+    RFC 1929 §2 requires that any non-zero status byte be treated as failure,
+    not rejected.  This is the only enum in this module with a permissive
+    ``_missing_``.
     """
 
     SUCCESS = 0x00
