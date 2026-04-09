@@ -32,6 +32,7 @@ __all__ = [
     "SESSION_CONN_ID",
     "new_conn_id",
     "new_flow_id",
+    "new_session_id",
 ]
 
 # ── Internal constants ────────────────────────────────────────────────────────
@@ -52,6 +53,13 @@ _TOKEN_BYTES: Final[int] = 12
 #
 # Derived from _TOKEN_BYTES so that if the token length ever changes,
 # SESSION_CONN_ID stays structurally consistent with ID_RE automatically.
+#
+# Safety assumption: ``secrets.token_hex`` draws from a CSPRNG and will
+# never return the all-zero string in practice.  This is not enforced at
+# runtime — the sentinel relies on the all-zero token being outside the
+# reachable random space.  If _TOKEN_BYTES is ever reduced to a value
+# small enough that exhaustive enumeration becomes feasible, this
+# assumption must be re-evaluated.
 SESSION_CONN_ID: Final[str] = _TCP_PREFIX + "0" * (_TOKEN_BYTES * 2)
 
 # Compiled pattern for validating conn_id / flow_id values.
@@ -59,6 +67,36 @@ SESSION_CONN_ID: Final[str] = _TCP_PREFIX + "0" * (_TOKEN_BYTES * 2)
 # Exported so that frames.py and the agent can share the same validator
 # without importing the generator functions.
 ID_RE: Final[re.Pattern[str]] = re.compile(r"^[cu][0-9a-f]{24}$", re.ASCII)
+
+
+# ── Session ID ───────────────────────────────────────────────────────────────
+
+# Prefix for session-scoped identifiers, distinct from connection/flow prefixes
+# so that session IDs never collide with conn_ids or flow_ids structurally.
+_SESSION_PREFIX: Final[str] = "s"
+
+
+def new_session_id() -> str:
+    """Generate a unique session ID for log and task correlation.
+
+    Session IDs use the ``s`` prefix to distinguish them from TCP connection
+    IDs (``c``) and UDP flow IDs (``u``), preventing any accidental cross-type
+    confusion in logs and task names.
+
+    Returns:
+        A string of the form ``s<24 hex chars>``,
+        e.g. ``s3f7a1c9e2b4d6f8a0c2e4b6d8f0a2c4``.
+
+    Note:
+        The assert is a development-time invariant check and is stripped in
+        optimised builds (``python -O``).  It will never fire in practice
+        because ``secrets.token_hex`` is guaranteed to return lowercase hex.
+    """
+    result = _SESSION_PREFIX + secrets.token_hex(_TOKEN_BYTES)
+    assert re.match(r"^s[0-9a-f]{24}$", result, re.ASCII), (  # noqa: S101
+        f"new_session_id produced invalid ID: {result!r}"
+    )
+    return result
 
 
 def new_conn_id() -> str:

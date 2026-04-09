@@ -49,12 +49,13 @@ class AuthMethod(_StrictIntEnum):
     """SOCKS5 authentication method codes (RFC 1928 §3).
 
     Note:
-        ``GSSAPI`` is defined for wire-format completeness only.
-        This tunnel implementation does **not** support GSSAPI negotiation;
-        peers advertising only GSSAPI will receive ``NO_ACCEPT``.
+        ``GSSAPI`` and ``USERNAME_PASSWORD`` are defined for wire-format
+        completeness only.  This tunnel implementation accepts **only**
+        ``NO_AUTH``; peers advertising only unsupported methods will receive
+        ``NO_ACCEPT``.
 
     Use :meth:`is_supported` to programmatically check whether a method is
-    implemented before attempting negotiation.
+    negotiated by this tunnel before attempting negotiation.
     """
 
     NO_AUTH = 0x00
@@ -63,15 +64,18 @@ class AuthMethod(_StrictIntEnum):
     NO_ACCEPT = 0xFF
 
     def is_supported(self) -> bool:
-        """Return ``True`` if this method is implemented by this tunnel.
+        """Return ``True`` if this method is negotiated by this tunnel.
 
-        ``GSSAPI`` is defined for wire-format completeness only and is **not**
-        supported.  Callers should check this before attempting negotiation.
+        Only ``NO_AUTH`` is negotiated.  ``GSSAPI`` and ``USERNAME_PASSWORD``
+        are defined for wire-format completeness only and are **not** accepted
+        by the server.  Callers should check this before attempting negotiation.
         """
         return self not in _AUTH_METHOD_UNSUPPORTED
 
 
-_AUTH_METHOD_UNSUPPORTED: Final[frozenset[AuthMethod]] = frozenset({AuthMethod.GSSAPI})
+_AUTH_METHOD_UNSUPPORTED: Final[frozenset[AuthMethod]] = frozenset(
+    {AuthMethod.GSSAPI, AuthMethod.USERNAME_PASSWORD}
+)
 
 
 class Cmd(_StrictIntEnum):

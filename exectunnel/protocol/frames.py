@@ -63,6 +63,7 @@ __all__ = [
     "FRAME_PREFIX",
     "FRAME_SUFFIX",
     "MAX_FRAME_LEN",
+    "PORT_UNSPECIFIED",
     "READY_FRAME",
     "SESSION_CONN_ID",
     # ── Frame result type ──────────────────────────────────────────────────
@@ -91,6 +92,13 @@ log: Final[logging.Logger] = logging.getLogger(__name__)
 
 FRAME_PREFIX: Final[str] = "<<<EXECTUNNEL:"
 FRAME_SUFFIX: Final[str] = ">>>"
+
+# Sentinel for the RFC 1928 §6 "unspecified" bind address in SOCKS5 error
+# replies.  This value is intentionally NOT accepted by encode_host_port or
+# parse_host_port (both reject port 0) because it is only meaningful in
+# build_socks5_reply, which has its own separate path.  Defining it as a named
+# constant prevents accidental use of the bare literal 0 in reply-building code.
+PORT_UNSPECIFIED: Final[int] = 0
 
 # Sentinel emitted by the agent once it is ready to accept tunnel frames.
 READY_FRAME: Final[str] = "<<<EXECTUNNEL:AGENT_READY>>>"
@@ -126,6 +134,12 @@ _VALID_MSG_TYPES: Final[frozenset[str]] = frozenset({
     "UDP_DATA",
     "UDP_CLOSE",
     "ERROR",
+    # NOTE: KEEPALIVE is intentionally absent from _VALID_MSG_TYPES.
+    # KEEPALIVE is a client→agent-only heartbeat frame; the agent silently
+    # discards it and never echoes it back.  parse_frame on the inbound
+    # (agent→client) path would therefore never encounter a KEEPALIVE frame.
+    # If that invariant ever changes, add KEEPALIVE here and add a
+    # corresponding entry in _NO_CONN_ID_TYPES.
 })
 
 # Frame types that carry no conn_id on the wire.
@@ -646,7 +660,10 @@ def decode_binary_payload(payload: str) -> bytes:
             f"Invalid base64url payload: {payload[:64]!r}"
             f"{'...' if len(payload) > 64 else ''}",
             details={
-                "raw_bytes": payload.encode("ascii", errors="replace").hex()[:128],
+                # Use repr() so non-ASCII bytes injected by a proxy are
+                # faithfully represented in the diagnostic rather than
+                # silently replaced by the ascii codec's error handler.
+                "raw_bytes": repr(payload[:64]),
                 "codec": "base64url",
             },
         ) from exc
@@ -748,6 +765,13 @@ def parse_frame(line: str) -> ParsedFrame | None:
 
     # ── Step 2: prefix/suffix check — MUST come before the length guard. ──
     # A non-frame line is never an error, regardless of its length.
+    #
+    # Tolerate proxy-injected suffixes (e.g. RunFlare appends " [trace=… span=…]"
+    # after the closing ">>>").  Find the last occurrence of FRAME_SUFFIX and
+    # truncate there so the rest of the parser sees a clean frame.
+    suffix_pos = line.rfind(FRAME_SUFFIX)
+    if suffix_pos != -1:
+        line = line[: suffix_pos + len(FRAME_SUFFIX)]
     is_tunnel_frame = line.startswith(FRAME_PREFIX) and line.endswith(FRAME_SUFFIX)
 
     if not is_tunnel_frame:
@@ -791,11 +815,16 @@ def parse_frame(line: str) -> ParsedFrame | None:
     payload: str = parts[2] if len(parts) > 2 else ""
 
     # Validate conn_id format for frames that carry one.
+    # Note: if a proxy injects spaces or other characters into the frame body
+    # (between FRAME_PREFIX and FRAME_SUFFIX), the conn_id field will fail
+    # this check.  The error message says "malformed conn_id" but the root
+    # cause is proxy corruption, not a genuine protocol violation by the peer.
     if conn_id is not None and not ID_RE.match(conn_id):
         raise FrameDecodingError(
-            f"Tunnel frame has malformed conn_id {conn_id!r} (msg_type={msg_type!r}).",
+            f"Tunnel frame has malformed conn_id {conn_id!r} (msg_type={msg_type!r}). "
+            "If this follows a known-good encode, suspect proxy body corruption.",
             details={
-                "raw_bytes": line.encode("ascii", errors="replace").hex()[:128],
+                "raw_bytes": line.encode("utf-8", errors="replace").hex()[:128],
                 "codec": "frame",
             },
         )
@@ -819,11 +848,12 @@ def is_ready_frame(line: str) -> bool:
     pre-ready scan.  A typical bootstrap loop looks like::
 
         async for line in channel:
+            if is_ready_frame(line):  # pure predicate — never raises
+                break
             try:
-                if is_ready_frame(line):
-                    break
                 # Optionally call parse_frame(line) here to detect early
                 # protocol faults and log them before the tunnel is up.
+                parse_frame(line)
             except FrameDecodingError:
                 log.warning("corrupt frame during bootstrap: %r", line)
 
@@ -834,4 +864,11 @@ def is_ready_frame(line: str) -> bool:
         ``True`` if the line is the ``AGENT_READY`` sentinel (after stripping
         whitespace), ``False`` otherwise.
     """
-    return line.strip() == READY_FRAME
+    stripped = line.strip()
+    # Tolerate proxy-injected suffixes using the same rfind-based normalization
+    # as parse_frame, so that any character (space, tab, or arbitrary tag text)
+    # appended after ">>>" is handled consistently between the two paths.
+    suffix_pos = stripped.rfind(FRAME_SUFFIX)
+    if suffix_pos != -1:
+        stripped = stripped[: suffix_pos + len(FRAME_SUFFIX)]
+    return stripped == READY_FRAME
