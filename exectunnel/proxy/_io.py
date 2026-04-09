@@ -18,7 +18,8 @@ import contextlib
 
 from exectunnel.exceptions import ProtocolError
 from exectunnel.protocol import AddrType
-from exectunnel.proxy._wire import parse_socks5_addr_buf
+
+from ._wire import parse_socks5_addr_buf
 
 __all__: list[str] = [
     "close_writer",

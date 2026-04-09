@@ -11,7 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from exectunnel.exceptions import ConfigurationError
-from exectunnel.proxy._constants import (
+
+from ._constants import (
     DEFAULT_HANDSHAKE_TIMEOUT,
     DEFAULT_QUEUE_CAPACITY,
     DROP_WARN_INTERVAL,
@@ -53,7 +54,11 @@ class Socks5ServerConfig:
         if not self.host:
             raise ConfigurationError(
                 "Socks5ServerConfig.host must not be empty.",
-                details={"field": "host", "value": self.host, "expected": "non-empty string"},
+                details={
+                    "field": "host",
+                    "value": self.host,
+                    "expected": "non-empty string",
+                },
                 hint="Provide a valid bind address, e.g. '127.0.0.1' or '::1'.",
             )
 

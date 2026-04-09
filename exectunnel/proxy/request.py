@@ -13,8 +13,9 @@ from dataclasses import dataclass, field
 
 from exectunnel.exceptions import ProtocolError
 from exectunnel.protocol import Cmd, Reply
-from exectunnel.proxy._wire import build_socks5_reply
-from exectunnel.proxy.udp_relay import UdpRelay
+
+from ._wire import build_socks5_reply
+from .udp_relay import UdpRelay
 
 __all__: list[str] = ["Socks5Request"]
 

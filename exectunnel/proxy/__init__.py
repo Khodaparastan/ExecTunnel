@@ -10,10 +10,10 @@ Public types:
 
 from __future__ import annotations
 
-from exectunnel.proxy.config import Socks5ServerConfig
-from exectunnel.proxy.request import Socks5Request
-from exectunnel.proxy.server import Socks5Server
-from exectunnel.proxy.udp_relay import UdpRelay
+from .config import Socks5ServerConfig
+from .request import Socks5Request
+from .server import Socks5Server
+from .udp_relay import UdpRelay
 
 __all__: list[str] = [
     "Socks5ServerConfig",

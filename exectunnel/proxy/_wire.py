@@ -32,7 +32,6 @@ import struct
 
 from exectunnel.exceptions import ConfigurationError, ProtocolError
 from exectunnel.protocol import AddrType, Reply
-from exectunnel.proxy._constants import MAX_UDP_PAYLOAD_BYTES
 
 __all__: list[str] = [
     "build_socks5_reply",
@@ -377,12 +376,7 @@ def build_udp_header(atyp: AddrType, addr_packed: bytes, port: int) -> bytes:
     Returns:
         Header bytes ready for concatenation with the payload.
     """
-    return (
-        b"\x00\x00\x00"
-        + bytes([int(atyp)])
-        + addr_packed
-        + struct.pack("!H", port)
-    )
+    return b"\x00\x00\x00" + bytes([int(atyp)]) + addr_packed + struct.pack("!H", port)
 
 
 # ---------------------------------------------------------------------------

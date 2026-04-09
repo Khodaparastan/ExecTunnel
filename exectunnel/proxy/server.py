@@ -21,16 +21,17 @@ from exectunnel.exceptions import (
     TransportError,
 )
 from exectunnel.protocol import AuthMethod, Cmd, Reply
-from exectunnel.proxy._io import (
+
+from ._io import (
     close_writer,
     read_exact,
     read_socks5_addr,
     write_and_drain_silent,
 )
-from exectunnel.proxy._wire import build_socks5_reply
-from exectunnel.proxy.config import Socks5ServerConfig
-from exectunnel.proxy.request import Socks5Request
-from exectunnel.proxy.udp_relay import UdpRelay
+from ._wire import build_socks5_reply
+from .config import Socks5ServerConfig
+from .request import Socks5Request
+from .udp_relay import UdpRelay
 
 __all__: list[str] = ["Socks5Server"]
 
