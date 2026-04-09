@@ -15,12 +15,7 @@ import ipaddress
 import logging
 import random
 
-from exectunnel.config.defaults import (
-    CONNECT_PACE_JITTER_CAP_SECS,
-    PIPE_READ_CHUNK_BYTES,
-    UDP_DIRECT_RECV_TIMEOUT_SECS,
-    UDP_PUMP_POLL_TIMEOUT_SECS,
-)
+from exectunnel.config.defaults import Defaults
 from exectunnel.config.settings import TunnelConfig
 from exectunnel.exceptions import (
     ConnectionClosedError,
@@ -28,7 +23,12 @@ from exectunnel.exceptions import (
     TransportError,
     WebSocketSendTimeoutError,
 )
-from exectunnel.observability import metrics_gauge_inc, metrics_inc, metrics_observe, span
+from exectunnel.observability import (
+    metrics_gauge_inc,
+    metrics_inc,
+    metrics_observe,
+    span,
+)
 from exectunnel.protocol import (
     Reply,
     encode_conn_open_frame,
@@ -42,7 +42,6 @@ from ._lru import LruDict
 from ._payload import make_udp_socket
 from ._routing import is_host_excluded
 from ._state import AckStatus, PendingConnect
-
 
 logger = logging.getLogger(__name__)
 
@@ -136,9 +135,8 @@ class RequestDispatcher:
         elif req.is_udp_associate:
             with span("socks.udp_associate"):
                 await self._handle_udp_associate(req)
-        else:
-            if not req.replied:
-                await req.send_reply_error(Reply.CMD_NOT_SUPPORTED)
+        elif not req.replied:
+            await req.send_reply_error(Reply.CMD_NOT_SUPPORTED)
 
     # ── CONNECT ───────────────────────────────────────────────────────────────
 
@@ -495,7 +493,7 @@ class RequestDispatcher:
                 """Read datagrams from the SOCKS5 relay and forward through tunnel."""
                 while True:
                     try:
-                        async with asyncio.timeout(UDP_PUMP_POLL_TIMEOUT_SECS):
+                        async with asyncio.timeout(Defaults.UDP_PUMP_POLL_TIMEOUT_SECS):
                             result = await relay.recv()
                     except TimeoutError:
                         if req.reader.at_eof():
@@ -582,9 +580,9 @@ class RequestDispatcher:
                         ConnectionClosedError,
                         TransportError,
                     ) as exc:
-                        err = getattr(
-                            exc, "error_code", type(exc).__name__
-                        ).replace(".", "_")
+                        err = getattr(exc, "error_code", type(exc).__name__).replace(
+                            ".", "_"
+                        )
                         metrics_inc("udp.datagram.send.error", error=err)
                         logger.warning(
                             "udp flow %s send error [%s] — datagram dropped",
@@ -654,17 +652,13 @@ class RequestDispatcher:
             return
         if self._ack_reconnect_requested:
             return
-        if (
-            self._ack_timeout_window_count
-            < self._tun.ack_timeout_reconnect_threshold
-        ):
+        if self._ack_timeout_window_count < self._tun.ack_timeout_reconnect_threshold:
             return
 
         self._ack_reconnect_requested = True
         metrics_inc("tunnel.conn_ack.reconnect_triggered")
         logger.error(
-            "agent appears unhealthy: %d ACK timeouts within %.0fs; "
-            "forcing reconnect",
+            "agent appears unhealthy: %d ACK timeouts within %.0fs; forcing reconnect",
             self._ack_timeout_window_count,
             self._tun.ack_timeout_window_secs,
         )
@@ -712,7 +706,7 @@ class RequestDispatcher:
                         wait_for
                         + random.uniform(
                             0.0,
-                            min(CONNECT_PACE_JITTER_CAP_SECS, interval / 2.0),
+                            min(Defaults.CONNECT_PACE_JITTER_CAP_SECS, interval / 2.0),
                         )
                     )
             self._host_connect_last_open_at[host_key] = (
@@ -777,7 +771,7 @@ async def _pipe(
     ) -> None:
         try:
             while True:
-                chunk = await src.read(PIPE_READ_CHUNK_BYTES)
+                chunk = await src.read(Defaults.PIPE_READ_CHUNK_BYTES)
                 if not chunk:
                     if dst.can_write_eof():
                         with contextlib.suppress(OSError):
@@ -832,7 +826,7 @@ async def _direct_udp_relay(
         await loop.sock_connect(sock, (dst_host, dst_port))
         await loop.sock_sendall(sock, payload)
         try:
-            async with asyncio.timeout(UDP_DIRECT_RECV_TIMEOUT_SECS):
+            async with asyncio.timeout(Defaults.UDP_DIRECT_RECV_TIMEOUT_SECS):
                 response = await loop.sock_recv(sock, 65_535)
             relay.send_to_client(response, dst_host, dst_port)
         except TimeoutError:

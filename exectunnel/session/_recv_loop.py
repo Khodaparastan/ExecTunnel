@@ -44,7 +44,6 @@ from exectunnel.transport import TcpConnection, UdpFlow
 
 from ._state import AckStatus, PendingConnect
 
-
 logger = logging.getLogger(__name__)
 
 # CONN_ACK is a session-layer extension not registered in the protocol
@@ -169,7 +168,9 @@ class FrameReceiver:
         # ── CONN_ACK fast path ────────────────────────────────────────────────
         # CONN_ACK is a session-layer extension not in the protocol package's
         # _VALID_MSG_TYPES.  Intercept before parse_frame.
-        if stripped.startswith(_CONN_ACK_PREFIX) and stripped.endswith(_CONN_ACK_SUFFIX):
+        if stripped.startswith(_CONN_ACK_PREFIX) and stripped.endswith(
+            _CONN_ACK_SUFFIX
+        ):
             self._on_conn_ack(stripped)
             return
 

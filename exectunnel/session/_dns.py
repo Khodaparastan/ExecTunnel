@@ -10,12 +10,7 @@ import asyncio
 import contextlib
 import logging
 
-from exectunnel.config.defaults import (
-    DNS_MAX_INFLIGHT,
-    DNS_QUERY_TIMEOUT_SECS,
-    DNS_UPSTREAM_PORT,
-    UDP_WARN_EVERY,
-)
+from exectunnel.config.defaults import Defaults
 from exectunnel.exceptions import (
     ConnectionClosedError,
     ExecTunnelError,
@@ -25,7 +20,6 @@ from exectunnel.exceptions import (
 from exectunnel.observability import metrics_inc, metrics_observe
 from exectunnel.protocol import new_flow_id
 from exectunnel.transport import UdpFlow, WsSendCallable
-
 
 logger = logging.getLogger(__name__)
 
@@ -48,10 +42,10 @@ class _DnsDatagramProtocol(asyncio.DatagramProtocol):
             metrics_inc("dns.forwarder.bad_transport_type")
             transport.close()
             return
-        self._forwarder._on_transport_ready(transport)
+        self._forwarder.on_transport_ready(transport)
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
-        self._forwarder._on_query(data, addr)
+        self._forwarder.on_query(data, addr)
 
     def error_received(self, exc: Exception) -> None:
         metrics_inc("dns.forwarder.socket_error", reason=type(exc).__name__)
@@ -115,8 +109,8 @@ class DnsForwarder:
         upstream: str,
         ws_send: WsSendCallable,
         udp_registry: dict[str, UdpFlow],
-        max_inflight: int = DNS_MAX_INFLIGHT,
-        upstream_port: int = DNS_UPSTREAM_PORT,
+        max_inflight: int = Defaults.DNS_MAX_INFLIGHT,
+        upstream_port: int = Defaults.DNS_UPSTREAM_PORT,
     ) -> None:
         self._local_port = local_port
         self._upstream = upstream
@@ -147,10 +141,10 @@ class DnsForwarder:
 
     # ── Package-internal callbacks ────────────────────────────────────────────
 
-    def _on_transport_ready(self, transport: asyncio.DatagramTransport) -> None:
+    def on_transport_ready(self, transport: asyncio.DatagramTransport) -> None:
         self._transport = transport
 
-    def _on_query(self, data: bytes, addr: tuple[str, int]) -> None:
+    def on_query(self, data: bytes, addr: tuple[str, int]) -> None:
         metrics_inc("dns.query.received")
 
         if len(self._tasks) >= self._max_inflight:
@@ -159,7 +153,7 @@ class DnsForwarder:
             metrics_inc("dns.query.drop.saturated")
             if (
                 self._saturation_drop_count == 1
-                or self._saturation_drop_count % UDP_WARN_EVERY == 0
+                or self._saturation_drop_count % Defaults.UDP_WARN_EVERY == 0
             ):
                 logger.warning(
                     "dns forwarder saturated (%d inflight), dropping query "
@@ -300,7 +294,7 @@ class DnsForwarder:
             # Single recv — DNS is request/response.  Flow is closed in the
             # finally block immediately after, so no further datagrams can
             try:
-                async with asyncio.timeout(DNS_QUERY_TIMEOUT_SECS):
+                async with asyncio.timeout(Defaults.DNS_QUERY_TIMEOUT_SECS):
                     response = await handler.recv_datagram()
             except TimeoutError:
                 self._error_drop_count += 1
@@ -311,7 +305,7 @@ class DnsForwarder:
                     client_addr[0],
                     client_addr[1],
                     flow_id,
-                    DNS_QUERY_TIMEOUT_SECS,
+                    Defaults.DNS_QUERY_TIMEOUT_SECS,
                 )
                 return  # finally block handles cleanup.
 
@@ -319,8 +313,7 @@ class DnsForwarder:
                 agent_closed = True
                 metrics_inc("dns.query.error", error="agent_closed_no_response")
                 logger.debug(
-                    "dns query for %s:%d — agent closed flow before response "
-                    "(flow=%s)",
+                    "dns query for %s:%d — agent closed flow before response (flow=%s)",
                     client_addr[0],
                     client_addr[1],
                     flow_id,
@@ -335,8 +328,7 @@ class DnsForwarder:
                 metrics_observe("dns.query.bytes.out", float(len(response)))
             else:
                 logger.debug(
-                    "dns query for %s:%d — transport closed before reply "
-                    "(flow=%s)",
+                    "dns query for %s:%d — transport closed before reply (flow=%s)",
                     client_addr[0],
                     client_addr[1],
                     flow_id,
@@ -372,9 +364,7 @@ class DnsForwarder:
         except TransportError as exc:
             self._error_drop_count += 1
             self._total_drop_count += 1
-            metrics_inc(
-                "dns.query.error", error=exc.error_code.replace(".", "_")
-            )
+            metrics_inc("dns.query.error", error=exc.error_code.replace(".", "_"))
             logger.debug(
                 "dns query for %s:%d dropped — transport error [%s]: %s "
                 "(flow=%s, error_id=%s)",
@@ -389,9 +379,7 @@ class DnsForwarder:
         except ExecTunnelError as exc:
             self._error_drop_count += 1
             self._total_drop_count += 1
-            metrics_inc(
-                "dns.query.error", error=exc.error_code.replace(".", "_")
-            )
+            metrics_inc("dns.query.error", error=exc.error_code.replace(".", "_"))
             logger.warning(
                 "dns query for %s:%d failed [%s]: %s (flow=%s, error_id=%s)",
                 client_addr[0],

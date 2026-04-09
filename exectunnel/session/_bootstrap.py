@@ -40,12 +40,7 @@ from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed
 
 from exectunnel.config.defaults import (
-    BOOTSTRAP_CHUNK_SIZE_CHARS,
-    BOOTSTRAP_DECODE_DELAY_SECS,
-    BOOTSTRAP_DIAG_MAX_LINES,
-    BOOTSTRAP_GITHUB_FETCH_DELAY_SECS,
-    BOOTSTRAP_RM_DELAY_SECS,
-    BOOTSTRAP_STTY_DELAY_SECS,
+    Defaults,
 )
 from exectunnel.config.settings import AppConfig, TunnelConfig
 from exectunnel.exceptions import (
@@ -58,8 +53,7 @@ from exectunnel.exceptions import (
 from exectunnel.observability import metrics_inc, metrics_observe, span
 from exectunnel.protocol import is_ready_frame
 
-from ._payload import load_agent_b64
-
+from ._payload import load_agent_b64, load_go_agent_b64
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +94,7 @@ class AgentBootstrapper:
         self._app = app_cfg
         self._tun = tun_cfg
         self._diag: collections.deque[str] = collections.deque(
-            maxlen=BOOTSTRAP_DIAG_MAX_LINES
+            maxlen=Defaults.BOOTSTRAP_DIAG_MAX_LINES
         )
         self._post_ready_lines: list[str] = []
         self._pre_ready_carry: str = ""
@@ -145,16 +139,14 @@ class AgentBootstrapper:
             AgentVersionMismatchError: Remote agent version incompatible.
             BootstrapError:            Any other startup failure.
         """
+        use_go = self._tun.bootstrap_use_go_agent
         delivery = self._tun.bootstrap_delivery
-        if delivery not in _VALID_DELIVERY_MODES:
+        if not use_go and delivery not in _VALID_DELIVERY_MODES:
             raise BootstrapError(
                 f"Unknown bootstrap_delivery {delivery!r}. "
                 f"Valid values: {sorted(_VALID_DELIVERY_MODES)}",
                 details={"bootstrap_delivery": delivery},
-                hint=(
-                    "Set EXECTUNNEL_BOOTSTRAP_DELIVERY to one of: "
-                    "upload, github."
-                ),
+                hint=("Set EXECTUNNEL_BOOTSTRAP_DELIVERY to one of: upload, github."),
             )
 
         loop = asyncio.get_running_loop()
@@ -163,81 +155,29 @@ class AgentBootstrapper:
 
         with span("session.bootstrap"):
             await self._send_command("stty raw -echo", start=start)
-            await asyncio.sleep(BOOTSTRAP_STTY_DELAY_SECS)
+            await asyncio.sleep(Defaults.BOOTSTRAP_STTY_DELAY_SECS)
             metrics_inc("bootstrap.stty_done")
 
-            agent_path: str = self._tun.bootstrap_agent_path
-            sentinel_path: str = self._tun.bootstrap_syntax_ok_sentinel
-            skip_if_present: bool = self._tun.bootstrap_skip_if_present
-
-            # Determine whether the agent file is already present on the pod.
-            # We use a shell one-liner that writes "1" if the file exists and
-            # "0" otherwise, then read the response line from the WebSocket.
-            agent_present = await self._check_file_exists(agent_path, start=start)
-
-            if agent_present and skip_if_present:
-                # Agent is present and user wants to reuse it — skip delivery.
-                logger.info(
-                    "bootstrap: agent already present at %s — skipping delivery",
-                    agent_path,
-                )
-                metrics_inc("bootstrap.skip_delivery")
+            if use_go:
+                await self._run_go_bootstrap(start=start)
             else:
-                # Either the agent is absent, or the user wants a fresh copy.
-                if agent_present:
-                    # Remove stale copy before re-delivering.
-                    logger.info(
-                        "bootstrap: removing existing agent at %s before re-delivery",
-                        agent_path,
-                    )
-                    await self._send_command(
-                        f"rm -f '{agent_path}'", start=start
-                    )
-                    await asyncio.sleep(BOOTSTRAP_RM_DELAY_SECS)
+                await self._run_python_bootstrap(delivery=delivery, start=start)
 
-                if delivery == "upload":
-                    await self._deliver_via_upload(start=start)
-                else:
-                    await self._deliver_via_github(start=start)
-
-            # Decide whether to run the syntax check.
-            run_syntax = self._tun.bootstrap_syntax_check
-            if run_syntax and skip_if_present and agent_present:
-                # Check whether the syntax-OK sentinel is present — if so,
-                # we can trust the cached result and skip the check.
-                sentinel_present = await self._check_file_exists(
-                    sentinel_path, start=start
-                )
-                if sentinel_present:
-                    logger.info(
-                        "bootstrap: syntax-OK sentinel present — skipping syntax check"
-                    )
-                    metrics_inc("bootstrap.syntax_cache_hit")
-                    run_syntax = False
-
-            if run_syntax:
-                await self._run_syntax_check(
-                    agent_path=agent_path,
-                    sentinel_path=sentinel_path,
-                    start=start,
-                )
-            else:
-                metrics_inc("bootstrap.syntax_skipped")
-
-            # Exec the agent.
-            await self._send_command(
-                f"exec python3 '{agent_path}'", start=start
-            )
             metrics_inc("bootstrap.exec_started")
 
             logger.info("waiting for agent AGENT_READY…")
+            agent_path_for_wait = (
+                self._tun.bootstrap_go_agent_path
+                if use_go
+                else self._tun.bootstrap_agent_path
+            )
             try:
                 async with asyncio.timeout(self._tun.ready_timeout):
-                    await self._wait_for_ready(agent_path=agent_path, start=start)
+                    await self._wait_for_ready(
+                        agent_path=agent_path_for_wait, start=start
+                    )
             except TimeoutError as exc:
-                detail = (
-                    f"; last output: {self._diag[-1]}" if self._diag else ""
-                )
+                detail = f"; last output: {self._diag[-1]}" if self._diag else ""
                 metrics_inc("tunnel.bootstrap.timeout")
                 raise AgentReadyTimeoutError(
                     f"Agent did not signal AGENT_READY within "
@@ -249,7 +189,8 @@ class AgentBootstrapper:
                     },
                     hint=(
                         "Increase EXECTUNNEL_AGENT_TIMEOUT or check the remote "
-                        "Python version and available memory."
+                        "Python version and available memory (Go agent) or "
+                        "Python version and available memory (Python agent)."
                     ),
                 ) from exc
 
@@ -264,6 +205,94 @@ class AgentBootstrapper:
                 "session_bootstrap_duration_seconds",
                 asyncio.get_running_loop().time() - start,
             )
+
+    # ── Bootstrap strategy helpers ────────────────────────────────────────────
+
+    async def _run_python_bootstrap(self, *, delivery: str, start: float) -> None:
+        """Deliver and exec the Python agent script.
+
+        Handles upload/github delivery, optional syntax check, and exec.
+        """
+        agent_path: str = self._tun.bootstrap_agent_path
+        sentinel_path: str = self._tun.bootstrap_syntax_ok_sentinel
+        skip_if_present: bool = self._tun.bootstrap_skip_if_present
+
+        agent_present = await self._check_file_exists(agent_path, start=start)
+
+        if agent_present and skip_if_present:
+            logger.info(
+                "bootstrap: agent already present at %s — skipping delivery",
+                agent_path,
+            )
+            metrics_inc("bootstrap.skip_delivery")
+        else:
+            if agent_present:
+                logger.info(
+                    "bootstrap: removing existing agent at %s before re-delivery",
+                    agent_path,
+                )
+                await self._send_command(f"rm -f '{agent_path}'", start=start)
+                await asyncio.sleep(Defaults.BOOTSTRAP_RM_DELAY_SECS)
+
+            if delivery == "upload":
+                await self._deliver_via_upload(start=start)
+            else:
+                await self._deliver_via_github(start=start)
+
+        # Decide whether to run the syntax check.
+        run_syntax = self._tun.bootstrap_syntax_check
+        if run_syntax and skip_if_present and agent_present:
+            sentinel_present = await self._check_file_exists(sentinel_path, start=start)
+            if sentinel_present:
+                logger.info(
+                    "bootstrap: syntax-OK sentinel present — skipping syntax check"
+                )
+                metrics_inc("bootstrap.syntax_cache_hit")
+                run_syntax = False
+
+        if run_syntax:
+            await self._run_syntax_check(
+                agent_path=agent_path,
+                sentinel_path=sentinel_path,
+                start=start,
+            )
+        else:
+            metrics_inc("bootstrap.syntax_skipped")
+
+        await self._send_command(f"exec python3 '{agent_path}'", start=start)
+
+    async def _run_go_bootstrap(self, *, start: float) -> None:
+        """Deliver and exec the pre-built Go agent binary.
+
+        Uploads the static Linux/amd64 binary as base64 chunks, decodes it
+        on the pod, marks it executable, and exec's it directly.
+        No Python is required on the target pod.
+        """
+        go_path: str = self._tun.bootstrap_go_agent_path
+        skip_if_present: bool = self._tun.bootstrap_skip_if_present
+
+        agent_present = await self._check_file_exists(go_path, start=start)
+
+        if agent_present and skip_if_present:
+            logger.info(
+                "bootstrap(go): agent already present at %s — skipping delivery",
+                go_path,
+            )
+            metrics_inc("bootstrap.go.skip_delivery")
+        else:
+            if agent_present:
+                logger.info(
+                    "bootstrap(go): removing existing binary at %s before re-delivery",
+                    go_path,
+                )
+                await self._send_command(f"rm -f '{go_path}'", start=start)
+                await asyncio.sleep(Defaults.BOOTSTRAP_RM_DELAY_SECS)
+
+            await self._deliver_go_agent(start=start)
+
+        # Mark executable and exec.
+        await self._send_command(f"chmod +x '{go_path}'", start=start)
+        await self._send_command(f"exec '{go_path}'", start=start)
 
     # ── Shell command helper ──────────────────────────────────────────────────
 
@@ -365,17 +394,15 @@ class AgentBootstrapper:
         b64_path = agent_path.replace(".py", ".b64")
 
         agent_b64 = load_agent_b64()
-        chunk_count = len(range(0, len(agent_b64), BOOTSTRAP_CHUNK_SIZE_CHARS))
+        chunk_count = len(range(0, len(agent_b64), Defaults.BOOTSTRAP_CHUNK_SIZE_CHARS))
         metrics_observe("tunnel.bootstrap.chunks", float(chunk_count))
 
-        await self._send_command(
-            f"rm -f '{b64_path}'", start=start
-        )
-        await asyncio.sleep(BOOTSTRAP_RM_DELAY_SECS)
+        await self._send_command(f"rm -f '{b64_path}'", start=start)
+        await asyncio.sleep(Defaults.BOOTSTRAP_RM_DELAY_SECS)
 
         metrics_inc("bootstrap.upload_started")
-        for i in range(0, len(agent_b64), BOOTSTRAP_CHUNK_SIZE_CHARS):
-            chunk = agent_b64[i : i + BOOTSTRAP_CHUNK_SIZE_CHARS]
+        for i in range(0, len(agent_b64), Defaults.BOOTSTRAP_CHUNK_SIZE_CHARS):
+            chunk = agent_b64[i : i + Defaults.BOOTSTRAP_CHUNK_SIZE_CHARS]
             await self._send_command(
                 f"printf '%s' '{chunk}' >> '{b64_path}'",
                 start=start,
@@ -383,12 +410,11 @@ class AgentBootstrapper:
 
         metrics_inc("bootstrap.upload_done")
         await self._send_command(
-            f"sed 's/-/+/g; s/_/\\//g' '{b64_path}'"
-            f" | base64 -d > '{agent_path}'",
+            f"sed 's/-/+/g; s/_/\\//g' '{b64_path}' | base64 -d > '{agent_path}'",
             start=start,
         )
         metrics_inc("bootstrap.decode_started")
-        await asyncio.sleep(BOOTSTRAP_DECODE_DELAY_SECS)
+        await asyncio.sleep(Defaults.BOOTSTRAP_DECODE_DELAY_SECS)
         metrics_inc("bootstrap.decode_done")
 
     async def _deliver_via_github(self, *, start: float) -> None:
@@ -420,8 +446,49 @@ class AgentBootstrapper:
         # the file.  BOOTSTRAP_GITHUB_FETCH_DELAY_SECS (default 10 s) is
         # much longer than the decode-delay because a network fetch can take
         # several seconds on slow cluster egress paths.
-        await asyncio.sleep(BOOTSTRAP_GITHUB_FETCH_DELAY_SECS)
+        await asyncio.sleep(Defaults.BOOTSTRAP_GITHUB_FETCH_DELAY_SECS)
         metrics_inc("bootstrap.github_fetch_done")
+
+    async def _deliver_go_agent(self, *, start: float) -> None:
+        """Upload the pre-built Go agent binary as base64 chunks and decode it.
+
+        Encodes ``payload/go_agent/agent_linux_amd64`` as URL-safe base64 and
+        streams it to the pod in ``BOOTSTRAP_CHUNK_SIZE_CHARS``-character
+        ``printf`` chunks, then decodes with ``sed | base64 -d``.
+
+        The binary is a statically-linked Linux/amd64 ELF executable — no
+        Python or any other runtime is required on the target pod.
+
+        Note: stty and any pre-existing file removal are handled by the
+        caller (``_run_go_bootstrap()``).
+        """
+        go_path = self._tun.bootstrap_go_agent_path
+        b64_path = go_path + ".b64"
+
+        agent_b64 = load_go_agent_b64()
+        chunk_count = len(range(0, len(agent_b64), Defaults.BOOTSTRAP_CHUNK_SIZE_CHARS))
+        metrics_observe("tunnel.bootstrap.go.chunks", float(chunk_count))
+        logger.info("bootstrap(go): uploading binary as %d base64 chunks", chunk_count)
+
+        await self._send_command(f"rm -f '{b64_path}'", start=start)
+        await asyncio.sleep(Defaults.BOOTSTRAP_RM_DELAY_SECS)
+
+        metrics_inc("bootstrap.go.upload_started")
+        for i in range(0, len(agent_b64), Defaults.BOOTSTRAP_CHUNK_SIZE_CHARS):
+            chunk = agent_b64[i : i + Defaults.BOOTSTRAP_CHUNK_SIZE_CHARS]
+            await self._send_command(
+                f"printf '%s' '{chunk}' >> '{b64_path}'",
+                start=start,
+            )
+
+        metrics_inc("bootstrap.go.upload_done")
+        await self._send_command(
+            f"sed 's/-/+/g; s/_/\\//g' '{b64_path}' | base64 -d > '{go_path}'",
+            start=start,
+        )
+        metrics_inc("bootstrap.go.decode_started")
+        await asyncio.sleep(Defaults.BOOTSTRAP_DECODE_DELAY_SECS)
+        metrics_inc("bootstrap.go.decode_done")
 
     # ── Syntax check ─────────────────────────────────────────────────────────
 
@@ -524,9 +591,9 @@ class AgentBootstrapper:
 
                     # Detect SyntaxError on its own line or as the first line
                     # of a traceback header.
-                    if stripped.startswith(
-                        "SyntaxError:"
-                    ) or stripped.startswith("Traceback (most recent call last):"):
+                    if stripped.startswith("SyntaxError:") or stripped.startswith(
+                        "Traceback (most recent call last):"
+                    ):
                         # No underlying exception to chain from — the error
                         # information comes from the remote stderr text.
                         raise AgentSyntaxError(

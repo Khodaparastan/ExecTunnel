@@ -22,7 +22,7 @@ import logging
 from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed
 
-from exectunnel.config.defaults import SEND_DROP_LOG_EVERY
+from exectunnel.config.defaults import Defaults
 from exectunnel.config.settings import AppConfig
 from exectunnel.exceptions import (
     ConnectionClosedError,
@@ -31,12 +31,12 @@ from exectunnel.exceptions import (
 from exectunnel.observability import metrics_inc
 from exectunnel.protocol import FRAME_PREFIX, FRAME_SUFFIX
 
-
 logger = logging.getLogger(__name__)
 
 
 class _StopSentinel:
     """Singleton stop signal for the send-loop queues."""
+
     __slots__ = ()
 
     def __repr__(self) -> str:
@@ -114,9 +114,7 @@ class WsSender:
         if self._started:
             return
         self._started = True
-        self._loop_task = asyncio.create_task(
-            self._run(), name="tun-send-loop"
-        )
+        self._loop_task = asyncio.create_task(self._run(), name="tun-send-loop")
 
     async def stop(self) -> None:
         """Signal the send loop to exit and await its completion.
@@ -191,7 +189,7 @@ class WsSender:
             metrics_inc("tunnel.frames.send_drop")
             if (
                 self._send_drop_count == 1
-                or self._send_drop_count % SEND_DROP_LOG_EVERY == 0
+                or self._send_drop_count % Defaults.SEND_DROP_LOG_EVERY == 0
             ):
                 logger.warning(
                     "send data queue full, dropping frame (drops=%d)",

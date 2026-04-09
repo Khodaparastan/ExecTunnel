@@ -165,8 +165,7 @@ class TunnelSession:
                         f"ws_send_timeout: {exc.message} (error_id={exc.error_id})"
                     )
                     logger.warning(
-                        "WebSocket send timed out [%s] (error_id=%s) — "
-                        "will reconnect",
+                        "WebSocket send timed out [%s] (error_id=%s) — will reconnect",
                         exc.error_code,
                         exc.error_id,
                     )
@@ -239,7 +238,12 @@ class TunnelSession:
                 # Cap total delay to max_delay so jitter never overshoots.
                 delay = min(delay + jitter, max_delay)
                 attempt += 1
-                metrics_inc("session_reconnects_total", reason=reconnect_reason.split(":")[0] if reconnect_reason else "unknown")
+                metrics_inc(
+                    "session_reconnects_total",
+                    reason=reconnect_reason.split(":")[0]
+                    if reconnect_reason
+                    else "unknown",
+                )
                 metrics_observe("tunnel.reconnect.delay_sec", delay)
                 logger.warning(
                     "WebSocket disconnected (%s), reconnecting in %.1fs "
@@ -272,7 +276,10 @@ class TunnelSession:
                 else:
                     await conn.close_unstarted()
             except Exception:  # noqa: BLE001
-                logger.debug("error aborting stale tcp connection during session reset", exc_info=True)
+                logger.debug(
+                    "error aborting stale tcp connection during session reset",
+                    exc_info=True,
+                )
         self._tcp_registry.clear()
 
         # Cancel pending connect futures.
@@ -286,7 +293,9 @@ class TunnelSession:
             try:
                 await flow.close()
             except Exception:  # noqa: BLE001
-                logger.debug("error closing stale udp flow during session reset", exc_info=True)
+                logger.debug(
+                    "error closing stale udp flow during session reset", exc_info=True
+                )
         self._udp_registry.clear()
 
         # Safety net — should already be empty.

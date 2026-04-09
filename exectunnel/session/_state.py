@@ -16,14 +16,14 @@ class AckStatus(StrEnum):
     self-documenting in dashboards.
     """
 
-    OK               = "ok"
-    TIMEOUT          = "timeout"
-    WS_CLOSED        = "ws_closed"
-    AGENT_ERROR      = "agent_error"
-    AGENT_CLOSED     = "agent_closed"
-    WS_SEND_TIMEOUT  = "ws_send_timeout"
+    OK = "ok"
+    TIMEOUT = "timeout"
+    WS_CLOSED = "ws_closed"
+    AGENT_ERROR = "agent_error"
+    AGENT_CLOSED = "agent_closed"
+    WS_SEND_TIMEOUT = "ws_send_timeout"
     PRE_ACK_OVERFLOW = "pre_ack_overflow"
-    ERROR            = "error"
+    ERROR = "error"
 
 
 @dataclass(frozen=True, slots=True)

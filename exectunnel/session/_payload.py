@@ -15,6 +15,67 @@ import socket
 from exectunnel.exceptions import ConfigurationError
 
 
+@functools.lru_cache(maxsize=1)
+def load_go_agent_b64() -> str:
+    """Load the pre-built Go agent binary and return it as a URL-safe base64 string.
+
+    The binary must be pre-built via::
+
+        CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o agent_linux_amd64 .
+
+    and placed at ``payload/go_agent/agent_linux_amd64`` inside the package.
+
+    The result is LRU-cached — binary never changes at runtime.
+
+    Returns:
+        The binary as a URL-safe base64 string with no padding.
+
+    Raises:
+        ConfigurationError:
+            * ``config.go_agent_payload_missing``          — binary not found.
+            * ``config.go_agent_payload_permission_denied`` — unreadable.
+            * ``config.go_agent_payload_load_failed``       — any other I/O error.
+    """
+    try:
+        pkg = importlib.resources.files("exectunnel")
+        agent_bytes = (pkg / "payload" / "go_agent" / "agent_linux_amd64").read_bytes()
+    except FileNotFoundError as exc:
+        raise ConfigurationError(
+            "Go agent binary not found in package resources — "
+            "build it first with: "
+            "CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o agent_linux_amd64 .",
+            error_code="config.go_agent_payload_missing",
+            details={"resource_path": "exectunnel/payload/go_agent/agent_linux_amd64"},
+            hint=(
+                "Run 'make build-go-agent' from the project root to compile "
+                "the Go agent for Linux/amd64 deployment."
+            ),
+        ) from exc
+    except PermissionError as exc:
+        raise ConfigurationError(
+            "Insufficient permissions to read the Go agent binary from "
+            "package resources.",
+            error_code="config.go_agent_payload_permission_denied",
+            details={"resource_path": "exectunnel/payload/go_agent/agent_linux_amd64"},
+            hint=(
+                "Check the file permissions of the installed package directory "
+                "and ensure the current user can read it."
+            ),
+        ) from exc
+    except OSError as exc:
+        raise ConfigurationError(
+            "Unexpected I/O error while loading the Go agent binary from "
+            "package resources.",
+            error_code="config.go_agent_payload_load_failed",
+            details={
+                "resource_path": "exectunnel/payload/go_agent/agent_linux_amd64",
+                "cause": repr(exc),
+            },
+            hint="Reinstall the package and check for filesystem or packaging issues.",
+        ) from exc
+
+    return base64.urlsafe_b64encode(agent_bytes).rstrip(b"=").decode("ascii")
+
 
 @functools.lru_cache(maxsize=1)
 def load_agent_b64() -> str:
