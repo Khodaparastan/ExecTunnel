@@ -1,23 +1,187 @@
-"""Agent payload loading and UDP socket helpers for the session layer.
+"""Agent payload loading helpers for the session layer.
 
-``load_agent_b64`` is called once per process lifetime (LRU-cached).
-``make_udp_socket`` / ``resolve_address_family`` are async-safe helpers
-used by the direct-UDP relay path in ``_handlers.py``.
+``load_agent_b64`` / ``load_go_agent_b64`` are called once per process
+lifetime (cached).  Both return URL-safe base64 with standard ``=``
+padding so callers need only convert ``- → +`` and ``_ → /`` before
+decoding on the remote.
+
+Call ``clear_caches()`` to force a reload (useful during development or
+after a hot-swap of the payload on disk).
 """
 
-import asyncio
+from __future__ import annotations
+
 import base64
 import functools
 import importlib.resources
-import ipaddress
-import socket
+import logging
+import threading
+from typing import Final
 
 from exectunnel.exceptions import ConfigurationError
+
+__all__ = [
+    "clear_caches",
+    "load_agent_b64",
+    "load_go_agent_b64",
+]
+
+logger = logging.getLogger(__name__)
+
+# Minimum payload sizes (bytes) to catch empty / truncated resources early.
+_MIN_PYTHON_AGENT_SIZE: Final[int] = 256
+# Static Go binaries are always several MB; 512 KB is a safe lower bound
+# that catches stubs/placeholders while allowing stripped minimal builds.
+_MIN_GO_AGENT_SIZE: Final[int] = 524_288  # 512 KiB
+
+# Protects lru_cache clear + re-prime against concurrent callers.
+_CACHE_LOCK: threading.Lock = threading.Lock()
+
+
+# ── Private helpers ───────────────────────────────────────────────────────────
+
+
+def _load_resource_bytes(
+    resource_path: tuple[str, ...],
+    error_code_prefix: str,
+    not_found_message: str,
+    not_found_hint: str,
+    min_size: int = 0,
+) -> bytes:
+    """Load a package resource and return its raw bytes.
+
+    Args:
+        resource_path:      Non-empty path components relative to the
+                            ``exectunnel`` package root.
+        error_code_prefix:  Prefix for ``ConfigurationError.error_code``.
+        not_found_message:  Human-readable message for ``FileNotFoundError``.
+        not_found_hint:     Hint string for ``FileNotFoundError``.
+        min_size:           Minimum expected byte count.  A resource smaller
+                            than this is treated as corrupt/truncated.
+
+    Returns:
+        The raw resource bytes.
+
+    Raises:
+        ConfigurationError: On any I/O or validation failure.
+        ValueError:         If *resource_path* is empty.
+    """
+    if not resource_path:
+        raise ValueError("resource_path must not be empty")
+
+    pkg = importlib.resources.files("exectunnel")
+    node = pkg
+    for part in resource_path:
+        node /= part
+
+    # Used only for logging / error messages — not for actual I/O.
+    resource_str = "/".join(("exectunnel", *resource_path))
+
+    try:
+        data: bytes = node.read_bytes()
+    except FileNotFoundError as exc:
+        raise ConfigurationError(
+            not_found_message,
+            error_code=f"{error_code_prefix}_missing",
+            details={"resource_path": resource_str},
+            hint=not_found_hint,
+        ) from exc
+    except PermissionError as exc:
+        raise ConfigurationError(
+            f"Insufficient permissions to read {resource_str!r} from package resources.",
+            error_code=f"{error_code_prefix}_permission_denied",
+            details={"resource_path": resource_str},
+            hint=(
+                "Check the file permissions of the installed package directory "
+                "and ensure the current user can read it."
+            ),
+        ) from exc
+    except OSError as exc:
+        raise ConfigurationError(
+            f"Unexpected I/O error while loading {resource_str!r} from package resources.",
+            error_code=f"{error_code_prefix}_load_failed",
+            details={"resource_path": resource_str, "cause": repr(exc)},
+            hint="Reinstall the package and check for filesystem or packaging issues.",
+        ) from exc
+
+    if min_size and len(data) < min_size:
+        raise ConfigurationError(
+            f"Resource {resource_str!r} is only {len(data):,} bytes — "
+            f"expected at least {min_size:,}. The file may be truncated or corrupt.",
+            error_code=f"{error_code_prefix}_truncated",
+            details={
+                "resource_path": resource_str,
+                "actual_size": len(data),
+                "min_size": min_size,
+            },
+            hint="Reinstall the package or rebuild the agent payload.",
+        )
+
+    return data
+
+
+def _encode_urlsafe_b64(data: bytes) -> str:
+    """Encode *data* as URL-safe base64 **with standard ``=`` padding**.
+
+    URL-safe base64 uses ``-`` instead of ``+`` and ``_`` instead of ``/``,
+    making the string safe for ``printf '%s'`` in all POSIX shells.
+
+    Standard padding (``=``) is preserved so the bootstrapper can decode
+    with ``sed 's/-/+/g; s/_/\\//g' | base64 -d`` without needing to
+    re-compute padding characters.
+
+    Returns:
+        An ASCII string containing only ``[A-Za-z0-9_\\-=]``.
+    """
+    return base64.urlsafe_b64encode(data).decode("ascii")
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+
+@functools.lru_cache(maxsize=1)
+def load_agent_b64() -> str:
+    """Load ``payload/agent.py`` and return it as a padded URL-safe base64 string.
+
+    The result is cached after the first call — the agent payload never
+    changes at runtime.  Call :func:`clear_caches` to force a reload.
+
+    Returns:
+        The agent source as a padded URL-safe base64 string.
+
+    Raises:
+        ConfigurationError:
+            * ``config.agent_payload_missing``           — resource not found.
+            * ``config.agent_payload_truncated``         — too small.
+            * ``config.agent_payload_permission_denied`` — unreadable.
+            * ``config.agent_payload_load_failed``       — any other I/O error.
+    """
+    data = _load_resource_bytes(
+        resource_path=("payload", "agent.py"),
+        error_code_prefix="config.agent_payload",
+        not_found_message=(
+            "Agent payload not found in package resources — "
+            "the installation may be incomplete or corrupted."
+        ),
+        not_found_hint=(
+            "Reinstall the package and verify that payload/agent.py is "
+            "included in the distribution. If using an editable install, "
+            "ensure the source tree is intact."
+        ),
+        min_size=_MIN_PYTHON_AGENT_SIZE,
+    )
+    result = _encode_urlsafe_b64(data)
+    logger.debug(
+        "loaded agent.py payload: %d bytes → %d base64 chars",
+        len(data),
+        len(result),
+    )
+    return result
 
 
 @functools.lru_cache(maxsize=1)
 def load_go_agent_b64() -> str:
-    """Load the pre-built Go agent binary and return it as a URL-safe base64 string.
+    """Load the pre-built Go agent binary as a padded URL-safe base64 string.
 
     The binary must be pre-built via::
 
@@ -25,204 +189,45 @@ def load_go_agent_b64() -> str:
 
     and placed at ``payload/go_agent/agent_linux_amd64`` inside the package.
 
-    The result is LRU-cached — binary never changes at runtime.
-
     Returns:
-        The binary as a URL-safe base64 string with no padding.
+        The binary as a padded URL-safe base64 string.
 
     Raises:
         ConfigurationError:
-            * ``config.go_agent_payload_missing``          — binary not found.
+            * ``config.go_agent_payload_missing``           — binary not found.
+            * ``config.go_agent_payload_truncated``         — too small (< 512 KiB).
             * ``config.go_agent_payload_permission_denied`` — unreadable.
             * ``config.go_agent_payload_load_failed``       — any other I/O error.
     """
-    try:
-        pkg = importlib.resources.files("exectunnel")
-        agent_bytes = (pkg / "payload" / "go_agent" / "agent_linux_amd64").read_bytes()
-    except FileNotFoundError as exc:
-        raise ConfigurationError(
+    data = _load_resource_bytes(
+        resource_path=("payload", "go_agent", "agent_linux_amd64"),
+        error_code_prefix="config.go_agent_payload",
+        not_found_message=(
             "Go agent binary not found in package resources — "
             "build it first with: "
-            "CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o agent_linux_amd64 .",
-            error_code="config.go_agent_payload_missing",
-            details={"resource_path": "exectunnel/payload/go_agent/agent_linux_amd64"},
-            hint=(
-                "Run 'make build-go-agent' from the project root to compile "
-                "the Go agent for Linux/amd64 deployment."
-            ),
-        ) from exc
-    except PermissionError as exc:
-        raise ConfigurationError(
-            "Insufficient permissions to read the Go agent binary from "
-            "package resources.",
-            error_code="config.go_agent_payload_permission_denied",
-            details={"resource_path": "exectunnel/payload/go_agent/agent_linux_amd64"},
-            hint=(
-                "Check the file permissions of the installed package directory "
-                "and ensure the current user can read it."
-            ),
-        ) from exc
-    except OSError as exc:
-        raise ConfigurationError(
-            "Unexpected I/O error while loading the Go agent binary from "
-            "package resources.",
-            error_code="config.go_agent_payload_load_failed",
-            details={
-                "resource_path": "exectunnel/payload/go_agent/agent_linux_amd64",
-                "cause": repr(exc),
-            },
-            hint="Reinstall the package and check for filesystem or packaging issues.",
-        ) from exc
-
-    return base64.urlsafe_b64encode(agent_bytes).rstrip(b"=").decode("ascii")
+            "CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o agent_linux_amd64 ."
+        ),
+        not_found_hint=(
+            "Run 'make build-go-agent' from the project root to compile "
+            "the Go agent for Linux/amd64 deployment."
+        ),
+        min_size=_MIN_GO_AGENT_SIZE,
+    )
+    result = _encode_urlsafe_b64(data)
+    logger.debug(
+        "loaded Go agent payload: %d bytes → %d base64 chars",
+        len(data),
+        len(result),
+    )
+    return result
 
 
-@functools.lru_cache(maxsize=1)
-def load_agent_b64() -> str:
-    """Load ``payload/agent.py`` and return it as a URL-safe base64 string.
+def clear_caches() -> None:
+    """Evict cached payloads so the next call reloads from disk.
 
-    The result is cached after the first call — the agent payload never
-    changes at runtime and re-reading + re-encoding on every session
-    reconnect is unnecessary I/O.
-
-    URL-safe base64 (``urlsafe_b64encode``) is used so the encoded string
-    contains only ``[A-Za-z0-9_-]`` characters, which are unconditionally
-    safe as ``printf '%s'`` arguments in all POSIX shell environments.
-    Standard base64 produces ``+`` and ``/`` which are valid in most shells
-    but can be misinterpreted by some ``printf`` implementations when they
-    appear at chunk boundaries.
-
-    Returns:
-        The agent source as a URL-safe base64 string with no padding.
-
-    Raises:
-        ConfigurationError:
-            * ``config.agent_payload_missing``          — resource not found.
-            * ``config.agent_payload_permission_denied`` — unreadable.
-            * ``config.agent_payload_load_failed``       — any other I/O error.
+    Thread-safe: acquires an internal lock so that a concurrent
+    ``load_*`` call cannot observe a partially-cleared cache.
     """
-    try:
-        pkg = importlib.resources.files("exectunnel")
-        # Two separate / joins — the API contract does not guarantee that a
-        # single string with "/" is treated as a path separator.
-        agent_bytes = (pkg / "payload" / "agent.py").read_bytes()
-    except FileNotFoundError as exc:
-        raise ConfigurationError(
-            "Agent payload not found in package resources — "
-            "the installation may be incomplete or corrupted.",
-            error_code="config.agent_payload_missing",
-            details={"resource_path": "exectunnel/payload/agent.py"},
-            hint=(
-                "Reinstall the package and verify that payload/agent.py is "
-                "included in the distribution. If using an editable install, "
-                "ensure the source tree is intact."
-            ),
-        ) from exc
-    except PermissionError as exc:
-        raise ConfigurationError(
-            "Insufficient permissions to read the agent payload from "
-            "package resources.",
-            error_code="config.agent_payload_permission_denied",
-            details={"resource_path": "exectunnel/payload/agent.py"},
-            hint=(
-                "Check the file permissions of the installed package directory "
-                "and ensure the current user can read it."
-            ),
-        ) from exc
-    except OSError as exc:
-        # Covers all remaining I/O errors (e.g. EIO, ENOSPC) without
-        # accidentally catching KeyboardInterrupt / SystemExit.
-        raise ConfigurationError(
-            "Unexpected I/O error while loading the agent payload from "
-            "package resources.",
-            error_code="config.agent_payload_load_failed",
-            details={
-                "resource_path": "exectunnel/payload/agent.py",
-                "cause": repr(exc),
-            },
-            hint="Reinstall the package and check for filesystem or packaging issues.",
-        ) from exc
-
-    # urlsafe_b64encode never raises on bytes input — no try/except needed.
-    return base64.urlsafe_b64encode(agent_bytes).rstrip(b"=").decode("ascii")
-
-
-async def resolve_address_family(host: str) -> socket.AddressFamily:
-    """Resolve the correct socket address family for *host* without blocking.
-
-    For IP literals the resolution is synchronous (no I/O).
-    For domain names ``getaddrinfo`` is dispatched to the default executor
-    so the event loop is never blocked.
-
-    Args:
-        host: An IPv4 or IPv6 address string, or a domain name.
-
-    Returns:
-        ``socket.AF_INET`` or ``socket.AF_INET6``.
-
-    Raises:
-        ConfigurationError: If the address family cannot be determined.
-    """
-    try:
-        addr = ipaddress.ip_address(host)
-        return socket.AF_INET6 if addr.version == 6 else socket.AF_INET
-    except ValueError:
-        pass
-
-    loop = asyncio.get_running_loop()
-    try:
-        infos = await loop.getaddrinfo(host, None, type=socket.SOCK_DGRAM)
-        if not infos:
-            raise OSError(f"getaddrinfo returned no results for {host!r}")
-        return infos[0][0]
-    except OSError as exc:
-        raise ConfigurationError(
-            f"Failed to resolve address family for host {host!r}.",
-            error_code="config.udp_socket_resolve_failed",
-            details={"host": host, "os_error": str(exc)},
-            hint=(
-                "Ensure the host is reachable and DNS is functioning. "
-                "Domain names in the exclusion list are resolved locally "
-                "to determine the UDP socket address family."
-            ),
-        ) from exc
-
-
-async def make_udp_socket(host: str) -> socket.socket:
-    """Create a UDP socket with the correct address family for *host*.
-
-    Always safe to call from the asyncio event loop thread — domain name
-    resolution is dispatched to the executor.
-
-    The caller is responsible for closing the returned socket.
-
-    Args:
-        host: An IPv4 or IPv6 address string, or a domain name.
-
-    Returns:
-        An unconnected UDP socket with the correct address family.
-
-    Raises:
-        ConfigurationError: If the OS refuses to create a UDP socket or
-            address family resolution fails.
-    """
-    family = await resolve_address_family(host)
-    family_name = "AF_INET6" if family == socket.AF_INET6 else "AF_INET"
-    try:
-        return socket.socket(family, socket.SOCK_DGRAM)
-    except OSError as exc:
-        raise ConfigurationError(
-            f"Failed to create a UDP socket for address family {family_name}.",
-            error_code="config.udp_socket_create_failed",
-            details={
-                "host": host,
-                "address_family": family_name,
-                "os_error": str(exc),
-            },
-            hint=(
-                f"Ensure {family_name} is supported and enabled on this host. "
-                "For IPv6, check that the kernel has IPv6 support compiled in "
-                "and that it is not disabled via "
-                "sysctl net.ipv6.conf.all.disable_ipv6."
-            ),
-        ) from exc
+    with _CACHE_LOCK:
+        load_agent_b64.cache_clear()
+        load_go_agent_b64.cache_clear()
