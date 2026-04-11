@@ -45,10 +45,10 @@ if TYPE_CHECKING:
     from exectunnel.transport.udp import UdpFlow
 
 __all__ = [
-    "WsSendCallable",
-    "TransportHandler",
     "TcpRegistry",
+    "TransportHandler",
     "UdpRegistry",
+    "WsSendCallable",
 ]
 
 

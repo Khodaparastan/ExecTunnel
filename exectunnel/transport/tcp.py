@@ -18,8 +18,8 @@ Lifecycle
 5. Either direction finishing triggers :meth:`~TcpConnection._on_task_done`,
    which cancels the sibling task (unless half-close applies) and schedules
    :meth:`~TcpConnection._cleanup`.
-6. :meth:`~TcpConnection._cleanup` awaits both tasks, evicts from registry,
-   closes writer.
+6. :meth:`~TcpConnection._cleanup` awaits both tasks, sends ``CONN_CLOSE``
+   if neither task already sent it, evicts from registry, closes writer.
 
 Half-close semantics
 --------------------
@@ -204,12 +204,6 @@ def _log_task_exception(
             )
 
         case OSError():
-            # OSError is logged at DEBUG because the most common cause is a
-            # dead local socket (e.g. BrokenPipeError from _downstream), which
-            # is expected and not actionable.  Note that an OSError raised by
-            # ws.send() inside _upstream also reaches this branch at DEBUG —
-            # if ws.send() OSErrors become a concern, _upstream should catch
-            # them separately before they propagate here.
             metrics_inc(f"tcp.connection.{direction}.error", error="os_error")
             logger.debug(
                 "conn %s: %s socket error: %s",
@@ -358,6 +352,11 @@ class TcpConnection:
 
         Idempotent — subsequent calls are logged and ignored.
 
+        Raises :class:`TransportError` if the connection has already been
+        cleaned up (e.g. via :meth:`close_unstarted` or pre-ACK overflow).
+        Starting a dead connection would spawn tasks on a closed writer,
+        causing immediate ``OSError`` cascades.
+
         If :meth:`on_remote_closed` was called before :meth:`start` (e.g. the
         agent rejected the connection immediately), ``_remote_closed`` is
         already set and ``_downstream`` will drain any buffered data then exit
@@ -373,10 +372,15 @@ class TcpConnection:
 
         Done-callback registration
         --------------------------
-        Callbacks are registered on the local task variables *before* being
-        assigned to ``self._upstream_task`` / ``self._downstream_task`` to
-        eliminate the window where a callback could fire before the instance
-        attributes are set.
+        ``asyncio.create_task`` schedules the coroutine for the *next* event
+        loop iteration — the task cannot complete before control returns to
+        the event loop.  Therefore the registration and assignment order below
+        has no correctness implications; both happen synchronously before the
+        loop yields.  The explicit ordering is retained for readability.
+
+        Raises:
+            TransportError: If ``_closed`` is already set (``error_code``
+                ``"transport.start_on_closed"``).
         """
         if self._started:
             logger.debug(
@@ -385,6 +389,22 @@ class TcpConnection:
                 extra={"conn_id": self._id},
             )
             return
+
+        # ── Guard: reject start on a dead connection ──────────────────────
+        # This catches the case where close_unstarted() or pre-ACK overflow
+        # already ran _cleanup() — without this guard, tasks would be spawned
+        # on a closed writer and immediately error out.
+        if self._closed.is_set():
+            raise TransportError(
+                f"conn {self._id!r}: start() called on a closed connection.",
+                error_code="transport.start_on_closed",
+                details={"conn_id": self._id},
+                hint=(
+                    "The connection was already cleaned up (via close_unstarted() "
+                    "or pre-ACK buffer overflow). Do not call start() after cleanup."
+                ),
+            )
+
         self._started = True
 
         for chunk in self._pre_ack_buffer:
@@ -412,8 +432,6 @@ class TcpConnection:
             self._downstream(), name=f"tcp-down-{self._id}"
         )
 
-        # Register callbacks before storing to instance — eliminates the
-        # window where _on_task_done fires before self._*_task is assigned.
         upstream_task.add_done_callback(self._on_task_done)
         downstream_task.add_done_callback(self._on_task_done)
 
@@ -611,6 +629,12 @@ class TcpConnection:
         """
         if not self._closed.is_set():
             self._remote_closed.set()
+            metrics_inc("tcp.connection.closed_remote")
+            logger.debug(
+                "conn %s: remote closed signalled",
+                self._id,
+                extra={"conn_id": self._id},
+            )
 
     def abort(self) -> None:
         """Hard-cancel both directions immediately.
@@ -674,9 +698,8 @@ class TcpConnection:
         tunnel, not bytes that were read but may have been lost on send failure.
 
         ``CONN_CLOSE`` is sent in the ``finally`` block only when the upstream
-        task was not cancelled — a cancelled upstream means the connection is
-        already being torn down from another path and the close frame will be
-        (or has already been) sent by that path.
+        task was not cancelled — a cancelled upstream means cleanup will send
+        ``CONN_CLOSE`` as a safety net via :meth:`_cleanup`.
         """
         with span("tcp.connection.upstream"):
             start = asyncio.get_running_loop().time()
@@ -711,8 +734,8 @@ class TcpConnection:
                 metrics_observe(
                     "tcp.connection.upstream.bytes", float(self._bytes_upstream)
                 )
-                # Send CONN_CLOSE only when not cancelled — a cancelled upstream
-                # means teardown is already in progress from another path.
+                # Send CONN_CLOSE only when not cancelled — when cancelled,
+                # _cleanup() will send it as an idempotent safety net.
                 if not _cancelled:
                     await self._send_close_frame_once()
 
@@ -739,8 +762,8 @@ class TcpConnection:
         write on every iteration.
 
         The ``_on_task_done`` callback detects the downstream exit and cancels
-        the upstream task, which sends ``CONN_CLOSE`` to the agent so the
-        agent-side socket is also torn down cleanly.
+        the upstream task.  ``CONN_CLOSE`` is guaranteed to be sent by the
+        ``_cleanup`` safety net even when upstream is cancelled.
 
         Task reuse strategy
         -------------------
@@ -783,14 +806,8 @@ class TcpConnection:
                             self._writer.write(chunk)
                         try:
                             await self._writer.drain()
-                            for chunk in batch:
-                                self._bytes_downstream += len(chunk)
+                            self._bytes_downstream += sum(len(c) for c in batch)
                         except OSError as exc:
-                            # Local socket is dead — no recovery possible.
-                            # Exit immediately to stop the log storm that would
-                            # occur if we continued looping over a dead writer.
-                            # _on_task_done will cancel upstream and send
-                            # CONN_CLOSE to the agent.
                             metrics_inc(
                                 "tcp.connection.downstream.error", error="os_drain"
                             )
@@ -811,9 +828,6 @@ class TcpConnection:
                                 self._writer.write_eof()
                                 await self._writer.drain()
                             except OSError as exc:
-                                # Socket already dead — EOF not deliverable.
-                                # Exit cleanly; upstream will be cancelled by
-                                # _on_task_done.
                                 logger.debug(
                                     "conn %s: downstream write_eof error: %s — "
                                     "local socket closed",
@@ -826,8 +840,6 @@ class TcpConnection:
                         break
 
                     # ── Block until data arrives OR remote closes ─────────────
-                    # close_task is reused; get_task is fresh each iteration
-                    # since Queue.get() is consumed on completion.
                     get_task: asyncio.Task[bytes] = asyncio.create_task(
                         self._inbound.get(),
                         name=f"tcp-down-get-{self._id}",
@@ -839,15 +851,12 @@ class TcpConnection:
                             return_when=asyncio.FIRST_COMPLETED,
                         )
                     except asyncio.CancelledError:
-                        # Cancel get_task only — close_task cleanup is handled
-                        # by the finally block unconditionally.
                         get_task.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
                             await get_task
                         raise
 
-                    # Cancel the get_task loser only — close_task is reused
-                    # and must not be cancelled here.
+                    # Cancel the get_task loser only — close_task is reused.
                     if get_task not in done:
                         get_task.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
@@ -860,9 +869,6 @@ class TcpConnection:
                             await self._writer.drain()
                             self._bytes_downstream += len(chunk)
                         except OSError as exc:
-                            # Local socket is dead — no recovery possible.
-                            # Exit immediately; _on_task_done handles upstream
-                            # cancellation and CONN_CLOSE.
                             metrics_inc(
                                 "tcp.connection.downstream.error", error="os_drain"
                             )
@@ -874,10 +880,7 @@ class TcpConnection:
                                 extra={"conn_id": self._id},
                             )
                             return
-                    # If close_task fired (or both fired), loop back to the
-                    # batch-drain path.  The close flag is only honoured after
-                    # the queue is fully drained — the batch-drain path empties
-                    # the queue first, then checks _remote_closed.is_set().
+                    # If close_task fired, loop back to batch-drain.
 
             except asyncio.CancelledError:
                 metrics_inc("tcp.connection.downstream.cancelled")
@@ -887,9 +890,6 @@ class TcpConnection:
                 _log_task_exception(self._id, "downstream", exc, self._bytes_downstream)
 
             finally:
-                # Always cancel the reused close_task on exit so it does not
-                # leak if _downstream exits via any path (clean, error, cancel,
-                # or early return on OSError).
                 if not close_task.done():
                     close_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
@@ -910,9 +910,7 @@ class TcpConnection:
         is encoded consistently with the rest of the protocol layer.
 
         All exceptions are caught and logged — teardown must always complete
-        regardless of send failures.  ``WebSocketSendTimeoutError`` and
-        ``ConnectionClosedError`` are logged at WARNING; all other exceptions
-        are logged at WARNING with full traceback at DEBUG.
+        regardless of send failures.
         """
         if self._conn_close_sent:
             return
@@ -971,11 +969,7 @@ class TcpConnection:
 
         When ``_downstream`` exits (cleanly or otherwise, including early
         return on ``OSError``), ``_upstream`` is always cancelled — there is
-        no more inbound data to relay.  This is the path that fires when
-        aria2 closes its SOCKS5 connection mid-download: ``_downstream``
-        returns on ``BrokenPipeError``, this callback cancels ``_upstream``,
-        ``_upstream``'s ``finally`` sends ``CONN_CLOSE`` to the agent, and
-        the agent tears down its TCP connection to the CDN.
+        no more inbound data to relay.
 
         When ``_upstream`` exits with an error or is cancelled, ``_downstream``
         is cancelled immediately.
@@ -1009,20 +1003,14 @@ class TcpConnection:
                         exc,
                     )
 
-        # A task ended cleanly iff it was not cancelled and raised no exception.
         task_ended_cleanly = not task.cancelled() and task.exception() is None
 
         should_cancel_peer: bool
         if task is self._upstream_task:
-            # Keep downstream alive only when upstream ended cleanly
-            # (local client sent EOF — server may still reply).
             should_cancel_peer = not (
                 task_ended_cleanly and self._upstream_ended_cleanly
             )
         else:
-            # Downstream finished (cleanly, via error, or via early return on
-            # OSError) → always cancel upstream.  There is no more inbound
-            # data to relay.  Upstream's finally block sends CONN_CLOSE.
             should_cancel_peer = True
 
         if should_cancel_peer:
@@ -1034,8 +1022,6 @@ class TcpConnection:
                 ):
                     candidate.cancel()
 
-        # Schedule cleanup only when both tasks are finished, cleanup has not
-        # already been scheduled, and the closed gate has not been set.
         both_done = (self._upstream_task is None or self._upstream_task.done()) and (
             self._downstream_task is None or self._downstream_task.done()
         )
@@ -1059,13 +1045,26 @@ class TcpConnection:
                 )
 
     async def _cleanup(self) -> None:
-        """Await all tasks, remove from registry, close the local writer.
+        """Await all tasks, send CONN_CLOSE if needed, remove from registry,
+        close the local writer.
 
         ``_closed`` is set at entry as the authoritative gate — concurrent
         calls (e.g. from ``_on_task_done`` and a direct external call) are
         no-ops after the first execution.  The ``_cleanup_task is None`` guard
         in ``_on_task_done`` prevents double-*scheduling*; this guard prevents
         double-*execution*.
+
+        CONN_CLOSE safety net
+        ---------------------
+        ``_send_close_frame_once`` is called after both tasks are awaited so
+        there is no race with ``_upstream``'s own ``finally`` block.  The
+        method is idempotent (checks ``_conn_close_sent``), so a redundant
+        call when upstream already sent it is a no-op.
+
+        This covers the case where ``_downstream`` exits early (e.g. local
+        socket OSError) and ``_on_task_done`` cancels ``_upstream`` — the
+        cancelled upstream skips its own CONN_CLOSE send, but ``_cleanup``
+        sends it here so the agent is always notified.
         """
         if self._closed.is_set():
             return
@@ -1079,10 +1078,6 @@ class TcpConnection:
                 task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
-            # Log any unhandled exception that was not caught by
-            # _log_task_exception (e.g. a new exception type added in a future
-            # Python version).  _on_cleanup_done covers the cleanup task itself
-            # but not the tasks being awaited here.
             if not task.cancelled() and task.exception() is not None:
                 logger.warning(
                     "conn %s task %s raised an unhandled exception during cleanup: %s",
@@ -1092,6 +1087,11 @@ class TcpConnection:
                     exc_info=task.exception(),
                     extra={"conn_id": self._id},
                 )
+
+        # ── CONN_CLOSE safety net ─────────────────────────────────────────
+        # Guarantees the agent is notified regardless of which teardown path
+        # ran.  Idempotent — no-op when upstream already sent the frame.
+        await self._send_close_frame_once()
 
         self._registry.pop(self._id, None)
         metrics_gauge_dec("session_active_tcp_connections")
@@ -1162,3 +1162,19 @@ class TcpConnection:
     def drop_count(self) -> int:
         """Total inbound chunks dropped due to queue saturation or buffer overflow."""
         return self._drop_count
+
+    # ── Debug ─────────────────────────────────────────────────────────────────
+
+    def __repr__(self) -> str:
+        if self._closed.is_set():
+            state = "closed"
+        elif self._started:
+            state = "started"
+        else:
+            state = "new"
+        return (
+            f"<TcpConnection id={self._id} state={state} "
+            f"remote_closed={self._remote_closed.is_set()} "
+            f"up={self._bytes_upstream} down={self._bytes_downstream} "
+            f"drops={self._drop_count}>"
+        )

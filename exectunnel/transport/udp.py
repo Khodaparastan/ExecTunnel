@@ -13,7 +13,7 @@ Lifecycle
 3. Call :meth:`~UdpFlow.send_datagram` / :meth:`~UdpFlow.recv_datagram`
    to relay datagrams.
 4. Call :meth:`~UdpFlow.close` for local teardown (sends ``UDP_CLOSE``
-   to the agent).
+   to the agent only if ``open()`` succeeded).
    OR the agent signals closure → recv_loop calls
    :meth:`~UdpFlow.on_remote_closed`.
 5. Both paths set ``_closed`` so :meth:`~UdpFlow.recv_datagram` unblocks.
@@ -216,12 +216,6 @@ class UdpFlow:
                 hint="Check WebSocket connectivity to the remote agent.",
             ) from exc
 
-        # Mark as opened only after successful send.  If the send raised
-        # WebSocketSendTimeoutError or ConnectionClosedError above, _opened
-        # remains False and the caller may retry.  On retry the frame is
-        # re-encoded and re-sent; the agent handles a duplicate UDP_OPEN for
-        # the same flow_id by emitting UDP_CLOSE and ignoring the second open,
-        # so duplicate opens are safe but should be avoided by the caller.
         self._opened = True
         metrics_inc("udp.flow.opened")
         logger.debug(
@@ -242,6 +236,12 @@ class UdpFlow:
         Any datagrams still queued in ``_inbound`` at close time are silently
         abandoned — this is intentional UDP semantics; datagrams may be lost.
 
+        ``UDP_CLOSE`` is only sent when :meth:`open` completed successfully
+        (``_opened is True``).  If ``open()`` was never called or failed, the
+        agent has no record of this flow and sending a close frame for an
+        unknown flow ID would be a wasted frame (the agent drops it, but the
+        log noise is undesirable).
+
         Raises:
             WebSocketSendTimeoutError:
                 If the close frame cannot be delivered within the configured
@@ -260,6 +260,14 @@ class UdpFlow:
         self._evict()
         metrics_inc("udp.flow.closed")
         logger.debug("udp flow %s closing (local)", self._id)
+
+        # Only send UDP_CLOSE if the agent knows about this flow.
+        if not self._opened:
+            logger.debug(
+                "udp flow %s: skipping UDP_CLOSE — open() never completed",
+                self._id,
+            )
+            return
 
         try:
             await self._ws_send(encode_udp_close_frame(self._id), control=True)
@@ -374,7 +382,10 @@ class UdpFlow:
             return None
 
         # Lazily create the close_task once and reuse it across all blocking
-        # recv calls — avoids per-call Event.wait() coroutine allocation.
+        # recv calls.  Recreate only if the previous task completed (which
+        # happens when the close event fires) — in that case the fast-path
+        # check above would normally catch it, but a narrow race exists when
+        # the event is set between get_nowait() and is_set().
         if self._close_task is None or self._close_task.done():
             self._close_task = asyncio.create_task(
                 self._closed_event.wait(),
@@ -409,11 +420,7 @@ class UdpFlow:
         if get_task in done and not get_task.cancelled():
             return get_task.result()
 
-        # close_task won — drain all remaining items in case multiple datagrams
-        # arrived between the close signal and the task cancellation.  A single
-        # get_nowait() would only return the first; the caller (_drain_flow)
-        # loops recv_datagram() until None, but each extra call would re-enter
-        # the full asyncio.wait path unnecessarily.
+        # close_task won — drain remaining items before returning None.
         try:
             return self._inbound.get_nowait()
         except asyncio.QueueEmpty:
@@ -434,6 +441,9 @@ class UdpFlow:
         caller is responsible for ensuring *data* fits within the protocol's
         maximum payload budget (≤ 6,108 bytes).
 
+        Guards against sending before :meth:`open` completes — the agent
+        would not recognise the flow ID and silently drop the datagram.
+
         Args:
             data: Raw datagram bytes to forward to the agent.
 
@@ -441,6 +451,9 @@ class UdpFlow:
             TransportError:
                 If *data* is not a ``bytes`` instance
                 (``error_code`` ``"transport.invalid_payload_type"``).
+            TransportError:
+                If the flow has not been opened yet
+                (``error_code`` ``"transport.udp_send_before_open"``).
             WebSocketSendTimeoutError:
                 If the WebSocket send stalls beyond the configured timeout.
             ConnectionClosedError:
@@ -456,6 +469,20 @@ class UdpFlow:
         # avoids a wasted frame on an already-torn-down flow.
         if self._closed:
             return
+
+        # Guard against sending before the agent knows about this flow.
+        # The agent would drop the datagram for an unregistered flow ID,
+        # wasting bandwidth and generating agent-side warnings.
+        if not self._opened:
+            raise TransportError(
+                f"UDP flow {self._id!r}: send_datagram() called before open() completed.",
+                error_code="transport.udp_send_before_open",
+                details={"flow_id": self._id},
+                hint=(
+                    "Await open() before sending datagrams. The agent does not "
+                    "recognise this flow ID until it receives the UDP_OPEN frame."
+                ),
+            )
 
         frame = encode_udp_data_frame(self._id, data)
 
@@ -514,3 +541,14 @@ class UdpFlow:
     def bytes_recv(self) -> int:
         """Total raw bytes received from the agent (inbound)."""
         return self._bytes_recv
+
+    # ── Debug ─────────────────────────────────────────────────────────────────
+
+    def __repr__(self) -> str:
+        state = "closed" if self._closed else ("opened" if self._opened else "new")
+        return (
+            f"<UdpFlow id={self._id} state={state} "
+            f"dest={self._host}:{self._port} "
+            f"sent={self._bytes_sent} recv={self._bytes_recv} "
+            f"drops={self._drop_count}>"
+        )
