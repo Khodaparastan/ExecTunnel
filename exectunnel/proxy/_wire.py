@@ -4,24 +4,13 @@ All functions are **pure and synchronous** — no I/O, no asyncio, no network
 calls.  They operate exclusively on raw :class:`bytes` and
 :mod:`exectunnel.protocol` enums.
 
-Async address reading lives in :mod:`exectunnel.proxy._io` to keep this
-module side-effect free and trivially unit-testable.
-
-Public surface (package-internal only — not re-exported from ``__init__.py``)
-------------------------------------------------------------------------------
+Public surface (package-internal only)
+--------------------------------------
 * :func:`validate_socks5_domain` — RFC 1123 domain safety check.
 * :func:`parse_socks5_addr_buf`  — Sync ATYP+addr+port parser from a buffer.
 * :func:`parse_udp_header`       — SOCKS5 UDP datagram header parser (RFC 1928 §7).
 * :func:`build_socks5_reply`     — SOCKS5 reply packet serialiser (RFC 1928 §6).
 * :func:`build_udp_header`       — SOCKS5 UDP reply header builder.
-
-Exceptions raised
------------------
-* :class:`~exectunnel.exceptions.ProtocolError`      — malformed wire data from
-  the remote SOCKS5 client.
-* :class:`~exectunnel.exceptions.ConfigurationError` — bad arguments supplied by
-  the *caller* (e.g. invalid ``bind_host`` / ``bind_port`` to
-  :func:`build_socks5_reply`).
 """
 
 from __future__ import annotations
@@ -45,15 +34,15 @@ __all__: list[str] = [
 # Domain-name validation
 # ---------------------------------------------------------------------------
 
-# RFC 1123 relaxed: labels of 1–63 chars, total ≤ 253, no leading/trailing dot.
+# RFC 1123 relaxed + underscore (RFC 952 forbids it, but real-world DNS uses
+# underscores extensively: _dmarc, _srv, _acme-challenge, etc.).
 _DOMAIN_LABEL_RE: re.Pattern[str] = re.compile(
-    r"^[A-Za-z0-9]([A-Za-z0-9\-]{0,61}[A-Za-z0-9])?$",
+    r"^[A-Za-z0-9_]([A-Za-z0-9\-_]{0,61}[A-Za-z0-9_])?$",
     re.ASCII,
 )
 
-# Characters that are NUL (stream terminator) or frame-unsafe per the
-# ExecTunnel wire format.
-_DOMAIN_UNSAFE_RE: re.Pattern[str] = re.compile(r"[\x00:<>]", re.ASCII)
+# Characters that are NUL (stream terminator) or frame-unsafe.
+_DOMAIN_UNSAFE_RE: re.Pattern[str] = re.compile(r"[\x00:\r\n<>]", re.ASCII)
 
 # Maximum total length of a DNS name per RFC 1035 §2.3.4.
 _DOMAIN_MAX_LEN: int = 253
@@ -66,14 +55,10 @@ def validate_socks5_domain(domain: str) -> None:
 
     1. Total length ≤ 253 characters (RFC 1035 §2.3.4).
     2. No frame-unsafe characters (``\\x00``, ``:``, ``<``, ``>``).
-    3. Each dot-separated label matches RFC 1123 rules:
+    3. Each dot-separated label matches relaxed RFC 1123 rules (underscores
+       permitted for SRV/DMARC compatibility).
 
-       * 1–63 characters.
-       * Starts and ends with an alphanumeric character.
-       * Interior characters are alphanumeric or ``-``.
-
-    A trailing dot (FQDN notation) is stripped before label splitting so
-    ``"example.com."`` is treated identically to ``"example.com"``.
+    A trailing dot (FQDN notation) is stripped before label splitting.
 
     Args:
         domain: The decoded domain string to validate.
@@ -124,13 +109,14 @@ def validate_socks5_domain(domain: str) -> None:
                 details={
                     "socks5_field": "DST.ADDR",
                     "expected": (
-                        "label starting and ending with alphanumeric, "
-                        "interior chars alphanumeric or hyphen, length 1–63"
+                        "label starting and ending with alphanumeric (or underscore), "
+                        "interior chars alphanumeric, hyphen, or underscore, length 1–63"
                     ),
                 },
                 hint=(
                     "Each DNS label must start and end with an alphanumeric character "
-                    "and contain only letters, digits, and hyphens."
+                    "(or underscore) and contain only letters, digits, hyphens, and "
+                    "underscores."
                 ),
             )
 
@@ -149,24 +135,14 @@ def parse_socks5_addr_buf(
 ) -> tuple[str, int, int]:
     """Parse ``ATYP + address + port`` from *data* starting at *offset*.
 
-    Single source of truth for SOCKS5 address parsing from a contiguous
-    buffer.  Used by :func:`parse_udp_header` directly and by
-    :func:`~exectunnel.proxy._io.read_socks5_addr` after assembling bytes
-    from the stream.
-
     Args:
         data:            Raw bytes buffer.
         offset:          Byte position of the ATYP field.
-        context:         Human-readable context for error messages
-                         (e.g. ``"SOCKS5 UDP"``).
-        allow_port_zero: If ``False`` (default), port 0 raises
-                         :class:`ProtocolError`.  Set to ``True`` for
-                         ``UDP_ASSOCIATE`` requests where the client may
-                         declare ``DST.PORT=0`` per RFC 1928 §4.
+        context:         Human-readable context for error messages.
+        allow_port_zero: If ``True``, port 0 is permitted.
 
     Returns:
-        A ``(host, port, new_offset)`` tuple where *new_offset* points to
-        the first byte after the port field.
+        A ``(host, port, new_offset)`` tuple.
 
     Raises:
         ProtocolError: On any parse failure.
@@ -242,7 +218,7 @@ def parse_socks5_addr_buf(
 
         raw_domain = data[offset : offset + dlen]
         try:
-            host = raw_domain.decode("utf-8")
+            host = raw_domain.decode()
         except UnicodeDecodeError as exc:
             raise ProtocolError(
                 f"{context} DOMAIN address bytes are not valid UTF-8.",
@@ -283,7 +259,7 @@ def parse_socks5_addr_buf(
             hint=f"The {context} address has no port field.",
         )
 
-    port = struct.unpack("!H", data[offset : offset + 2])[0]
+    (port,) = struct.unpack("!H", data[offset : offset + 2])
     offset += 2
 
     if port == 0 and not allow_port_zero:
@@ -306,8 +282,6 @@ def parse_socks5_addr_buf(
 
 def parse_udp_header(data: bytes) -> tuple[bytes, str, int]:
     """Parse a SOCKS5 UDP datagram header and return ``(payload, host, port)``.
-
-    Pure function — no I/O, no state.
 
     Wire layout (RFC 1928 §7)::
 
@@ -336,6 +310,15 @@ def parse_udp_header(data: bytes) -> tuple[bytes, str, int]:
             hint="The SOCKS5 client sent a datagram shorter than the minimum header size.",
         )
 
+    if data[0:2] != b"\x00\x00":
+        raise ProtocolError(
+            f"SOCKS5 UDP RSV field must be 0x0000 (got {data[0:2].hex()}).",
+            details={
+                "socks5_field": "RSV",
+                "expected": "RSV=0x0000 (RFC 1928 §7)",
+            },
+            hint="The SOCKS5 client sent a non-zero RSV field in the UDP header.",
+        )
     if data[2] != 0:
         raise ProtocolError(
             f"SOCKS5 UDP fragmentation is not supported (FRAG={data[2]:#x}).",
@@ -349,10 +332,7 @@ def parse_udp_header(data: bytes) -> tuple[bytes, str, int]:
             ),
         )
 
-    # ATYP starts at offset 3; parse_socks5_addr_buf reads ATYP+addr+port.
-    host, port, end_offset = parse_socks5_addr_buf(
-        data, 3, context="SOCKS5 UDP", allow_port_zero=False
-    )
+    host, port, end_offset = parse_socks5_addr_buf(data, 3, context="SOCKS5 UDP")
     payload = data[end_offset:]
     return payload, host, port
 
@@ -361,21 +341,62 @@ def parse_udp_header(data: bytes) -> tuple[bytes, str, int]:
 # UDP reply header builder
 # ---------------------------------------------------------------------------
 
+_ATYP_PACKED_LENGTHS: dict[AddrType, int] = {
+    AddrType.IPV4: 4,
+    AddrType.IPV6: 16,
+}
+
 
 def build_udp_header(atyp: AddrType, addr_packed: bytes, port: int) -> bytes:
     """Build the SOCKS5 UDP reply header (RSV + FRAG + ATYP + ADDR + PORT).
 
-    Pre-computes the header bytes to avoid per-datagram allocation overhead
-    in :meth:`~exectunnel.proxy.udp_relay.UdpRelay.send_to_client`.
-
     Args:
-        atyp:        :class:`~exectunnel.protocol.AddrType` enum member.
+        atyp:        Only ``IPV4`` and ``IPV6`` are valid (RFC 1928 §7).
         addr_packed: Packed address bytes (4 for IPv4, 16 for IPv6).
         port:        Port number in ``[0, 65535]``.
 
     Returns:
         Header bytes ready for concatenation with the payload.
+
+    Raises:
+        ConfigurationError: Invalid arguments.
     """
+    expected_len = _ATYP_PACKED_LENGTHS.get(atyp)
+    if expected_len is None:
+        raise ConfigurationError(
+            f"build_udp_header: atyp={atyp!r} is not valid for UDP reply headers; "
+            "only IPV4 and IPV6 are permitted (RFC 1928 §7).",
+            details={
+                "field": "atyp",
+                "value": repr(atyp),
+                "expected": "AddrType.IPV4 or AddrType.IPV6",
+            },
+            hint="This is a caller bug — DOMAIN addresses cannot appear in UDP reply headers.",
+        )
+
+    if len(addr_packed) != expected_len:
+        raise ConfigurationError(
+            f"build_udp_header: addr_packed length {len(addr_packed)} does not match "
+            f"atyp={atyp!r} (expected {expected_len} bytes).",
+            details={
+                "field": "addr_packed",
+                "value": len(addr_packed),
+                "expected": f"{expected_len} bytes for {atyp!r}",
+            },
+            hint="Ensure addr_packed is the correct length for the given address type.",
+        )
+
+    if not (0 <= port <= 65_535):
+        raise ConfigurationError(
+            f"build_udp_header: port {port!r} is out of range [0, 65535].",
+            details={
+                "field": "port",
+                "value": port,
+                "expected": "integer in [0, 65535]",
+            },
+            hint="Ensure the port passed to build_udp_header() is a valid port number.",
+        )
+
     return b"\x00\x00\x00" + bytes([int(atyp)]) + addr_packed + struct.pack("!H", port)
 
 
@@ -390,10 +411,6 @@ def build_socks5_reply(
     bind_port: int = 0,
 ) -> bytes:
     """Serialise a SOCKS5 reply packet (RFC 1928 §6).
-
-    The default ``bind_host="0.0.0.0"`` and ``bind_port=0`` represent the
-    "unspecified" address per RFC 1928 §6 convention and are appropriate for
-    error replies.
 
     Args:
         reply:     The SOCKS5 reply code.

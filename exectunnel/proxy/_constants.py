@@ -12,7 +12,6 @@ __all__: list[str] = [
     "DEFAULT_HANDSHAKE_TIMEOUT",
     "DEFAULT_QUEUE_CAPACITY",
     "DROP_WARN_INTERVAL",
-    "LOOPBACK_ADDRS",
     "MAX_UDP_PAYLOAD_BYTES",
     "QUEUE_PUT_TIMEOUT",
 ]
@@ -28,17 +27,8 @@ DEFAULT_HANDSHAKE_TIMEOUT: float = 30.0
 DEFAULT_QUEUE_CAPACITY: int = 2_048
 
 # Log a warning every N drops to avoid log flooding on a saturated relay.
-# 1,000 matches UDP_WARN_EVERY in defaults.py and _UDP_DROP_WARN_EVERY in the
-# agent for consistent log volume across all drop-counting paths.
 DROP_WARN_INTERVAL: int = 1_000
 
 # Maximum seconds to wait when enqueueing a completed handshake before
-# dropping the connection with a GENERAL_FAILURE reply.  Prevents indefinite
-# stalls when the consumer is slow.
+# dropping the connection with a GENERAL_FAILURE reply.
 QUEUE_PUT_TIMEOUT: float = 5.0
-
-# Addresses considered loopback — binding to anything else triggers a warning.
-# Only IP literals are included; "localhost" is excluded because it depends on
-# DNS resolution and may resolve to a non-loopback address on misconfigured
-# systems.
-LOOPBACK_ADDRS: frozenset[str] = frozenset({"127.0.0.1", "::1"})

@@ -66,11 +66,6 @@ async def read_socks5_addr(
 ) -> tuple[str, int]:
     """Read ``ATYP + address + port`` from *reader* and return ``(host, port)``.
 
-    Reads the necessary bytes from the stream, then delegates to
-    :func:`~exectunnel.proxy._wire.parse_socks5_addr_buf` for actual parsing.
-    This avoids duplicating address parsing logic between stream and buffer
-    contexts.
-
     Args:
         reader:          The asyncio stream reader.
         allow_port_zero: If ``True``, port 0 is permitted (needed for
@@ -82,15 +77,12 @@ async def read_socks5_addr(
     Raises:
         ProtocolError: On any parse failure or stream truncation.
     """
-    # Read ATYP byte to determine how many more bytes we need.
     atyp_byte = await read_exact(reader, 1)
     atyp = atyp_byte[0]
 
     if atyp == AddrType.IPV4:
-        # 4 (addr) + 2 (port) = 6
         rest = await read_exact(reader, 6)
     elif atyp == AddrType.IPV6:
-        # 16 (addr) + 2 (port) = 18
         rest = await read_exact(reader, 18)
     elif atyp == AddrType.DOMAIN:
         len_byte = await read_exact(reader, 1)
@@ -107,7 +99,6 @@ async def read_socks5_addr(
                     "violates RFC 1928 §5."
                 ),
             )
-        # dlen (domain) + 2 (port)
         rest = len_byte + await read_exact(reader, dlen + 2)
     else:
         raise ProtocolError(
@@ -122,7 +113,6 @@ async def read_socks5_addr(
             ),
         )
 
-    # Reassemble the full ATYP+addr+port buffer and delegate to the sync parser.
     buf = atyp_byte + rest
     host, port, _ = parse_socks5_addr_buf(
         buf, 0, context="SOCKS5", allow_port_zero=allow_port_zero
@@ -131,11 +121,9 @@ async def read_socks5_addr(
 
 
 async def close_writer(writer: asyncio.StreamWriter) -> None:
-    """Close *writer*, suppressing ``OSError`` and ``RuntimeError``.
-
-    ``RuntimeError`` is suppressed because ``wait_closed()`` can raise it
-    on some Python versions when the transport is already gone (e.g. during
-    interpreter shutdown).
+    """Close *writer*, suppressing ``OSError``, ``RuntimeError``, and
+    ``asyncio.CancelledError`` (the latter can surface from
+    ``wait_closed()`` during interpreter shutdown).
 
     Args:
         writer: The asyncio stream writer to close.
@@ -150,9 +138,6 @@ async def write_and_drain_silent(
     data: bytes,
 ) -> None:
     """Write *data* and drain, suppressing ``OSError``.
-
-    Used for best-effort error-reply writes inside the SOCKS5 negotiation
-    where the connection may already be half-closed.
 
     Args:
         writer: The asyncio stream writer to write to.
