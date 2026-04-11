@@ -14,7 +14,8 @@ protocol:
   ``is_ready_frame`` (pure predicate — never raises)
 * **Payload helpers** — ``decode_binary_payload``, ``decode_error_payload``,
   ``encode_host_port``, ``parse_host_port``
-* **ID generators** — ``new_conn_id``, ``new_flow_id``, ``ID_RE``
+* **ID generators** — ``new_conn_id``, ``new_flow_id``, ``new_session_id``,
+  ``ID_RE``, ``SESSION_ID_RE``
 * **SOCKS5 enums** — ``AddrType``, ``AuthMethod``, ``Cmd``, ``Reply``,
   ``UserPassStatus``
 
@@ -63,16 +64,19 @@ from .frames import (
     FRAME_PREFIX,
     FRAME_SUFFIX,
     MAX_FRAME_LEN,
+    PORT_UNSPECIFIED,
     READY_FRAME,
     SESSION_CONN_ID,
     ParsedFrame,
     decode_binary_payload,
     decode_error_payload,
+    encode_conn_ack_frame,
     encode_conn_close_frame,
     encode_conn_open_frame,
     encode_data_frame,
     encode_error_frame,
     encode_host_port,
+    encode_keepalive_frame,
     encode_udp_close_frame,
     encode_udp_data_frame,
     encode_udp_open_frame,
@@ -80,13 +84,21 @@ from .frames import (
     parse_frame,
     parse_host_port,
 )
-from .ids import ID_RE, new_conn_id, new_flow_id
+from .ids import (
+    CONN_FLOW_ID_RE,
+    ID_RE,
+    SESSION_ID_RE,
+    new_conn_id,
+    new_flow_id,
+    new_session_id,
+)
 
 __all__ = [
     # ── Frame constants ────────────────────────────────────────────────────
     "FRAME_PREFIX",
     "FRAME_SUFFIX",
     "MAX_FRAME_LEN",
+    "PORT_UNSPECIFIED",
     "READY_FRAME",
     "SESSION_CONN_ID",
     # ── SOCKS5 enums ───────────────────────────────────────────────────────
@@ -98,10 +110,12 @@ __all__ = [
     # ── Frame result type ──────────────────────────────────────────────────
     "ParsedFrame",
     # ── Frame encoders ─────────────────────────────────────────────────────
+    "encode_conn_ack_frame",
     "encode_conn_close_frame",
     "encode_conn_open_frame",
     "encode_data_frame",
     "encode_error_frame",
+    "encode_keepalive_frame",
     "encode_udp_close_frame",
     "encode_udp_data_frame",
     "encode_udp_open_frame",
@@ -114,7 +128,10 @@ __all__ = [
     "encode_host_port",
     "parse_host_port",
     # ── ID generators & validators ─────────────────────────────────────────
+    "CONN_FLOW_ID_RE",
     "ID_RE",
+    "SESSION_ID_RE",
     "new_conn_id",
     "new_flow_id",
+    "new_session_id",
 ]
