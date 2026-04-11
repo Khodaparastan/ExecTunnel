@@ -53,6 +53,10 @@ _HOST_SEMAPHORE_CAPACITY: Final[int] = 4_096
 # indefinite hangs when the OS never delivers the FIN ACK.
 _PIPE_WRITER_CLOSE_TIMEOUT_SECS: Final[float] = 5.0
 
+# Timeout for direct (excluded-host) TCP connect attempts.  Prevents a hung
+# DNS lookup or TCP handshake from blocking the dispatch task indefinitely.
+_DIRECT_CONNECT_TIMEOUT_SECS: Final[float] = 15.0
+
 
 class RequestDispatcher:
     """Dispatches CONNECT and UDP_ASSOCIATE requests on behalf of TunnelSession.
@@ -188,8 +192,9 @@ class RequestDispatcher:
         """Open a direct TCP connection for excluded hosts."""
         logger.debug("direct connect %s:%d (excluded)", host, port)
         try:
-            rem_reader, rem_writer = await asyncio.open_connection(host, port)
-        except OSError as exc:
+            async with asyncio.timeout(_DIRECT_CONNECT_TIMEOUT_SECS):
+                rem_reader, rem_writer = await asyncio.open_connection(host, port)
+        except (OSError, TimeoutError) as exc:
             logger.debug("direct connect failed: %s", exc)
             metrics_inc("socks_reply_code", code=int(Reply.HOST_UNREACHABLE))
             if not req.replied:
@@ -304,6 +309,8 @@ class RequestDispatcher:
             metrics_inc("tunnel.conn_ack.ok")
             metrics_inc("socks_reply_code", code=int(Reply.SUCCESS))
 
+            # send_reply_success() can raise OSError when the SOCKS5 client
+            # closes its socket before we send the reply — normal race.
             try:
                 await req.send_reply_success()
             except OSError as exc:
@@ -785,6 +792,12 @@ async def _pipe(
     Uses :class:`asyncio.TaskGroup` for half-close semantics: when one
     direction hits EOF and returns normally, the other continues until it
     also finishes.
+
+    ``copy()`` catches ``Exception`` (not just ``OSError``) so that an
+    unexpected error in one direction does not cause ``TaskGroup`` to emit
+    an ``ExceptionGroup`` that bypasses every ``except`` clause in the call
+    chain (``ExceptionGroup`` is a ``BaseException`` subclass that does not
+    match ``except Exception`` in Python 3.11+).
     """
 
     async def copy(
@@ -804,6 +817,13 @@ async def _pipe(
                 await dst.drain()
         except OSError:
             metrics_inc("pipe.copy.os_error")
+        except Exception:
+            # Defensive: catch non-OSError exceptions (e.g. RuntimeError from
+            # drain() on a closing transport) to prevent TaskGroup from
+            # wrapping them in an ExceptionGroup that would bypass all
+            # except-Exception handlers in the call chain.
+            metrics_inc("pipe.copy.unexpected_error")
+            logger.debug("pipe copy unexpected error", exc_info=True)
 
     try:
         async with asyncio.TaskGroup() as tg:
@@ -833,6 +853,7 @@ async def _direct_udp_relay(
     .. note::
         Only the **first** response datagram is relayed back to the client.
     """
+    # Invariant: is_host_excluded only matches IP literals.
     try:
         ipaddress.ip_address(dst_host)
     except ValueError:
@@ -855,8 +876,9 @@ async def _direct_udp_relay(
         except TimeoutError:
             pass
     except (OSError, ExecTunnelError):
-        pass
+        metrics_inc("udp.direct.error")
     except Exception:
+        metrics_inc("udp.direct.unexpected_error")
         logger.debug(
             "unexpected error in UDP direct relay to %s:%d",
             dst_host,
