@@ -23,7 +23,8 @@ class AckStatus(StrEnum):
     AGENT_CLOSED = "agent_closed"
     WS_SEND_TIMEOUT = "ws_send_timeout"
     PRE_ACK_OVERFLOW = "pre_ack_overflow"
-    ERROR = "error"
+    LIBRARY_ERROR = "library_error"
+    UNEXPECTED_ERROR = "unexpected_error"
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,4 +36,5 @@ class PendingConnect:
     """
 
     host: str
+    port: int
     ack_future: asyncio.Future[AckStatus]

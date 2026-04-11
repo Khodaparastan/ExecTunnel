@@ -13,13 +13,22 @@ def is_host_excluded(
     Domain names are never excluded — they are resolved remotely by the agent
     and their IP addresses are not known at routing time.
 
+    .. warning::
+        **Security boundary**: a domain name that resolves to a private IP
+        (e.g. ``internal.corp`` → ``10.0.0.1``) will *not* be excluded even
+        if ``10.0.0.1/8`` is in the exclusion list.  The exclusion list only
+        protects against direct IP-literal connections.  DNS-based bypasses
+        require a separate DNS-level policy.
+
     The exclusion list is assumed to be pre-validated (all entries are
     ``IPv4Network`` or ``IPv6Network`` instances).  Validation at
     configuration load time rather than per-call avoids repeated
     ``isinstance`` checks on every connection attempt.
 
     The membership test is O(n) in the number of exclusion networks.  For
-    typical deployments (< 20 networks) this is negligible.  If the exclusion
+    typical deployments (< 20 networks) this is negligible.  This function
+    is called on every CONNECT and every UDP datagram — for DNS-heavy
+    workloads this can be thousands of calls per second.  If the exclusion
     list grows to hundreds of entries, consider a prefix-tree structure.
 
     Args:
