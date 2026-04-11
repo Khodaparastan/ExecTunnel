@@ -12,6 +12,7 @@ Authentication: ``NO_AUTH`` (0x00) only.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import AsyncIterator
 
@@ -55,7 +56,7 @@ class Socks5Server:
         self._config = config if config is not None else Socks5ServerConfig()
 
         self._queue: asyncio.Queue[Socks5Request | None] = asyncio.Queue(
-            self._config.queue_capacity
+            self._config.request_queue_capacity
         )
         self._server: asyncio.Server | None = None
         self._started: bool = False
@@ -132,17 +133,19 @@ class Socks5Server:
             await asyncio.gather(*self._handshake_tasks, return_exceptions=True)
             self._handshake_tasks.clear()
 
-        # 3. Signal the async iterator to stop.
-        await self._queue.put(None)
-
-        # 4. Drain any requests that were queued but never consumed.
+        # 3. Drain queued-but-unconsumed requests BEFORE the sentinel so the
+        #    sentinel is never accidentally consumed by the drain loop.
         while True:
             try:
                 req = self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
             if isinstance(req, Socks5Request):
-                await req.close()
+                with contextlib.suppress(Exception):
+                    await req.close()
+
+        # 4. Signal the async iterator to stop.
+        await self._queue.put(None)
 
     # ── Async context manager ────────────────────────────────────────────────
 
@@ -159,10 +162,10 @@ class Socks5Server:
         return self._iter()
 
     async def _iter(self) -> AsyncIterator[Socks5Request]:
-        """Yield requests until :meth:`stop` is called."""
+        """Yield requests until :meth:`stop` enqueues the ``None`` sentinel."""
         while True:
             req = await self._queue.get()
-            if req is None or self._stopped:
+            if req is None:
                 return
             yield req
 
@@ -183,45 +186,33 @@ class Socks5Server:
             self._handshake_tasks.add(task)
 
         try:
+            await self._do_handshake(reader, writer)
+        except asyncio.CancelledError:
+            await close_writer(writer)
+            raise
+        except Exception:
+            # Already logged inside _do_handshake; just ensure cleanup.
+            await close_writer(writer)
+        finally:
+            if task is not None:
+                self._handshake_tasks.discard(task)
+
+    async def _do_handshake(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        """Inner handshake logic, separated for cleaner exception handling."""
+        try:
             async with asyncio.timeout(self._config.handshake_timeout):
                 req = await self._negotiate(reader, writer)
-
-            if req is not None:
-                try:
-                    # Bounded put prevents indefinite stall when consumer is slow.
-                    await asyncio.wait_for(
-                        self._queue.put(req),
-                        timeout=self._config.queue_put_timeout,
-                    )
-                except TimeoutError:
-                    logger.warning(
-                        "socks5 queue full — dropping handshake for %s:%d "
-                        "(queue_put_timeout=%.1fs)",
-                        req.host,
-                        req.port,
-                        self._config.queue_put_timeout,
-                    )
-                    # Send GENERAL_FAILURE to the client before closing.
-                    await write_and_drain_silent(
-                        writer, build_socks5_reply(Reply.GENERAL_FAILURE)
-                    )
-                    await req.close()
-                    return
-
-                logger.debug(
-                    "socks5 handshake ok: cmd=%s host=%s port=%d",
-                    req.cmd.name,
-                    req.host,
-                    req.port,
-                )
-
         except TimeoutError:
             logger.warning(
                 "socks5 handshake timed out after %.1fs",
                 self._config.handshake_timeout,
             )
             await close_writer(writer)
-
+            return
         except ProtocolError as exc:
             logger.debug(
                 "socks5 handshake rejected [%s]: %s (error_id=%s)",
@@ -230,7 +221,7 @@ class Socks5Server:
                 exc.error_id,
             )
             await close_writer(writer)
-
+            return
         except TransportError as exc:
             logger.warning(
                 "socks5 handshake transport error [%s]: %s (error_id=%s)",
@@ -239,7 +230,7 @@ class Socks5Server:
                 exc.error_id,
             )
             await close_writer(writer)
-
+            return
         except ExecTunnelError as exc:
             logger.warning(
                 "socks5 handshake library error [%s]: %s (error_id=%s)",
@@ -248,22 +239,39 @@ class Socks5Server:
                 exc.error_id,
             )
             await close_writer(writer)
-
+            return
         except OSError as exc:
             logger.debug("socks5 handshake I/O error: %s", exc)
             await close_writer(writer)
+            return
 
-        except asyncio.CancelledError:
+        if req is None:
             await close_writer(writer)
-            raise
+            return
 
-        except Exception:
-            logger.exception("socks5 handshake unexpected failure")
-            await close_writer(writer)
+        try:
+            await asyncio.wait_for(
+                self._queue.put(req),
+                timeout=self._config.queue_put_timeout,
+            )
+        except TimeoutError:
+            logger.warning(
+                "socks5 queue full — dropping handshake for %s:%d "
+                "(queue_put_timeout=%.1fs)",
+                req.host,
+                req.port,
+                self._config.queue_put_timeout,
+            )
+            with contextlib.suppress(Exception):
+                await req.send_reply_error(Reply.GENERAL_FAILURE)
+            return
 
-        finally:
-            if task is not None:
-                self._handshake_tasks.discard(task)
+        logger.debug(
+            "socks5 handshake ok: cmd=%s host=%s port=%d",
+            req.cmd.name,
+            req.host,
+            req.port,
+        )
 
     # ── SOCKS5 negotiation ───────────────────────────────────────────────────
 
@@ -370,7 +378,6 @@ class Socks5Server:
                 ),
             ) from exc
 
-        # UDP_ASSOCIATE allows port 0 per RFC 1928 §4.
         allow_port_zero = cmd == Cmd.UDP_ASSOCIATE
         host, port = await read_socks5_addr(reader, allow_port_zero=allow_port_zero)
 
@@ -386,7 +393,7 @@ class Socks5Server:
 
             case Cmd.UDP_ASSOCIATE:
                 relay = UdpRelay(
-                    queue_capacity=self._config.queue_capacity,
+                    queue_capacity=self._config.udp_relay_queue_capacity,
                     drop_warn_interval=self._config.udp_drop_warn_interval,
                 )
                 try:
