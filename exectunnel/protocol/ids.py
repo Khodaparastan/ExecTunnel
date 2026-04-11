@@ -1,4 +1,4 @@
-"""TCP connection and UDP flow ID generation.
+"""TCP connection, UDP flow, and session ID generation.
 
 IDs are cryptographically random, prefix-namespaced strings that are safe
 to embed in any frame field without escaping.
@@ -7,8 +7,9 @@ Format
 ──────
     <prefix><24 lowercase hex chars>
 
-    TCP connection IDs: ``c<24 hex>``  e.g. ``ca1b2c3d4e5f6a7b8c9d0e1f2a3b``
-    UDP flow IDs:       ``u<24 hex>``  e.g. ``ua1b2c3d4e5f6a7b8c9d0e1f2a3b``
+    TCP connection IDs: ``c<24 hex>``  e.g. ``ca1b2c3d4e5f6a7b8c9d0e1f``
+    UDP flow IDs:       ``u<24 hex>``  e.g. ``ua1b2c3d4e5f6a7b8c9d0e1f``
+    Session IDs:        ``s<24 hex>``  e.g. ``s3f7a1c9e2b4d6f8a0c2e4b6``
 
 Entropy
 ───────
@@ -16,9 +17,9 @@ Entropy
     probability; safe for high-concurrency, long-lived tunnel sessions.
 
     ``secrets.token_hex`` is guaranteed to return lowercase hexadecimal, so
-    the post-generation assert in each generator is a development-time sanity
-    check only.  It is stripped in optimised builds (``python -O``) and will
-    never fire in practice.
+    the post-generation asserts are development-time sanity checks only.
+    They are stripped in optimised builds (``python -O``) and will never
+    fire in practice.
 """
 
 from __future__ import annotations
@@ -28,8 +29,10 @@ import secrets
 from typing import Final
 
 __all__ = [
+    "CONN_FLOW_ID_RE",
     "ID_RE",
     "SESSION_CONN_ID",
+    "SESSION_ID_RE",
     "new_conn_id",
     "new_flow_id",
     "new_session_id",
@@ -37,63 +40,56 @@ __all__ = [
 
 # ── Internal constants ────────────────────────────────────────────────────────
 
-# Prefix characters that namespace IDs by type, preventing any cross-type
-# collision even if the underlying token bytes happen to be identical.
 _TCP_PREFIX: Final[str] = "c"
 _UDP_PREFIX: Final[str] = "u"
+_SESSION_PREFIX: Final[str] = "s"
 
 # 12 bytes → 24 hex chars → 96-bit entropy.
 _TOKEN_BYTES: Final[int] = 12
+_HEX_LEN: Final[int] = _TOKEN_BYTES * 2  # 24
 
-# ── Public API ────────────────────────────────────────────────────────────────
+# ── Compiled patterns ─────────────────────────────────────────────────────────
+
+# Validates TCP connection IDs (c-prefix) and UDP flow IDs (u-prefix).
+# Used by frames.py to validate conn_id / flow_id fields on the wire.
+# re.ASCII ensures [0-9a-f] never matches Unicode digits on exotic builds.
+CONN_FLOW_ID_RE: Final[re.Pattern[str]] = re.compile(
+    rf"^[{_TCP_PREFIX}{_UDP_PREFIX}][0-9a-f]{{{_HEX_LEN}}}$", re.ASCII
+)
+
+# Backward-compatible alias — existing code imports ``ID_RE`` from this module.
+ID_RE: Final[re.Pattern[str]] = CONN_FLOW_ID_RE
+
+# Validates session IDs (s-prefix).
+SESSION_ID_RE: Final[re.Pattern[str]] = re.compile(
+    rf"^{_SESSION_PREFIX}[0-9a-f]{{{_HEX_LEN}}}$", re.ASCII
+)
+
+# ── Sentinels ─────────────────────────────────────────────────────────────────
 
 # Session-level error sentinel: a valid conn_id-shaped value that is
 # deliberately outside the random space (all-zero token) so callers can
 # distinguish session-level errors from per-connection errors.
 #
-# Derived from _TOKEN_BYTES so that if the token length ever changes,
-# SESSION_CONN_ID stays structurally consistent with ID_RE automatically.
-#
 # Safety assumption: ``secrets.token_hex`` draws from a CSPRNG and will
-# never return the all-zero string in practice.  This is not enforced at
-# runtime — the sentinel relies on the all-zero token being outside the
-# reachable random space.  If _TOKEN_BYTES is ever reduced to a value
-# small enough that exhaustive enumeration becomes feasible, this
-# assumption must be re-evaluated.
-SESSION_CONN_ID: Final[str] = _TCP_PREFIX + "0" * (_TOKEN_BYTES * 2)
-
-# Compiled pattern for validating conn_id / flow_id values.
-# re.ASCII ensures [0-9a-f] never matches Unicode digits on exotic builds.
-# Exported so that frames.py and the agent can share the same validator
-# without importing the generator functions.
-ID_RE: Final[re.Pattern[str]] = re.compile(r"^[cu][0-9a-f]{24}$", re.ASCII)
+# never return the all-zero string in practice.
+SESSION_CONN_ID: Final[str] = _TCP_PREFIX + "0" * _HEX_LEN
 
 
-# ── Session ID ───────────────────────────────────────────────────────────────
-
-# Prefix for session-scoped identifiers, distinct from connection/flow prefixes
-# so that session IDs never collide with conn_ids or flow_ids structurally.
-_SESSION_PREFIX: Final[str] = "s"
+# ── ID generators ─────────────────────────────────────────────────────────────
 
 
 def new_session_id() -> str:
     """Generate a unique session ID for log and task correlation.
 
     Session IDs use the ``s`` prefix to distinguish them from TCP connection
-    IDs (``c``) and UDP flow IDs (``u``), preventing any accidental cross-type
-    confusion in logs and task names.
+    IDs (``c``) and UDP flow IDs (``u``).
 
     Returns:
-        A string of the form ``s<24 hex chars>``,
-        e.g. ``s3f7a1c9e2b4d6f8a0c2e4b6d8f0a2c4``.
-
-    Note:
-        The assert is a development-time invariant check and is stripped in
-        optimised builds (``python -O``).  It will never fire in practice
-        because ``secrets.token_hex`` is guaranteed to return lowercase hex.
+        A string of the form ``s<24 hex chars>``.
     """
     result = _SESSION_PREFIX + secrets.token_hex(_TOKEN_BYTES)
-    assert re.match(r"^s[0-9a-f]{24}$", result, re.ASCII), (  # noqa: S101
+    assert SESSION_ID_RE.match(result), (  # noqa: S101
         f"new_session_id produced invalid ID: {result!r}"
     )
     return result
@@ -103,13 +99,7 @@ def new_conn_id() -> str:
     """Generate a unique TCP connection ID.
 
     Returns:
-        A string of the form ``c<24 hex chars>``,
-        e.g. ``ca1b2c3d4e5f6a7b8c9d0e1f2a3b``.
-
-    Note:
-        The assert is a development-time invariant check and is stripped in
-        optimised builds (``python -O``).  It will never fire in practice
-        because ``secrets.token_hex`` is guaranteed to return lowercase hex.
+        A string of the form ``c<24 hex chars>``.
     """
     result = _TCP_PREFIX + secrets.token_hex(_TOKEN_BYTES)
     assert ID_RE.match(result), f"new_conn_id produced invalid ID: {result!r}"  # noqa: S101
@@ -120,13 +110,7 @@ def new_flow_id() -> str:
     """Generate a unique UDP flow ID.
 
     Returns:
-        A string of the form ``u<24 hex chars>``,
-        e.g. ``ua1b2c3d4e5f6a7b8c9d0e1f2a3b``.
-
-    Note:
-        The assert is a development-time invariant check and is stripped in
-        optimised builds (``python -O``).  It will never fire in practice
-        because ``secrets.token_hex`` is guaranteed to return lowercase hex.
+        A string of the form ``u<24 hex chars>``.
     """
     result = _UDP_PREFIX + secrets.token_hex(_TOKEN_BYTES)
     assert ID_RE.match(result), f"new_flow_id produced invalid ID: {result!r}"  # noqa: S101
