@@ -13,11 +13,20 @@ dropped silently or block the caller (``must_queue=True``).
 The ``_run`` loop drains the control queue before the data queue on every
 iteration, guaranteeing that ``CONN_CLOSE`` / ``UDP_CLOSE`` / ``UDP_OPEN``
 frames are delivered ahead of bulk data.
+
+Dequeue strategy
+----------------
+The send loop uses an ``asyncio.Event`` (``_frame_ready``) instead of racing
+two ``asyncio.Task``s.  ``send()`` and ``stop()`` set the event after
+enqueuing; the loop clears it and double-checks both queues before waiting
+(standard condition-variable pattern).  This eliminates per-iteration task
+creation, cancellation, and the fragile item-rescue logic.
 """
 
 import asyncio
 import contextlib
 import logging
+from typing import Final
 
 from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed
@@ -29,9 +38,14 @@ from exectunnel.exceptions import (
     WebSocketSendTimeoutError,
 )
 from exectunnel.observability import metrics_inc
-from exectunnel.protocol import FRAME_PREFIX, FRAME_SUFFIX
+from exectunnel.protocol import FRAME_PREFIX, FRAME_SUFFIX, encode_keepalive_frame
 
 logger = logging.getLogger(__name__)
+
+# ── Internal constants ────────────────────────────────────────────────────────
+
+# Length of the frame prefix — used to extract msg_type for metrics.
+_FRAME_PREFIX_LEN: Final[int] = len(FRAME_PREFIX)
 
 
 class _StopSentinel:
@@ -45,17 +59,37 @@ class _StopSentinel:
 
 _QUEUE_STOP = _StopSentinel()
 
-
-# Type alias for queue items: a frame string or the stop sentinel.
 _SendQueueItem = str | _StopSentinel
+
+
+def _extract_msg_type(frame: str) -> str:
+    """Extract the msg_type token from an encoded frame string for metrics.
+
+    Expects the canonical format ``<<<EXECTUNNEL:{TYPE}:...>>>\\n``.
+    Returns ``"unknown"`` if the format is unexpected.
+    """
+    if not frame.startswith(FRAME_PREFIX):
+        return "unknown"
+    rest = frame[_FRAME_PREFIX_LEN:]
+    colon_pos = rest.find(":")
+    suffix_pos = rest.find(FRAME_SUFFIX)
+    if colon_pos == -1 and suffix_pos == -1:
+        return "unknown"
+    if colon_pos == -1:
+        end = suffix_pos
+    elif suffix_pos == -1:
+        end = colon_pos
+    else:
+        end = min(colon_pos, suffix_pos)
+    return rest[:end] if end > 0 else "unknown"
 
 
 class WsSender:
     """Concurrency-safe ``WsSendCallable`` implementation.
 
-    Owns two asyncio queues and a background send-loop task.  Callers
-    enqueue frames via :meth:`send`; the loop drains them in priority order
-    and writes to the WebSocket.
+    Owns two asyncio queues, a notification event, and a background send-loop
+    task.  Callers enqueue frames via :meth:`send`; the loop drains them in
+    priority order and writes to the WebSocket.
 
     Lifecycle
     ---------
@@ -80,6 +114,7 @@ class WsSender:
         "_ws_closed",
         "_ctrl_queue",
         "_data_queue",
+        "_frame_ready",
         "_loop_task",
         "_send_drop_count",
         "_started",
@@ -102,6 +137,9 @@ class WsSender:
             maxsize=app_cfg.bridge.send_queue_cap
         )
 
+        # Notification event — set by send()/stop(), cleared by the send loop.
+        self._frame_ready = asyncio.Event()
+
         self._loop_task: asyncio.Task[None] | None = None
         self._send_drop_count: int = 0
         self._started: bool = False
@@ -120,8 +158,9 @@ class WsSender:
         """Signal the send loop to exit and await its completion.
 
         Inserts the stop sentinel into the control queue (always succeeds —
-        unbounded) then cancels the task as a safety net in case the loop
-        is blocked on a slow send.  Does NOT set ``ws_closed`` — that is
+        unbounded) and sets the notification event so the loop wakes
+        immediately.  Cancels the task as a safety net in case the loop is
+        blocked on a slow send.  Does NOT set ``ws_closed`` — that is
         ``FrameReceiver``'s responsibility.
         """
         if self._stopped:
@@ -130,6 +169,7 @@ class WsSender:
 
         # Insert stop sentinel into ctrl queue — always succeeds (unbounded).
         self._ctrl_queue.put_nowait(_QUEUE_STOP)
+        self._frame_ready.set()
 
         if self._loop_task is not None and not self._loop_task.done():
             self._loop_task.cancel()
@@ -168,6 +208,7 @@ class WsSender:
         if control:
             # Unbounded queue — put_nowait never raises QueueFull.
             self._ctrl_queue.put_nowait(frame)
+            self._frame_ready.set()
             return
 
         if must_queue:
@@ -179,11 +220,42 @@ class WsSender:
                         "close_reason": "ws_closed_before_enqueue",
                     },
                 )
-            await self._data_queue.put(frame)
-            return
+            # Race ws_closed against the blocking put so callers don't hang
+            # forever when the send loop exits during shutdown.
+            ws_wait = asyncio.ensure_future(self._ws_closed.wait())
+            put_task = asyncio.ensure_future(self._data_queue.put(frame))
+            try:
+                done, _ = await asyncio.wait(
+                    {ws_wait, put_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            except asyncio.CancelledError:
+                put_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await put_task
+                # Do NOT cancel ws_wait — it's a shared event.
+                raise
+
+            if put_task in done:
+                # Frame was enqueued successfully.
+                self._frame_ready.set()
+                return
+
+            # ws_closed won the race — cancel the put and raise.
+            put_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await put_task
+            raise ConnectionClosedError(
+                "WebSocket closed while waiting to enqueue data frame.",
+                details={
+                    "close_code": 0,
+                    "close_reason": "ws_closed_during_enqueue",
+                },
+            )
 
         try:
             self._data_queue.put_nowait(frame)
+            self._frame_ready.set()
         except asyncio.QueueFull:
             self._send_drop_count += 1
             metrics_inc("tunnel.frames.send_drop")
@@ -198,13 +270,31 @@ class WsSender:
 
     # ── Send loop ─────────────────────────────────────────────────────────────
 
+    def _try_dequeue(self) -> _SendQueueItem | None:
+        """Try to dequeue one item, preferring the control queue.
+
+        Returns ``None`` if both queues are empty.  Never blocks.
+        """
+        try:
+            return self._ctrl_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        try:
+            return self._data_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return None
+
     async def _run(self) -> None:
         """Single writer to the WebSocket — serialises all outgoing frames.
 
         Priority: control queue is drained before data queue on every
-        iteration.  Exits on the ``_QUEUE_STOP`` sentinel or on WebSocket close.
+        iteration.  Exits on the ``_QUEUE_STOP`` sentinel or on WebSocket
+        close.
 
-        Sends frames as text (``str``) — the kubectl exec channel is text-mode.
+        Uses an ``asyncio.Event`` (``_frame_ready``) for idle-wait instead of
+        racing two tasks.  The standard condition-variable double-check pattern
+        (clear → re-check → wait) prevents lost wakeups without creating any
+        tasks.
 
         On unexpected exit (timeout or connection closed) the ``ws_closed``
         event is set so that ``_await_conn_ack``'s ``ws_closed_task`` unblocks
@@ -216,24 +306,34 @@ class WsSender:
             ConnectionClosedError:     Same.
         """
         ws = self._ws
-        ctrl_q = self._ctrl_queue
-        data_q = self._data_queue
         send_timeout = self._app.bridge.send_timeout
         unexpected_exit = False
 
         try:
             while True:
-                item = await self._dequeue_next_frame(ctrl_q, data_q)
+                # ── Dequeue with priority ─────────────────────────────────
+                item = self._try_dequeue()
+                if item is None:
+                    # Standard condition-variable double-check:
+                    # 1. Clear the event.
+                    # 2. Re-check queues (catches races with concurrent send()).
+                    # 3. Only wait if still empty.
+                    self._frame_ready.clear()
+                    item = self._try_dequeue()
+                    if item is None:
+                        await self._frame_ready.wait()
+                        continue  # Re-enter loop to dequeue.
+
                 if isinstance(item, _StopSentinel):
                     return  # Clean exit.
 
-                frame: str = item  # type: ignore[assignment]
-                # Extract msg_type for outbound metric — format: <<<EXECTUNNEL:{TYPE}:...
-                _parts = frame.split(":", 2)
-                _msg_type = _parts[1] if len(_parts) >= 2 else "unknown"
+                # ── Send frame ────────────────────────────────────────────
+                frame: str = item
+                msg_type = _extract_msg_type(frame)
+
                 try:
                     metrics_inc("tunnel.frames.sent")
-                    metrics_inc("session_frames_outbound_total", msg_type=_msg_type)
+                    metrics_inc("session_frames_outbound_total", msg_type=msg_type)
                     async with asyncio.timeout(send_timeout):
                         await ws.send(frame)
                 except TimeoutError as exc:
@@ -266,107 +366,21 @@ class WsSender:
             if unexpected_exit:
                 self._ws_closed.set()
 
-    @staticmethod
-    async def _dequeue_next_frame(
-        ctrl_q: asyncio.Queue[_SendQueueItem],
-        data_q: asyncio.Queue[_SendQueueItem],
-    ) -> _SendQueueItem:
-        """Return the next item to send, prioritising control over data.
-
-        Drains the control queue completely before touching the data queue.
-        When both queues are empty, blocks on whichever fires first, then
-        re-checks the control queue before returning a data item.
-        """
-        # Fast path: drain control queue first.
-        try:
-            return ctrl_q.get_nowait()
-        except asyncio.QueueEmpty:
-            pass
-
-        # Try data queue without blocking.
-        try:
-            data_item = data_q.get_nowait()
-        except asyncio.QueueEmpty:
-            data_item = None
-
-        if data_item is not None:
-            # One final ctrl check before committing to the data item.
-            try:
-                return ctrl_q.get_nowait()
-            except asyncio.QueueEmpty:
-                return data_item
-
-        # Both queues empty — block on whichever fires first.
-        ctrl_task: asyncio.Task[_SendQueueItem] = asyncio.create_task(ctrl_q.get())
-        data_task: asyncio.Task[_SendQueueItem] = asyncio.create_task(data_q.get())
-
-        try:
-            done, _ = await asyncio.wait(
-                {ctrl_task, data_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-        except asyncio.CancelledError:
-            ctrl_task.cancel()
-            data_task.cancel()
-            await asyncio.gather(ctrl_task, data_task, return_exceptions=True)
-            raise
-
-        # Cancel the loser; rescue its result if it completed concurrently.
-        rescued_data: _SendQueueItem | None = None
-        for pending_task in (t for t in {ctrl_task, data_task} if t not in done):
-            pending_task.cancel()
-            try:
-                await pending_task
-            except asyncio.CancelledError:
-                # Cancelled before completing — peek the queue directly.
-                if pending_task is data_task:
-                    with contextlib.suppress(asyncio.QueueEmpty):
-                        rescued_data = data_q.get_nowait()
-            else:
-                result = pending_task.result()
-                if pending_task is data_task:
-                    rescued_data = result
-                else:
-                    # Rescued ctrl item — re-queue at front (unbounded).
-                    ctrl_q.put_nowait(result)
-
-        if ctrl_task in done:
-            winner = ctrl_task.result()
-            # If data also completed, re-queue it for the next iteration.
-            if rescued_data is not None:
-                with contextlib.suppress(asyncio.QueueFull):
-                    data_q.put_nowait(rescued_data)
-            return winner
-
-        # Data task won — do one final ctrl check.
-        try:
-            ctrl_item = ctrl_q.get_nowait()
-            # Re-queue the data item for next iteration.
-            if rescued_data is not None:
-                with contextlib.suppress(asyncio.QueueFull):
-                    data_q.put_nowait(rescued_data)
-            return ctrl_item
-        except asyncio.QueueEmpty:
-            return data_task.result()
-
 
 class KeepaliveLoop:
     """Sends a KEEPALIVE control frame at a fixed interval.
 
-    The KEEPALIVE frame is not a registered protocol frame type — the agent
-    discards it.  It exists solely to keep the WebSocket alive through
-    NAT/proxy idle timeouts.
+    The KEEPALIVE frame is discarded by the agent.  It exists solely to keep
+    the WebSocket alive through NAT/proxy idle timeouts.
 
     Uses ``asyncio.timeout`` on ``ws_closed.wait()`` so the loop exits
     promptly when the WebSocket closes rather than sleeping for a full
     interval.
     """
 
-    # Frame constructed from imported protocol constants so the format stays
-    # in sync if FRAME_PREFIX / FRAME_SUFFIX ever change.
-    # NOTE: KEEPALIVE is intentionally not a registered protocol frame type.
-    # It is a session-layer heartbeat only.  The agent discards it.
-    _KEEPALIVE_FRAME: str = f"{FRAME_PREFIX}KEEPALIVE{FRAME_SUFFIX}\n"
+    # Computed once at module load via the canonical encoder — stays in sync
+    # with any future changes to FRAME_PREFIX / FRAME_SUFFIX / frame format.
+    _KEEPALIVE_FRAME: Final[str] = encode_keepalive_frame()
 
     __slots__ = ("_sender", "_ws_closed", "_interval")
 
