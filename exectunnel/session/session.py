@@ -18,8 +18,10 @@ call) so reconnects start with clean state.
 """
 
 import asyncio
+import contextlib
 import logging
 import random
+import re
 from typing import TYPE_CHECKING
 
 from websockets.asyncio.client import ClientConnection, connect
@@ -235,8 +237,10 @@ class TunnelSession:
 
                 delay = min(base_delay * (2**attempt), max_delay)
                 jitter = random.uniform(0, delay * _RECONNECT_JITTER)
-                # Cap total delay to max_delay so jitter never overshoots.
-                delay = min(delay + jitter, max_delay)
+                # Do NOT cap after adding jitter — capping would collapse the
+                # jitter range to zero when delay is close to max_delay,
+                # defeating the purpose of jitter at high retry counts.
+                delay = delay + jitter
                 attempt += 1
                 metrics_inc(
                     "session_reconnects_total",
@@ -266,9 +270,17 @@ class TunnelSession:
         ``_run_tasks`` before this is called, so the set should already be
         empty — clearing it here is a safety net.
         """
+        # ── Close the previous session's dispatcher sentinel task ─────────
+        # RequestDispatcher owns a shared _ws_closed_task that must be
+        # cancelled to prevent task leaks across reconnects.  This is a
+        # safety net — _run_tasks' finally block also calls close(), but
+        # _clear_session_state handles the edge case where _run_tasks was
+        # never reached (e.g. bootstrap failure after dispatcher creation).
+        if self._dispatcher is not None:
+            self._dispatcher.close()
+            self._dispatcher = None
+
         # Abort TCP connections from the previous session.
-        # TcpConnection has no close() — use abort() for started handlers and
-        # close_unstarted() for handlers that never reached the RUNNING state.
         for conn in self._tcp_registry.values():
             try:
                 if conn.is_started:
@@ -288,10 +300,14 @@ class TunnelSession:
                 pending.ack_future.cancel()
         self._pending_connects.clear()
 
-        # Close UDP flows from the previous session.
+        # Signal UDP flows that the remote side is gone — the WebSocket is
+        # already closed at this point, so calling flow.close() would attempt
+        # to send a UDP_CLOSE frame to a dead connection.  on_remote_closed()
+        # marks the flow as closed and unblocks any waiters without touching
+        # the WebSocket.
         for flow in self._udp_registry.values():
             try:
-                await flow.close()
+                flow.on_remote_closed()
             except Exception:  # noqa: BLE001
                 logger.debug(
                     "error closing stale udp flow during session reset", exc_info=True
@@ -363,16 +379,14 @@ class TunnelSession:
         exceptions are logged but the *original* session exception takes
         precedence.
         """
-        if self._sender is None:
-            raise RuntimeError(
-                "_run_tasks called before _sender was initialised — "
-                "call _start_session() instead of _run_tasks() directly."
-            )
-        if self._dispatcher is None:
-            raise RuntimeError(
-                "_run_tasks called before _dispatcher was initialised — "
-                "call _start_session() instead of _run_tasks() directly."
-            )
+        assert self._sender is not None, (
+            "_run_tasks called before _sender was initialised — "
+            "call _start_session() instead of _run_tasks() directly."
+        )
+        assert self._dispatcher is not None, (
+            "_run_tasks called before _dispatcher was initialised — "
+            "call _start_session() instead of _run_tasks() directly."
+        )
 
         metrics_inc("tunnel.serve.started")
 
@@ -389,6 +403,11 @@ class TunnelSession:
         socks_cfg = Socks5ServerConfig(
             host=self._tun.socks_host,
             port=self._tun.socks_port,
+            handshake_timeout=self._tun.socks_handshake_timeout,
+            request_queue_capacity=self._tun.socks_request_queue_cap,
+            queue_put_timeout=self._tun.socks_queue_put_timeout,
+            udp_relay_queue_capacity=self._tun.udp_relay_queue_cap,
+            udp_drop_warn_interval=self._tun.udp_drop_warn_every,
         )
 
         first_exc: BaseException | None = None
@@ -396,21 +415,23 @@ class TunnelSession:
         try:
             async with Socks5Server(socks_cfg) as socks:
                 dns_fwd: DnsForwarder | None = None
-                dns_started = False
-                try:
-                    if self._tun.dns_upstream:
-                        # Deferred import — avoids circular import at module level.
-                        from ._dns import DnsForwarder  # noqa: PLC0415
+                if self._tun.dns_upstream:
+                    # Deferred import — avoids circular import at module level.
+                    from ._dns import DnsForwarder  # noqa: PLC0415
 
-                        dns_fwd = DnsForwarder(
-                            self._tun.dns_local_port,
-                            self._tun.dns_upstream,
-                            self._sender.send,
-                            self._udp_registry,
-                            max_inflight=self._app.bridge.dns_max_inflight,
-                        )
-                        await dns_fwd.start()
-                        dns_started = True
+                    dns_fwd = DnsForwarder(
+                        self._tun.dns_local_port,
+                        self._tun.dns_upstream,
+                        self._sender.send,
+                        self._udp_registry,
+                        max_inflight=self._app.bridge.dns_max_inflight,
+                        upstream_port=self._tun.dns_upstream_port,
+                        query_timeout=self._tun.dns_query_timeout,
+                    )
+
+                async with contextlib.AsyncExitStack() as _dns_stack:
+                    if dns_fwd is not None:
+                        await _dns_stack.enter_async_context(dns_fwd)
 
                     recv_task = asyncio.create_task(
                         receiver.run(), name="tun-recv-loop"
@@ -490,15 +511,15 @@ class TunnelSession:
                                 *self._request_tasks, return_exceptions=True
                             )
 
-                        metrics_inc("tunnel.serve.stopped")
+                        # ── FIX: close the dispatcher's sentinel task ─────
+                        # RequestDispatcher owns a shared _ws_closed_task
+                        # created in __init__.  close() cancels it to prevent
+                        # task leaks.  Safe to call even if _ws_closed was
+                        # already set (cancelling a done task is a no-op).
+                        if self._dispatcher is not None:
+                            self._dispatcher.close()
 
-                finally:
-                    # Stop DNS forwarder — only if it was successfully started.
-                    if dns_fwd is not None and dns_started:
-                        try:
-                            await dns_fwd.stop()
-                        except Exception:  # noqa: BLE001
-                            logger.debug("error stopping DNS forwarder", exc_info=True)
+                        metrics_inc("tunnel.serve.stopped")
 
         except BaseException as socks_exit_exc:
             # If Socks5Server.__aexit__ raises AND we already captured a session
@@ -530,8 +551,10 @@ class TunnelSession:
                 "_accept_loop called before _dispatcher was initialised."
             )
         async for req in socks:
-            # Sanitise task name — IPv6 colons replaced; truncated for readability.
-            safe_host = req.host.replace(":", "_")[:40]
+            # Sanitise task name — replace any character that is not
+            # alphanumeric, dot, hyphen, or underscore (covers IPv6 colons,
+            # spaces from malformed SOCKS5 clients, etc.).
+            safe_host = re.sub(r"[^a-zA-Z0-9_.\-]", "_", req.host)[:40]
             task = asyncio.create_task(
                 self._handle_request(req),
                 name=f"req-{req.cmd.name}-{safe_host}_{req.port}",
@@ -559,6 +582,11 @@ class TunnelSession:
                 exc.error_id,
                 extra=exc.to_dict(),
             )
+        elif isinstance(exc, OSError):
+            # OSError subclasses (ConnectionResetError, BrokenPipeError, etc.)
+            # are normal events — a client that disconnected mid-request is not
+            # an unexpected error.
+            logger.warning("request task %s failed: %s", task.get_name(), exc)
         else:
             logger.error("request task %s failed: %s", task.get_name(), exc)
         logger.debug(

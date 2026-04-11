@@ -7,7 +7,6 @@ concern and does not belong in ``proxy``.
 """
 
 import asyncio
-import contextlib
 import logging
 
 from exectunnel.config.defaults import Defaults
@@ -33,6 +32,9 @@ class _DnsDatagramProtocol(asyncio.DatagramProtocol):
         self._forwarder = forwarder
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        # Defence-in-depth type guard — start() also checks the return value
+        # of create_datagram_endpoint, but this guard covers hypothetical
+        # reuse of the protocol outside start().
         if not isinstance(transport, asyncio.DatagramTransport):
             logger.error(
                 "dns forwarder: expected DatagramTransport, got %s — "
@@ -81,6 +83,7 @@ class DnsForwarder:
         udp_registry:  Shared mutable dict mapping flow IDs to ``UdpFlow``.
         max_inflight:  Maximum number of concurrent in-flight DNS queries.
         upstream_port: UDP port of the upstream DNS server.
+        query_timeout: Seconds to wait for a DNS response before timing out.
     """
 
     __slots__ = (
@@ -90,6 +93,7 @@ class DnsForwarder:
         "_ws_send",
         "_udp_registry",
         "_max_inflight",
+        "_query_timeout",
         "_transport",
         "_tasks",
         "_started",
@@ -111,6 +115,7 @@ class DnsForwarder:
         udp_registry: dict[str, UdpFlow],
         max_inflight: int = Defaults.DNS_MAX_INFLIGHT,
         upstream_port: int = Defaults.DNS_UPSTREAM_PORT,
+        query_timeout: float = Defaults.DNS_QUERY_TIMEOUT_SECS,
     ) -> None:
         self._local_port = local_port
         self._upstream = upstream
@@ -118,6 +123,7 @@ class DnsForwarder:
         self._ws_send = ws_send
         self._udp_registry = udp_registry
         self._max_inflight = max(1, max_inflight)
+        self._query_timeout = query_timeout
         self._transport: asyncio.DatagramTransport | None = None
         self._tasks: set[asyncio.Task[None]] = set()
         self._started: bool = False
@@ -142,9 +148,27 @@ class DnsForwarder:
     # ── Package-internal callbacks ────────────────────────────────────────────
 
     def on_transport_ready(self, transport: asyncio.DatagramTransport) -> None:
+        """Called by :class:`_DnsDatagramProtocol` when the endpoint is ready.
+
+        ``start()`` also assigns ``_transport`` from the return value of
+        ``create_datagram_endpoint``.  Both assignments refer to the same
+        object; this callback exists so the protocol can set the transport
+        before ``start()``'s await returns (needed if the protocol fires
+        other callbacks during endpoint creation).
+        """
         self._transport = transport
 
     def on_query(self, data: bytes, addr: tuple[str, int]) -> None:
+        """Dispatch a DNS query received on the local socket.
+
+        Guards against dispatching after :meth:`stop` — the asyncio protocol's
+        ``datagram_received`` callback can fire between ``stop()`` closing the
+        transport and the transport actually shutting down.
+        """
+        if self._stopped:
+            metrics_inc("dns.query.drop.after_stop")
+            return
+
         metrics_inc("dns.query.received")
 
         if len(self._tasks) >= self._max_inflight:
@@ -223,6 +247,9 @@ class DnsForwarder:
                 hint="This is an asyncio internal error. Please report it.",
             )
 
+        # Authoritative assignment — on_transport_ready() may have already
+        # set this during create_datagram_endpoint, but this is the canonical
+        # assignment that start() guarantees.
         self._transport = transport
         metrics_inc("dns.forwarder.started")
         logger.info(
@@ -246,9 +273,12 @@ class DnsForwarder:
             self._transport.close()
 
         if self._tasks:
-            for task in list(self._tasks):
+            # Snapshot once — done-callbacks may mutate self._tasks between
+            # the cancel loop and the gather call.
+            snapshot = list(self._tasks)
+            for task in snapshot:
                 task.cancel()
-            await asyncio.gather(*list(self._tasks), return_exceptions=True)
+            await asyncio.gather(*snapshot, return_exceptions=True)
 
     # ── Core forwarding logic ─────────────────────────────────────────────────
 
@@ -271,6 +301,7 @@ class DnsForwarder:
         """
         start = asyncio.get_running_loop().time()
         agent_closed = False
+        opened = False
 
         handler = UdpFlow(
             flow_id,
@@ -284,6 +315,7 @@ class DnsForwarder:
 
         try:
             await handler.open()
+            opened = True
 
             self._query_count += 1
             self._bytes_in += len(query)
@@ -292,9 +324,9 @@ class DnsForwarder:
             await handler.send_datagram(query)
 
             # Single recv — DNS is request/response.  Flow is closed in the
-            # finally block immediately after, so no further datagrams can
+            # finally block immediately after.
             try:
-                async with asyncio.timeout(Defaults.DNS_QUERY_TIMEOUT_SECS):
+                async with asyncio.timeout(self._query_timeout):
                     response = await handler.recv_datagram()
             except TimeoutError:
                 self._error_drop_count += 1
@@ -305,7 +337,7 @@ class DnsForwarder:
                     client_addr[0],
                     client_addr[1],
                     flow_id,
-                    Defaults.DNS_QUERY_TIMEOUT_SECS,
+                    self._query_timeout,
                 )
                 return  # finally block handles cleanup.
 
@@ -408,11 +440,22 @@ class DnsForwarder:
                 "dns.query.duration_sec",
                 asyncio.get_running_loop().time() - start,
             )
-            # Close the flow unless the agent already tore it down.
-            if not agent_closed:
-                with contextlib.suppress(ExecTunnelError, OSError):
+            if agent_closed:
+                # Agent already tore down the flow — just clean up local state.
+                handler.on_remote_closed()
+            elif opened:
+                # Flow was successfully opened — send UDP_CLOSE to the agent.
+                try:
                     await handler.close()
+                except (ExecTunnelError, OSError) as _close_exc:
+                    logger.debug(
+                        "dns flow %s: UDP_CLOSE send failed during cleanup: %s",
+                        flow_id,
+                        _close_exc,
+                    )
             else:
+                # open() never succeeded — agent doesn't know about this flow.
+                # Just evict from registry; no UDP_CLOSE needed.
                 handler.on_remote_closed()
 
     # ── Properties ────────────────────────────────────────────────────────────
@@ -465,4 +508,15 @@ class DnsForwarder:
             and not self._stopped
             and self._transport is not None
             and not self._transport.is_closing()
+        )
+
+    # ── Debug ─────────────────────────────────────────────────────────────────
+
+    def __repr__(self) -> str:
+        state = "running" if self.is_running else ("stopped" if self._stopped else "new")
+        return (
+            f"<DnsForwarder 127.0.0.1:{self._local_port} → "
+            f"{self._upstream}:{self._upstream_port} "
+            f"state={state} inflight={len(self._tasks)} "
+            f"ok={self._ok_count} drops={self._total_drop_count}>"
         )
