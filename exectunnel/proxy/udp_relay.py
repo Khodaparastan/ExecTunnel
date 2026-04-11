@@ -98,6 +98,9 @@ class UdpRelay:
         self._client_addr: tuple[str, int] | None = None
         self._expected_client_addr: tuple[str, int] | None = None
 
+        # Reused across recv() calls to avoid per-call task allocation.
+        self._recv_close_task: asyncio.Task[None] | None = None
+
         # Telemetry counters.
         self._drop_count: int = 0
         self._foreign_client_count: int = 0
@@ -209,13 +212,17 @@ class UdpRelay:
         if self._close_event is not None:
             self._close_event.set()
 
+        # Cancel the reused close-wait task to avoid a dangling reference.
+        if self._recv_close_task is not None and not self._recv_close_task.done():
+            self._recv_close_task.cancel()
+            self._recv_close_task = None
+
     # ── Inbound path (client → relay) ────────────────────────────────────────
 
     def _on_datagram(self, data: bytes, addr: tuple[str, int]) -> None:
         """Parse the SOCKS5 UDP header and enqueue ``(payload, dst_host, dst_port)``.
 
-        This method is called from :class:`_RelayDatagramProtocol` and must
-        never raise.
+        Called from :class:`_RelayDatagramProtocol`; must never raise.
         """
         if self._closed or self._queue is None:
             return
@@ -306,12 +313,6 @@ class UdpRelay:
     async def recv(self) -> tuple[bytes, str, int] | None:
         """Return the next ``(payload, host, port)`` or ``None`` on close.
 
-        Uses a single ``asyncio.Event.wait()`` task racing against the queue
-        to guarantee prompt return after :meth:`close`.
-
-        Returns:
-            ``(payload, host, port)`` or ``None`` when closed and drained.
-
         Raises:
             RuntimeError: If called before :meth:`start`.
         """
@@ -334,29 +335,27 @@ class UdpRelay:
         queue_task: asyncio.Task[tuple[bytes, str, int]] = asyncio.create_task(
             self._queue.get(),
         )
-        close_task: asyncio.Task[None] = asyncio.create_task(
-            self._close_event.wait(),
-        )
+        if self._recv_close_task is None or self._recv_close_task.done():
+            self._recv_close_task = asyncio.create_task(
+                self._close_event.wait(),
+            )
+        close_task = self._recv_close_task
 
         try:
-            done, pending = await asyncio.wait(
+            done, _pending = await asyncio.wait(
                 [queue_task, close_task],
                 return_when=asyncio.FIRST_COMPLETED,
             )
         except asyncio.CancelledError:
             queue_task.cancel()
-            close_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await queue_task
-            with contextlib.suppress(asyncio.CancelledError):
-                await close_task
             raise
 
-        for task in pending:
-            if not task.done():
-                task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, asyncio.InvalidStateError):
-                await task
+        if queue_task not in done:
+            queue_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await queue_task
 
         if queue_task in done and not queue_task.cancelled():
             return queue_task.result()
@@ -380,10 +379,10 @@ class UdpRelay:
             src_port: Source port in ``[0, 65535]``.
 
         Raises:
-            ProtocolError: *payload* not bytes, or *src_port* out of range.
+            TransportError: *payload* not bytes, or *src_port* out of range.
         """
         if not isinstance(payload, bytes):
-            raise ProtocolError(
+            raise TransportError(
                 f"send_to_client() requires a bytes payload, "
                 f"got {type(payload).__name__!r}.",
                 details={"socks5_field": "DATA", "expected": "bytes payload"},
@@ -391,7 +390,7 @@ class UdpRelay:
             )
 
         if not (0 <= src_port <= 65_535):
-            raise ProtocolError(
+            raise TransportError(
                 f"send_to_client() src_port {src_port!r} is out of range [0, 65535].",
                 details={
                     "socks5_field": "SRC.PORT",

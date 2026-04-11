@@ -64,8 +64,9 @@ class Socks5Request:
     async def close(self) -> None:
         """Close the writer and any associated UDP relay.
 
-        Idempotent.  ``OSError`` and ``RuntimeError`` are suppressed because
-        the connection may already be torn down.
+        Idempotent.  ``OSError``, ``RuntimeError``, and
+        ``asyncio.CancelledError`` are suppressed because the connection may
+        already be torn down.
         """
         if self.udp_relay is not None:
             self.udp_relay.close()
@@ -95,14 +96,7 @@ class Socks5Request:
     # ── Internal reply guard ─────────────────────────────────────────────────
 
     def _assert_not_replied(self) -> None:
-        """Raise :class:`ProtocolError` on double-reply.
-
-        Sets ``_replied = True`` on the first call.  Subsequent calls raise.
-
-        Note: on double-reply, ``_replied`` remains ``True`` even though the
-        second reply was never written — this is intentional so that subsequent
-        calls continue to raise rather than silently allowing a third attempt.
-        """
+        """Raise :class:`ProtocolError` on double-reply."""
         if self._replied:
             raise ProtocolError(
                 f"A SOCKS5 reply has already been sent for "
@@ -162,8 +156,7 @@ class Socks5Request:
     ) -> None:
         """Write and flush an error reply, then close the writer and any UDP relay.
 
-        Errors during drain/close are suppressed.  If ``_assert_not_replied``
-        raises (double-reply), the writer is still closed to prevent leaks.
+        On double-reply the write is skipped but cleanup still runs.
 
         Args:
             reply: The reply code.  Defaults to ``GENERAL_FAILURE``.
@@ -172,9 +165,9 @@ class Socks5Request:
             ProtocolError:      Double-reply guard.
             ConfigurationError: Invalid reply code (caller bug).
         """
-        packet = build_socks5_reply(reply)
         try:
             self._assert_not_replied()
+            packet = build_socks5_reply(reply)
             with contextlib.suppress(OSError):
                 self.writer.write(packet)
         finally:
