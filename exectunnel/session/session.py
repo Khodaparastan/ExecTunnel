@@ -28,7 +28,6 @@ from typing import TYPE_CHECKING
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed
 
-from exectunnel.config.settings import AppConfig, TunnelConfig
 from exectunnel.exceptions import (
     BootstrapError,
     ConnectionClosedError,
@@ -47,10 +46,11 @@ from exectunnel.proxy import Socks5Request, Socks5Server, Socks5ServerConfig
 from exectunnel.transport import TcpConnection, UdpFlow
 
 from ._bootstrap import AgentBootstrapper
-from ._handlers import RequestDispatcher
-from ._recv_loop import FrameReceiver
+from ._config import SessionConfig, TunnelConfig
+from ._dispatcher import RequestDispatcher
+from ._receiver import FrameReceiver
+from ._sender import KeepaliveLoop, WsSender
 from ._state import PendingConnect
-from ._ws_sender import KeepaliveLoop, WsSender
 
 if TYPE_CHECKING:
     from ._dns import DnsForwarder
@@ -77,8 +77,8 @@ class TunnelSession:
     """Bootstraps ``agent.py`` into the pod and runs a local SOCKS5 proxy.
 
     Args:
-        app_cfg: Application-level configuration.
-        tun_cfg: Tunnel-level configuration.
+        session_cfg: Session-level configuration (WebSocket, reconnect, transport).
+        tun_cfg:     Tunnel-level configuration (SOCKS, bootstrap, UDP, DNS).
 
     Raises:
         AgentReadyTimeoutError:    Agent did not emit ``AGENT_READY`` in time.
@@ -89,7 +89,7 @@ class TunnelSession:
     """
 
     __slots__ = (
-        "_app",
+        "_cfg",
         "_tun",
         "_ws",
         # Per-session handler registries — cleared on each reconnect.
@@ -105,8 +105,8 @@ class TunnelSession:
         "_dispatcher",
     )
 
-    def __init__(self, app_cfg: AppConfig, tun_cfg: TunnelConfig) -> None:
-        self._app = app_cfg
+    def __init__(self, session_cfg: SessionConfig, tun_cfg: TunnelConfig) -> None:
+        self._cfg = session_cfg
         self._tun = tun_cfg
         self._ws: ClientConnection | None = None
 
@@ -127,16 +127,16 @@ class TunnelSession:
         """Connect, bootstrap the agent, and serve.
 
         Retries on transport/session interruptions using reconnect settings
-        from ``AppConfig``.  Bootstrap failures are always fatal.
+        from ``SessionConfig``.  Bootstrap failures are always fatal.
 
         Raises:
             BootstrapError:          Propagated immediately; never retried.
             ReconnectExhaustedError: All reconnect attempts consumed.
         """
-        ssl_ctx = self._app.ssl_context()
-        retries = self._app.bridge.reconnect_max_retries
-        base_delay = self._app.bridge.reconnect_base_delay
-        max_delay = self._app.bridge.reconnect_max_delay
+        ssl_ctx = self._cfg.ssl_context()
+        retries = self._cfg.reconnect_max_retries
+        base_delay = self._cfg.reconnect_base_delay
+        max_delay = self._cfg.reconnect_max_delay
         attempt = 0
 
         logger.info(
@@ -152,9 +152,9 @@ class TunnelSession:
                 try:
                     metrics_inc("session.connect.attempt")
                     async with connect(
-                        self._app.wss_url,
+                        self._cfg.wss_url,
                         ssl=ssl_ctx,
-                        additional_headers=self._app.ws_headers or None,
+                        additional_headers=self._cfg.ws_headers or None,
                         # Disable built-in ping — we implement our own via
                         # KeepaliveLoop which serialises through WsSender.
                         ping_interval=None,
@@ -271,7 +271,7 @@ class TunnelSession:
                 # the jitter range to zero when delay is close to
                 # max_delay, defeating the purpose of jitter at high retry
                 # counts.
-                delay = delay + jitter
+                delay += jitter
                 attempt += 1
                 metrics_inc(
                     "session.reconnect",
@@ -309,7 +309,8 @@ class TunnelSession:
             float(len(self._request_tasks)),
         )
 
-    def _zero_gauges(self) -> None:
+    @staticmethod
+    def _zero_gauges() -> None:
         """Zero all session-level gauges — called on session teardown."""
         for name in (
             "session.registry.tcp",
@@ -415,11 +416,11 @@ class TunnelSession:
 
             # Bootstrap — raises BootstrapError subclasses on failure.
             async with aspan("session.bootstrap"):
-                bootstrapper = AgentBootstrapper(ws, self._app, self._tun)
+                bootstrapper = AgentBootstrapper(ws, self._cfg, self._tun)
                 await bootstrapper.run()
 
             # Construct per-session sub-components.
-            self._sender = WsSender(ws, self._app, self._ws_closed)
+            self._sender = WsSender(ws, self._cfg, self._ws_closed)
             self._dispatcher = RequestDispatcher(
                 tun_cfg=self._tun,
                 ws_send=self._sender.send,
@@ -429,8 +430,14 @@ class TunnelSession:
                 udp_registry=self._udp_registry,
                 pre_ack_buffer_cap_bytes=self._tun.pre_ack_buffer_cap_bytes,
             )
-            self._dispatcher.reset_ack_state()
 
+            if self._sender is None or self._dispatcher is None:
+                raise RuntimeError(
+                    "sub-components unexpectedly None after construction "
+                    "in _start_session — this is a bug.",
+                )
+
+            self._dispatcher.reset_ack_state()
             self._sender.start()
             await self._run_tasks(
                 ws,
@@ -490,7 +497,7 @@ class TunnelSession:
 
         try:
             async with Socks5Server(socks_cfg) as socks:
-                dns_fwd: DnsForwarder | None = None
+                dns_fwd: "DnsForwarder | None" = None
                 if self._tun.dns_upstream:
                     from ._dns import DnsForwarder  # noqa: PLC0415
 
@@ -499,14 +506,12 @@ class TunnelSession:
                         self._tun.dns_upstream,
                         self._sender.send,
                         self._udp_registry,
-                        max_inflight=self._app.bridge.dns_max_inflight,
+                        max_inflight=self._tun.dns_max_inflight,
                         upstream_port=self._tun.dns_upstream_port,
                         query_timeout=self._tun.dns_query_timeout,
                     )
 
-                async with contextlib.AsyncExitStack() as _dns_stack:
-                    if dns_fwd is not None:
-                        await _dns_stack.enter_async_context(dns_fwd)
+                async with (dns_fwd if dns_fwd is not None else contextlib.nullcontext()):
 
                     recv_task = asyncio.create_task(
                         receiver.run(), name="tun-recv-loop",
@@ -524,7 +529,7 @@ class TunnelSession:
                     keepalive = KeepaliveLoop(
                         sender=self._sender,
                         ws_closed=self._ws_closed,
-                        interval=float(self._app.bridge.ping_interval),
+                        interval=float(self._cfg.ping_interval),
                     )
                     keepalive_task = asyncio.create_task(
                         keepalive.run(), name="tun-keepalive",
