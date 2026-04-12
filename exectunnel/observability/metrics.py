@@ -1,15 +1,50 @@
+"""In-process metrics registry for exectunnel observability.
+
+Provides thread-safe counters, histograms, and gauges with a tag system.
+All public helpers operate on the module-level ``METRICS`` singleton.
+"""
+
 from __future__ import annotations
 
 import threading
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
+__all__ = [
+    "METRICS",
+    "MetricsRegistry",
+    "metrics_gauge_dec",
+    "metrics_gauge_inc",
+    "metrics_gauge_set",
+    "metrics_inc",
+    "metrics_observe",
+    "metrics_reset",
+    "metrics_snapshot",
+    "register_metric_listener",
+]
+
+
+# ------------------------------------------------------------------
+# Tag helpers
+# ------------------------------------------------------------------
 
 def _normalize_tags(tags: dict[str, object] | None) -> tuple[tuple[str, str], ...]:
+    """Sort and stringify tag values.
+
+    Booleans are lowercased (``"true"``/``"false"``) for consistency
+    across callers that may pass Python ``True`` vs the string ``"true"``.
+    """
     if not tags:
         return ()
-    return tuple(sorted((k, str(v)) for k, v in tags.items()))
+    return tuple(sorted((k, _tag_str(v)) for k, v in tags.items()))
+
+
+def _tag_str(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
 
 
 def _render_metric_key(name: str, tags: tuple[tuple[str, str], ...]) -> str:
@@ -17,6 +52,22 @@ def _render_metric_key(name: str, tags: tuple[tuple[str, str], ...]) -> str:
         return name
     joined = ",".join(f"{k}={v}" for k, v in tags)
     return f"{name}{{{joined}}}"
+
+
+# ------------------------------------------------------------------
+# Metric types
+# ------------------------------------------------------------------
+
+class HistogramSnapshot(NamedTuple):
+    """Immutable copy of a histogram's state at a point in time."""
+    count: int
+    total: float
+    min: float | None
+    max: float | None
+
+    @property
+    def avg(self) -> float | None:
+        return (self.total / self.count) if self.count else None
 
 
 @dataclass
@@ -34,9 +85,13 @@ class _Histogram:
         if self.max is None or value > self.max:
             self.max = value
 
-    @property
-    def avg(self) -> float | None:
-        return (self.total / self.count) if self.count else None
+    def snapshot(self) -> HistogramSnapshot:
+        return HistogramSnapshot(
+            count=self.count,
+            total=self.total,
+            min=self.min,
+            max=self.max,
+        )
 
 
 @dataclass
@@ -53,34 +108,37 @@ class _Gauge:
         self.value -= delta
 
 
+# ------------------------------------------------------------------
+# Registry
+# ------------------------------------------------------------------
+
+_TagKey = tuple[str, tuple[tuple[str, str], ...]]
+
+
 class MetricsRegistry:
+    """Thread-safe registry for counters, histograms, and gauges."""
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._counters: defaultdict[tuple[str, tuple[tuple[str, str], ...]], int] = (
-            defaultdict(int)
-        )
-        self._hists: dict[tuple[str, tuple[tuple[str, str], ...]], _Histogram] = {}
-        self._gauges: dict[tuple[str, tuple[tuple[str, str], ...]], _Gauge] = {}
+        self._counters: defaultdict[_TagKey, int] = defaultdict(int)
+        self._hists: dict[_TagKey, _Histogram] = {}
+        self._gauges: dict[_TagKey, _Gauge] = {}
 
-    # ------------------------------------------------------------------
-    # Counter
-    # ------------------------------------------------------------------
+    # -- Counter ---------------------------------------------------
 
     def inc(
-        self, name: str, value: int = 1, tags: dict[str, object] | None = None
+        self, name: str, value: int = 1, tags: dict[str, object] | None = None,
     ) -> None:
-        key = (name, _normalize_tags(tags))
+        key: _TagKey = (name, _normalize_tags(tags))
         with self._lock:
             self._counters[key] += value
 
-    # ------------------------------------------------------------------
-    # Histogram
-    # ------------------------------------------------------------------
+    # -- Histogram -------------------------------------------------
 
     def observe(
-        self, name: str, value: float, tags: dict[str, object] | None = None
+        self, name: str, value: float, tags: dict[str, object] | None = None,
     ) -> None:
-        key = (name, _normalize_tags(tags))
+        key: _TagKey = (name, _normalize_tags(tags))
         with self._lock:
             hist = self._hists.get(key)
             if hist is None:
@@ -88,84 +146,85 @@ class MetricsRegistry:
                 self._hists[key] = hist
             hist.observe(value)
 
-    # ------------------------------------------------------------------
-    # Gauge
-    # ------------------------------------------------------------------
+    # -- Gauge -----------------------------------------------------
 
     def gauge_set(
-        self, name: str, value: float, tags: dict[str, object] | None = None
+        self, name: str, value: float, tags: dict[str, object] | None = None,
     ) -> None:
-        key = (name, _normalize_tags(tags))
+        key: _TagKey = (name, _normalize_tags(tags))
         with self._lock:
-            g = self._gauges.get(key)
-            if g is None:
-                g = _Gauge()
-                self._gauges[key] = g
+            g = self._gauges.setdefault(key, _Gauge())
             g.set(value)
 
     def gauge_inc(
-        self, name: str, delta: float = 1.0, tags: dict[str, object] | None = None
+        self, name: str, delta: float = 1.0, tags: dict[str, object] | None = None,
     ) -> None:
-        key = (name, _normalize_tags(tags))
+        key: _TagKey = (name, _normalize_tags(tags))
         with self._lock:
-            g = self._gauges.get(key)
-            if g is None:
-                g = _Gauge()
-                self._gauges[key] = g
+            g = self._gauges.setdefault(key, _Gauge())
             g.inc(delta)
 
     def gauge_dec(
-        self, name: str, delta: float = 1.0, tags: dict[str, object] | None = None
+        self, name: str, delta: float = 1.0, tags: dict[str, object] | None = None,
     ) -> None:
-        key = (name, _normalize_tags(tags))
+        key: _TagKey = (name, _normalize_tags(tags))
         with self._lock:
-            g = self._gauges.get(key)
-            if g is None:
-                g = _Gauge()
-                self._gauges[key] = g
+            g = self._gauges.setdefault(key, _Gauge())
             g.dec(delta)
 
-    # ------------------------------------------------------------------
-    # Snapshot / reset
-    # ------------------------------------------------------------------
+    # -- Snapshot / reset ------------------------------------------
 
     def snapshot(self) -> dict[str, object]:
+        """Return a point-in-time copy of all metrics.
+
+        All mutable state is copied **under the lock** so that the
+        returned dict is safe to read without synchronisation.
+        """
         with self._lock:
             counters = dict(self._counters)
-            hists = dict(self._hists)
-            gauges = dict(self._gauges)
+            hist_snaps = {k: h.snapshot() for k, h in self._hists.items()}
+            gauge_values = {k: round(g.value, 6) for k, g in self._gauges.items()}
+
         out: dict[str, object] = {}
+
         for (name, tags), value in counters.items():
             out[_render_metric_key(name, tags)] = value
-        for (name, tags), hist in hists.items():
+
+        for (name, tags), snap in hist_snaps.items():
             prefix = _render_metric_key(name, tags)
-            out[f"{prefix}.count"] = hist.count
-            out[f"{prefix}.sum"] = round(hist.total, 6)
-            avg = hist.avg
-            if avg is not None:
-                out[f"{prefix}.avg"] = round(avg, 6)
-            h_min = hist.min
-            if h_min is not None:
-                out[f"{prefix}.min"] = round(h_min, 6)
-            h_max = hist.max
-            if h_max is not None:
-                out[f"{prefix}.max"] = round(h_max, 6)
-        for (name, tags), gauge in gauges.items():
-            out[_render_metric_key(name, tags)] = round(gauge.value, 6)
+            out[f"{prefix}.count"] = snap.count
+            out[f"{prefix}.sum"] = round(snap.total, 6)
+            if snap.avg is not None:
+                out[f"{prefix}.avg"] = round(snap.avg, 6)
+            if snap.min is not None:
+                out[f"{prefix}.min"] = round(snap.min, 6)
+            if snap.max is not None:
+                out[f"{prefix}.max"] = round(snap.max, 6)
+
+        for (name, tags), val in gauge_values.items():
+            out[_render_metric_key(name, tags)] = val
+
         return out
 
     def reset(self) -> None:
+        """Clear all counters, histograms, and gauges."""
         with self._lock:
             self._counters.clear()
             self._hists.clear()
             self._gauges.clear()
 
 
-METRICS = MetricsRegistry()
-# ── Metric listeners ─────────────────────────────────────────────────────────
-# Listeners are called synchronously inside metrics_inc() after the counter
-# is incremented.  Keep listeners fast — no I/O, no blocking.
+# ------------------------------------------------------------------
+# Module-level singleton
+# ------------------------------------------------------------------
 
+METRICS = MetricsRegistry()
+
+# ------------------------------------------------------------------
+# Metric listeners
+# ------------------------------------------------------------------
+# Listeners are called synchronously inside metrics_inc() after the
+# counter is incremented.  Keep listeners fast — no I/O, no blocking.
 
 _listeners: list[Callable[..., None]] = []
 
@@ -180,12 +239,21 @@ def register_metric_listener(fn: Callable[..., None]) -> None:
     _listeners.append(fn)
 
 
+def unregister_all_listeners() -> None:
+    """Remove all metric listeners."""
+    _listeners.clear()
+
+
+# ------------------------------------------------------------------
+# Convenience module-level helpers
+# ------------------------------------------------------------------
+
 def metrics_inc(metric: str, value: int = 1, **tags: object) -> None:
     METRICS.inc(metric, value=value, tags=tags or None)
-    for _fn in _listeners:
+    for fn in _listeners:
         try:
-            _fn(metric, **tags)
-        except Exception:
+            fn(metric, **tags)
+        except Exception:  # noqa: BLE001
             pass
 
 
@@ -210,5 +278,6 @@ def metrics_snapshot() -> dict[str, object]:
 
 
 def metrics_reset() -> None:
+    """Reset all metrics **and** remove all listeners."""
     METRICS.reset()
-    _listeners.clear()
+    unregister_all_listeners()

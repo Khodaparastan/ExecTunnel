@@ -1,3 +1,5 @@
+"""exectunnel.observability — logging, metrics, tracing & reporting."""
+
 from .exporters import Exporter, build_exporters, build_obs_payload
 from .logging import LevelName, configure_logging
 from .metrics import (
@@ -11,9 +13,11 @@ from .metrics import (
     metrics_reset,
     metrics_snapshot,
     register_metric_listener,
+    unregister_all_listeners,
 )
 from .reporter import run_metrics_reporter
 from .tracing import (
+    aspan,
     current_parent_span_id,
     current_span_id,
     current_trace_id,
@@ -40,9 +44,11 @@ __all__ = [
     "metrics_reset",
     "metrics_snapshot",
     "register_metric_listener",
+    "unregister_all_listeners",
     # reporter
     "run_metrics_reporter",
     # tracing
+    "aspan",
     "current_parent_span_id",
     "current_span_id",
     "current_trace_id",

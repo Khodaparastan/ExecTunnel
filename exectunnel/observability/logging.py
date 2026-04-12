@@ -1,3 +1,15 @@
+"""Configurable logging subsystem for exectunnel.
+
+Supports three modes selected via environment variables:
+
+* ``EXECTUNNEL_LOG_FORMAT=console`` (default) — human-friendly output.
+* ``EXECTUNNEL_LOG_FORMAT=json`` — machine-parseable JSON lines.
+* ``EXECTUNNEL_LOG_ENGINE=structlog`` — delegates to *structlog* if installed.
+
+Trace and span IDs are automatically injected via :mod:`.tracing` context
+variables.
+"""
+
 from __future__ import annotations
 
 import json
@@ -5,9 +17,14 @@ import logging
 import os
 import sys
 from datetime import UTC, datetime
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 from .tracing import current_span_id, current_trace_id
+
+__all__ = [
+    "LevelName",
+    "configure_logging",
+]
 
 _LEVELS: dict[str, int] = {
     "debug": logging.DEBUG,
@@ -18,40 +35,51 @@ _LEVELS: dict[str, int] = {
 
 LevelName = Literal["debug", "info", "warning", "error"]
 
+# ------------------------------------------------------------------
+# Optional dependency imports
+# ------------------------------------------------------------------
+
 try:
-    from colorama import Fore, Style
-    from colorama import init as colorama_init
-except Exception:  # pragma: no cover - optional dependency
+    from colorama import Fore, Style  # type: ignore[import-untyped]
+    from colorama import init as colorama_init  # type: ignore[import-untyped]
+except ImportError:
     Fore = None  # type: ignore[assignment]
     Style = None  # type: ignore[assignment]
     colorama_init = None  # type: ignore[assignment]
+
 try:
-    import structlog
-except Exception:  # pragma: no cover - optional dependency
-    structlog = None  # type: ignore[assignment]
+    import structlog as _structlog  # type: ignore[import-untyped]
+except ImportError:
+    _structlog = None  # type: ignore[assignment]
 
 
-class _TraceContextFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        record.trace_id = current_trace_id() or "-"
-        record.span_id = current_span_id() or "-"
-        return True
+# ------------------------------------------------------------------
+# Trace context filter
+# ------------------------------------------------------------------
 
-
-# Fields that are standard LogRecord attributes — never re-emitted as extras.
+# Standard LogRecord attribute names — never re-emitted as caller extras.
 _LOG_RECORD_BUILTIN_ATTRS: frozenset[str] = frozenset(
     logging.LogRecord("", 0, "", 0, "", (), None).__dict__.keys()
-    | {
-        "message",
-        "asctime",
-        "trace_id",
-        "span_id",
-        "taskName",
-    }
+    | {"message", "asctime", "trace_id", "span_id", "taskName"}
 )
 
 
+class _TraceContextFilter(logging.Filter):
+    """Inject trace/span IDs from context-vars into every LogRecord."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.trace_id = current_trace_id() or "-"  # type: ignore[attr-defined]
+        record.span_id = current_span_id() or "-"  # type: ignore[attr-defined]
+        return True
+
+
+# ------------------------------------------------------------------
+# Formatters
+# ------------------------------------------------------------------
+
 class _JsonLogFormatter(logging.Formatter):
+    """Emit each log record as a single JSON object."""
+
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, object] = {
             "ts": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -61,7 +89,6 @@ class _JsonLogFormatter(logging.Formatter):
             "trace_id": getattr(record, "trace_id", "-"),
             "span_id": getattr(record, "span_id", "-"),
         }
-        # Emit any structured extra= fields passed by the caller.
         for key, val in record.__dict__.items():
             if key not in _LOG_RECORD_BUILTIN_ATTRS:
                 payload[key] = val
@@ -71,6 +98,8 @@ class _JsonLogFormatter(logging.Formatter):
 
 
 class _ConsoleFormatter(logging.Formatter):
+    """Human-friendly single-line formatter with optional ANSI colour."""
+
     def __init__(self, *, enable_color: bool) -> None:
         super().__init__()
         self._enable_color = enable_color
@@ -96,25 +125,30 @@ class _ConsoleFormatter(logging.Formatter):
         level = f"{record.levelname:<7}"
         message = record.getMessage()
         level, message = self._colorize(record.levelno, level, message)
-        # Collect structured extra= fields for richer debug output.
+
         extras = {
             k: v
             for k, v in record.__dict__.items()
             if k not in _LOG_RECORD_BUILTIN_ATTRS
         }
+
         if record.levelno <= logging.DEBUG:
             trace = getattr(record, "trace_id", "-")
-            span = getattr(record, "span_id", "-")
-            suffix = f" [trace={trace} span={span}]"
+            span_ = getattr(record, "span_id", "-")
             if extras:
                 kv = " ".join(f"{k}={v}" for k, v in extras.items())
-                suffix = f" [{kv} trace={trace} span={span}]"
-            return f"{ts} {level} {record.name}: {message}{suffix}"
+                return f"{ts} {level} {record.name}: {message} [{kv} trace={trace} span={span_}]"
+            return f"{ts} {level} {record.name}: {message} [trace={trace} span={span_}]"
+
         if extras:
             kv = " ".join(f"{k}={v}" for k, v in extras.items())
             return f"{ts} {level} {message} [{kv}]"
         return f"{ts} {level} {message}"
 
+
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
 
 def _color_enabled() -> bool:
     mode = os.getenv("EXECTUNNEL_LOG_COLOR", "auto").strip().lower()
@@ -126,7 +160,7 @@ def _color_enabled() -> bool:
 
 
 def _add_observability_context(
-    _logger: Any, _method_name: str, event_dict: dict[str, Any]
+    _logger: Any, _method_name: str, event_dict: dict[str, Any],
 ) -> dict[str, Any]:
     event_dict.setdefault("trace_id", current_trace_id() or "-")
     event_dict.setdefault("span_id", current_span_id() or "-")
@@ -139,75 +173,93 @@ def _configure_structlog(
     log_format: str,
     enable_color: bool,
 ) -> bool:
-    if structlog is None:
+    """Set up *structlog* as the logging backend.  Returns ``True`` on success."""
+    if _structlog is None:
         return False
 
     pre_chain = [
-        cast(Any, structlog).stdlib.add_log_level,
-        cast(Any, structlog).stdlib.add_logger_name,
+        _structlog.stdlib.add_log_level,
+        _structlog.stdlib.add_logger_name,
         _add_observability_context,
     ]
     if log_format == "json":
-        renderer = cast(Any, structlog).processors.JSONRenderer(serializer=json.dumps)
+        renderer = _structlog.processors.JSONRenderer(serializer=json.dumps)
     else:
-        renderer = cast(Any, structlog).dev.ConsoleRenderer(colors=enable_color)
+        renderer = _structlog.dev.ConsoleRenderer(colors=enable_color)
 
     handler.setFormatter(
-        cast(Any, structlog).stdlib.ProcessorFormatter(
+        _structlog.stdlib.ProcessorFormatter(
             processor=renderer,
             foreign_pre_chain=pre_chain,
-        )
+        ),
     )
 
-    cast(Any, structlog).configure(
+    _structlog.configure(
         processors=[
-            cast(Any, structlog).contextvars.merge_contextvars,
-            cast(Any, structlog).stdlib.add_log_level,
-            cast(Any, structlog).stdlib.add_logger_name,
+            _structlog.contextvars.merge_contextvars,
+            _structlog.stdlib.add_log_level,
+            _structlog.stdlib.add_logger_name,
             _add_observability_context,
-            cast(Any, structlog).stdlib.PositionalArgumentsFormatter(),
-            cast(Any, structlog).processors.StackInfoRenderer(),
-            cast(Any, structlog).processors.format_exc_info,
-            cast(Any, structlog).stdlib.ProcessorFormatter.wrap_for_formatter,
+            _structlog.stdlib.PositionalArgumentsFormatter(),
+            _structlog.processors.StackInfoRenderer(),
+            _structlog.processors.format_exc_info,
+            _structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
         ],
-        logger_factory=cast(Any, structlog).stdlib.LoggerFactory(),
-        wrapper_class=cast(Any, structlog).stdlib.BoundLogger,
+        logger_factory=_structlog.stdlib.LoggerFactory(),
+        wrapper_class=_structlog.stdlib.BoundLogger,
         cache_logger_on_first_use=True,
     )
     return True
 
 
+# ------------------------------------------------------------------
+# Public API
+# ------------------------------------------------------------------
+
+_HANDLER_ATTR = "_exectunnel_handler"
+
+
 def configure_logging(level: LevelName = "info") -> None:
+    """Bootstrap the ``exectunnel`` logger hierarchy.
+
+    Safe to call multiple times — previous exectunnel handlers are replaced.
+    """
     numeric = _LEVELS.get(level.lower(), logging.INFO)
     log_format = os.getenv("EXECTUNNEL_LOG_FORMAT", "console").strip().lower()
     log_engine = os.getenv("EXECTUNNEL_LOG_ENGINE", "stdlib").strip().lower()
     enable_color = _color_enabled()
+
     if colorama_init is not None:
         colorama_init()
 
     handler = logging.StreamHandler(sys.stderr)
     handler.setLevel(numeric)
     handler.addFilter(_TraceContextFilter())
-    structlog_enabled = log_engine == "structlog" and _configure_structlog(
+
+    structlog_active = log_engine == "structlog" and _configure_structlog(
         handler=handler,
         log_format=log_format,
         enable_color=enable_color,
     )
-    if not structlog_enabled and log_format == "json":
-        handler.setFormatter(_JsonLogFormatter())
-    elif not structlog_enabled:
-        handler.setFormatter(_ConsoleFormatter(enable_color=enable_color))
-    handler._exectunnel_handler = True  # type: ignore[attr-defined]
+
+    if not structlog_active:
+        if log_format == "json":
+            handler.setFormatter(_JsonLogFormatter())
+        else:
+            handler.setFormatter(_ConsoleFormatter(enable_color=enable_color))
+
+    setattr(handler, _HANDLER_ATTR, True)
 
     pkg_logger = logging.getLogger("exectunnel")
     pkg_logger.setLevel(numeric)
     for existing in list(pkg_logger.handlers):
-        if getattr(existing, "_exectunnel_handler", False):
+        if getattr(existing, _HANDLER_ATTR, False):
             pkg_logger.removeHandler(existing)
     pkg_logger.addHandler(handler)
     pkg_logger.propagate = False
-    if log_engine == "structlog" and not structlog_enabled:
+
+    if log_engine == "structlog" and not structlog_active:
         pkg_logger.warning(
-            "EXECTUNNEL_LOG_ENGINE=structlog requested, but structlog is not installed; "
-            "falling back to stdlib logging"
+            "EXECTUNNEL_LOG_ENGINE=structlog requested, but structlog is not "
+            "installed; falling back to stdlib logging",
         )
