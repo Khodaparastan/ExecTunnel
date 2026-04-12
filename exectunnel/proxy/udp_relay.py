@@ -21,12 +21,13 @@ from exectunnel.observability import (
     metrics_observe,
 )
 from exectunnel.protocol import AddrType
-from exectunnel.proxy._constants import (
-    DEFAULT_QUEUE_CAPACITY,
-    DROP_WARN_INTERVAL,
+
+from ._constants import (
+    DEFAULT_DROP_WARN_INTERVAL,
+    DEFAULT_UDP_QUEUE_CAPACITY,
     MAX_UDP_PAYLOAD_BYTES,
 )
-from exectunnel.proxy._wire import build_udp_header, parse_udp_header
+from ._wire import build_udp_header, parse_udp_header
 
 __all__: list[str] = ["UdpRelay"]
 
@@ -47,7 +48,7 @@ class _RelayDatagramProtocol(asyncio.DatagramProtocol):
         self._relay = relay
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
-        self._relay._on_datagram(data, addr)
+        self._relay.on_datagram(data, addr)
 
     def error_received(self, exc: Exception) -> None:
         logger.debug(
@@ -85,8 +86,8 @@ class UdpRelay:
     def __init__(
         self,
         *,
-        queue_capacity: int = DEFAULT_QUEUE_CAPACITY,
-        drop_warn_interval: int = DROP_WARN_INTERVAL,
+        queue_capacity: int = DEFAULT_UDP_QUEUE_CAPACITY,
+        drop_warn_interval: int = DEFAULT_DROP_WARN_INTERVAL,
     ) -> None:
         self._queue_capacity = queue_capacity
         self._drop_warn_interval = drop_warn_interval
@@ -228,7 +229,7 @@ class UdpRelay:
 
     # ── Inbound path (client → relay) ────────────────────────────────────────
 
-    def _on_datagram(self, data: bytes, addr: tuple[str, int]) -> None:
+    def on_datagram(self, data: bytes, addr: tuple[str, int]) -> None:
         """Parse the SOCKS5 UDP header and enqueue ``(payload, dst_host, dst_port)``.
 
         Called from :class:`_RelayDatagramProtocol`; must never raise.

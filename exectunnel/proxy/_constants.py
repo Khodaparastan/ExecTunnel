@@ -8,14 +8,6 @@ including ``MAX_UDP_PAYLOAD_BYTES`` which is used by both ``_wire`` and
 
 from __future__ import annotations
 
-__all__: list[str] = [
-    "DEFAULT_HANDSHAKE_TIMEOUT",
-    "DEFAULT_QUEUE_CAPACITY",
-    "DROP_WARN_INTERVAL",
-    "MAX_UDP_PAYLOAD_BYTES",
-    "QUEUE_PUT_TIMEOUT",
-]
-
 # Maximum UDP payload accepted from the SOCKS5 client.
 # 65507 = 65535 − 20 (IPv4 header) − 8 (UDP header).
 MAX_UDP_PAYLOAD_BYTES: int = 65_507
@@ -24,11 +16,18 @@ MAX_UDP_PAYLOAD_BYTES: int = 65_507
 DEFAULT_HANDSHAKE_TIMEOUT: float = 30.0
 
 # Default capacity of the inbound datagram queue per UdpRelay instance.
-DEFAULT_QUEUE_CAPACITY: int = 2_048
+# Per-server: max buffered, fully-negotiated SOCKS5 requests.
+DEFAULT_REQUEST_QUEUE_CAPACITY: int = 256
+
+# Per UdpRelay: max inbound datagrams before drop.
+DEFAULT_UDP_QUEUE_CAPACITY: int = 2_048
 
 # Log a warning every N drops to avoid log flooding on a saturated relay.
-DROP_WARN_INTERVAL: int = 1_000
+DEFAULT_DROP_WARN_INTERVAL: int = 1_000
 
 # Maximum seconds to wait when enqueueing a completed handshake before
 # dropping the connection with a GENERAL_FAILURE reply.
-QUEUE_PUT_TIMEOUT: float = 5.0
+DEFAULT_QUEUE_PUT_TIMEOUT: float = 5.0
+
+DEFAULT_HOST: str = "127.0.0.1"
+DEFAULT_PORT: int = 1080

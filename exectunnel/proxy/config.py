@@ -14,10 +14,13 @@ from dataclasses import dataclass
 from exectunnel.exceptions import ConfigurationError
 
 from ._constants import (
+    DEFAULT_DROP_WARN_INTERVAL,
     DEFAULT_HANDSHAKE_TIMEOUT,
-    DEFAULT_QUEUE_CAPACITY,
-    DROP_WARN_INTERVAL,
-    QUEUE_PUT_TIMEOUT,
+    DEFAULT_HOST,
+    DEFAULT_PORT,
+    DEFAULT_QUEUE_PUT_TIMEOUT,
+    DEFAULT_REQUEST_QUEUE_CAPACITY,
+    DEFAULT_UDP_QUEUE_CAPACITY,
 )
 
 __all__: list[str] = ["Socks5ServerConfig"]
@@ -46,13 +49,13 @@ class Socks5ServerConfig:
         ConfigurationError: If any field fails validation.
     """
 
-    host: str = "127.0.0.1"
-    port: int = 1080
+    host: str = DEFAULT_HOST
+    port: int = DEFAULT_PORT
     handshake_timeout: float = DEFAULT_HANDSHAKE_TIMEOUT
-    request_queue_capacity: int = DEFAULT_QUEUE_CAPACITY
-    udp_relay_queue_capacity: int = DEFAULT_QUEUE_CAPACITY
-    queue_put_timeout: float = QUEUE_PUT_TIMEOUT
-    udp_drop_warn_interval: int = DROP_WARN_INTERVAL
+    request_queue_capacity: int = DEFAULT_REQUEST_QUEUE_CAPACITY
+    udp_relay_queue_capacity: int = DEFAULT_UDP_QUEUE_CAPACITY
+    queue_put_timeout: float = DEFAULT_QUEUE_PUT_TIMEOUT
+    udp_drop_warn_interval: int = DEFAULT_DROP_WARN_INTERVAL
 
     def __post_init__(self) -> None:
         """Validate all fields."""
@@ -108,11 +111,11 @@ class Socks5ServerConfig:
             ),
         ]
 
-        for failed, field, value, expected, hint in validators:
+        for failed, field_name, value, expected, hint in validators:
             if failed:
                 raise ConfigurationError(
-                    f"Socks5ServerConfig.{field} {value!r} is invalid.",
-                    details={"field": field, "value": value, "expected": expected},
+                    f"Socks5ServerConfig.{field_name} {value!r} is invalid.",
+                    details={"field": field_name, "value": value, "expected": expected},
                     hint=hint,
                 )
 

@@ -217,7 +217,7 @@ class Socks5Server:
         writer: asyncio.StreamWriter,
     ) -> None:
         """Inner handshake logic, separated for cleaner exception handling."""
-        _t0 = time.monotonic()
+        handshake_start = time.monotonic()
         async with aspan("socks5.handshake"):
             try:
                 async with asyncio.timeout(self._config.handshake_timeout):
@@ -225,7 +225,7 @@ class Socks5Server:
             except TimeoutError:
                 metrics_inc("socks5.handshakes.timeout")
                 metrics_observe(
-                    "socks5.handshake_duration_sec", time.monotonic() - _t0
+                    "socks5.handshake_duration_sec", time.monotonic() - handshake_start
                 )
                 logger.warning(
                     "socks5 handshake timed out after %.1fs",
@@ -237,7 +237,7 @@ class Socks5Server:
                 metrics_inc("socks5.handshakes.error", reason="protocol")
                 metrics_inc("socks5.connections.rejected")
                 metrics_observe(
-                    "socks5.handshake_duration_sec", time.monotonic() - _t0
+                    "socks5.handshake_duration_sec", time.monotonic() - handshake_start
                 )
                 logger.debug(
                     "socks5 handshake rejected [%s]: %s (error_id=%s)",
@@ -251,7 +251,7 @@ class Socks5Server:
                 metrics_inc("socks5.handshakes.error", reason="transport")
                 metrics_inc("socks5.connections.rejected")
                 metrics_observe(
-                    "socks5.handshake_duration_sec", time.monotonic() - _t0
+                    "socks5.handshake_duration_sec", time.monotonic() - handshake_start
                 )
                 logger.warning(
                     "socks5 handshake transport error [%s]: %s (error_id=%s)",
@@ -265,7 +265,7 @@ class Socks5Server:
                 metrics_inc("socks5.handshakes.error", reason="library")
                 metrics_inc("socks5.connections.rejected")
                 metrics_observe(
-                    "socks5.handshake_duration_sec", time.monotonic() - _t0
+                    "socks5.handshake_duration_sec", time.monotonic() - handshake_start
                 )
                 logger.warning(
                     "socks5 handshake library error [%s]: %s (error_id=%s)",
@@ -279,7 +279,7 @@ class Socks5Server:
                 metrics_inc("socks5.handshakes.error", reason="os_error")
                 metrics_inc("socks5.connections.rejected")
                 metrics_observe(
-                    "socks5.handshake_duration_sec", time.monotonic() - _t0
+                    "socks5.handshake_duration_sec", time.monotonic() - handshake_start
                 )
                 logger.debug("socks5 handshake I/O error: %s", exc)
                 await close_writer(writer)
@@ -298,7 +298,7 @@ class Socks5Server:
                 metrics_inc("socks5.handshakes.error", reason="queue_full")
                 metrics_inc("socks5.connections.rejected")
                 metrics_observe(
-                    "socks5.handshake_duration_sec", time.monotonic() - _t0
+                    "socks5.handshake_duration_sec", time.monotonic() - handshake_start
                 )
                 logger.warning(
                     "socks5 queue full — dropping handshake for %s:%d "
@@ -312,7 +312,7 @@ class Socks5Server:
                 return
 
             metrics_inc("socks5.handshakes.ok", cmd=req.cmd.name)
-            metrics_observe("socks5.handshake_duration_sec", time.monotonic() - _t0)
+            metrics_observe("socks5.handshake_duration_sec", time.monotonic() - handshake_start)
             logger.debug(
                 "socks5 handshake ok: cmd=%s host=%s port=%d",
                 req.cmd.name,

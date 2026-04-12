@@ -121,9 +121,7 @@ async def read_socks5_addr(
 
 
 async def close_writer(writer: asyncio.StreamWriter) -> None:
-    """Close *writer*, suppressing ``OSError``, ``RuntimeError``, and
-    ``asyncio.CancelledError`` (the latter can surface from
-    ``wait_closed()`` during interpreter shutdown).
+    """Close *writer*, suppressing ``OSError``, ``RuntimeError``
 
     Args:
         writer: The asyncio stream writer to close.

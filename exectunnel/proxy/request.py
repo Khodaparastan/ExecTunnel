@@ -65,8 +65,7 @@ class Socks5Request:
     async def close(self) -> None:
         """Close the writer and any associated UDP relay.
 
-        Idempotent.  ``OSError``, ``RuntimeError``, and
-        ``asyncio.CancelledError`` are suppressed because the connection may
+        Idempotent.  ``OSError``, ``RuntimeError`` are suppressed because the connection may
         already be torn down.
         """
         if self.udp_relay is not None:
