@@ -9,7 +9,7 @@ concern and does not belong in ``proxy``.
 import asyncio
 import logging
 
-from exectunnel.config.defaults import Defaults
+from exectunnel.defaults import Defaults
 from exectunnel.exceptions import (
     ConnectionClosedError,
     ExecTunnelError,
@@ -361,7 +361,7 @@ class DnsForwarder:
                 if response is None:
                     # Timeout or agent-closed — already handled inside
                     # _recv_response; determine which for cleanup.
-                    if handler._closed:  # noqa: SLF001 — transport internals
+                    if handler.is_closed:
                         agent_closed = True
                     return
 

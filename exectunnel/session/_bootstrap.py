@@ -42,7 +42,7 @@ from typing import TYPE_CHECKING, Final
 
 from websockets.exceptions import ConnectionClosed
 
-from exectunnel.config.defaults import Defaults
+from exectunnel.defaults import Defaults
 from exectunnel.exceptions import (
     AgentReadyTimeoutError,
     AgentSyntaxError,
@@ -57,7 +57,7 @@ from ._payload import load_agent_b64, load_go_agent_b64
 if TYPE_CHECKING:
     from websockets.asyncio.client import ClientConnection
 
-    from exectunnel.config.settings import AppConfig, TunnelConfig
+    from ._config import SessionConfig, TunnelConfig
 
 logger = logging.getLogger(__name__)
 
@@ -100,14 +100,14 @@ class AgentBootstrapper:
     taking over the WebSocket iterator.
 
     Args:
-        ws:       Live WebSocket connection to the pod exec channel.
-        app_cfg:  Application-level configuration.
-        tun_cfg:  Tunnel-level configuration.
+        ws:          Live WebSocket connection to the pod exec channel.
+        session_cfg: Session-level configuration.
+        tun_cfg:     Tunnel-level configuration.
     """
 
     __slots__ = (
         "_ws",
-        "_app",
+        "_cfg",
         "_tun",
         "_diag",
         "_start",
@@ -118,12 +118,12 @@ class AgentBootstrapper:
     def __init__(
         self,
         ws: ClientConnection,
-        app_cfg: AppConfig,
+        session_cfg: SessionConfig,
         tun_cfg: TunnelConfig,
     ) -> None:
         self._validate_shell_literals(tun_cfg)
         self._ws = ws
-        self._app = app_cfg
+        self._cfg = session_cfg
         self._tun = tun_cfg
         self._diag: collections.deque[str] = collections.deque(
             maxlen=Defaults.BOOTSTRAP_DIAG_MAX_LINES,
@@ -141,7 +141,7 @@ class AgentBootstrapper:
             ("bootstrap_agent_path", tun_cfg.bootstrap_agent_path),
             ("bootstrap_go_agent_path", tun_cfg.bootstrap_go_agent_path),
             ("bootstrap_syntax_ok_sentinel", tun_cfg.bootstrap_syntax_ok_sentinel),
-            ("fetch_agent_url", tun_cfg.fetch_agent_url),
+            ("bootstrap_fetch_url", tun_cfg.bootstrap_fetch_url),
         )
         for attr, value in values_to_check:
             bad = _SHELL_UNSAFE_CHARS.intersection(value)
@@ -316,7 +316,7 @@ class AgentBootstrapper:
             await self._deliver_via_upload(agent_path, b64_data, label)
         else:
             await self._deliver_via_fetch(
-                agent_path, self._tun.fetch_agent_url, label
+                agent_path, self._tun.bootstrap_fetch_url, label
             )
 
         return True
@@ -336,7 +336,7 @@ class AgentBootstrapper:
                 "WebSocket closed while sending bootstrap command.",
                 details={
                     "command": cmd[:80],
-                    "host": self._app.wss_url,
+                    "host": self._cfg.wss_url,
                     "elapsed_s": self._elapsed,
                 },
                 hint="Check that the remote shell is still alive.",
@@ -390,7 +390,7 @@ class AgentBootstrapper:
                 f"({cmd[:40]!r}).",
                 details={
                     "command": cmd[:80],
-                    "host": self._app.wss_url,
+                    "host": self._cfg.wss_url,
                     "elapsed_s": self._elapsed,
                     "fence_timeout_s": timeout,
                 },
@@ -404,7 +404,7 @@ class AgentBootstrapper:
             f"WebSocket closed while waiting for command fence ({cmd[:40]!r}).",
             details={
                 "command": cmd[:80],
-                "host": self._app.wss_url,
+                "host": self._cfg.wss_url,
                 "elapsed_s": self._elapsed,
             },
             hint="Check that the remote shell is still alive.",
@@ -455,7 +455,7 @@ class AgentBootstrapper:
                 f"probe response for {path!r}.",
                 details={
                     "path": path,
-                    "host": self._app.wss_url,
+                    "host": self._cfg.wss_url,
                     "elapsed_s": self._elapsed,
                     "probe_timeout_s": timeout,
                 },
@@ -469,7 +469,7 @@ class AgentBootstrapper:
             f"WebSocket closed while probing for {path!r}.",
             details={
                 "path": path,
-                "host": self._app.wss_url,
+                "host": self._cfg.wss_url,
                 "elapsed_s": self._elapsed,
             },
             hint="Check that the remote shell is still alive.",
@@ -636,7 +636,7 @@ class AgentBootstrapper:
                 f"{self._tun.ready_timeout}s{detail}",
                 details={
                     "timeout_s": self._tun.ready_timeout,
-                    "host": self._app.wss_url,
+                    "host": self._cfg.wss_url,
                     "last_output": self._diag[-1] if self._diag else None,
                 },
                 hint=(
@@ -679,7 +679,7 @@ class AgentBootstrapper:
         raise BootstrapError(
             f"WebSocket closed before AGENT_READY was received{detail}",
             details={
-                "host": self._app.wss_url,
+                "host": self._cfg.wss_url,
                 "elapsed_s": self._elapsed,
                 "last_output": self._diag[-1] if self._diag else None,
             },
@@ -728,8 +728,8 @@ class AgentBootstrapper:
                 "incompatible with this client.",
                 details={
                     "remote_version": remote_version,
-                    "local_version": self._app.version,
-                    "minimum_version": self._app.version,
+                    "local_version": self._cfg.version,
+                    "minimum_version": self._cfg.version,
                 },
                 hint=(
                     "Upgrade the exectunnel client or redeploy "
@@ -744,7 +744,7 @@ class AgentBootstrapper:
         """Decode a WebSocket message to ``str``."""
         if isinstance(msg, str):
             return msg
-        return msg.decode("utf-8", errors=_WS_DECODE_ERRORS)
+        return msg.decode(errors=_WS_DECODE_ERRORS)
 
     @staticmethod
     def _b64_staging_path(agent_path: str) -> str:

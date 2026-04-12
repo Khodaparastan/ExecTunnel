@@ -32,7 +32,6 @@ from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed
 
 from exectunnel.defaults import Defaults
-from ._config import SessionConfig
 from exectunnel.exceptions import (
     ConnectionClosedError,
     WebSocketSendTimeoutError,
@@ -43,6 +42,8 @@ from exectunnel.observability import (
     metrics_inc,
 )
 from exectunnel.protocol import FRAME_PREFIX, FRAME_SUFFIX, encode_keepalive_frame
+
+from ._config import SessionConfig
 
 logger = logging.getLogger(__name__)
 
