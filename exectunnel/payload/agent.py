@@ -80,14 +80,6 @@ Protocol alignment
 
 from __future__ import annotations
 
-import sys
-
-# ── Python version guard ──────────────────────────────────────────────────────
-# match/case requires 3.10+; datetime.UTC requires 3.11+.
-if sys.version_info < (3, 11):
-    sys.stderr.write(f"exectunnel agent requires Python 3.11+, got {sys.version}\n")
-    sys.exit(1)
-
 import base64
 import binascii
 import contextlib
@@ -98,20 +90,16 @@ import re as _re
 import select
 import signal
 import socket
+import sys
 import termios
 import threading
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 
-# ── Protocol constants ────────────────────────────────────────────────────────
-
 _FRAME_PREFIX: str = "<<<EXECTUNNEL:"
 _FRAME_SUFFIX: str = ">>>"
 _AGENT_VERSION: str = "1"
-
-# ── Logging ───────────────────────────────────────────────────────────────────
-
 _LOG_LEVELS: dict[str, int] = {
     "debug": 10,
     "info": 20,
@@ -135,9 +123,6 @@ _MAX_UDP_INBOUND_DGRAMS: int = 2_048
 _STDOUT_DATA_QUEUE_CAP: int = 2_048
 
 # Backpressure threshold: pause TCP recv when data queue exceeds this fraction.
-# At 0.75 capacity the IO loop skips sock.recv(), letting the OS TCP receive
-# buffer fill and propagating backpressure to the remote sender.
-# This prevents the queue from reaching 100% and causing EPIPE on the writer.
 _STDOUT_DATA_QUEUE_BACKPRESSURE_RATIO: float = 0.75
 
 # Derived threshold in items — computed once at module load.
@@ -149,9 +134,6 @@ _STDOUT_DATA_QUEUE_BACKPRESSURE_THRESHOLD: int = int(
 _WRITER_DATA_BATCH_SIZE: int = 64
 
 # TCP connect timeout in seconds.
-# Must be shorter than the client-side CONN_ACK_TIMEOUT_SECS (10 s) so the
-# agent fails first and emits CONN_ERR before the client gives up waiting.
-# 8 s = 10 s - 2 s tunnel RTT budget, leaving time for CONN_ERR to arrive.
 _TCP_CONNECT_TIMEOUT_SECS: float = 8.0
 
 # TCP receive chunk size in bytes.
@@ -161,8 +143,6 @@ _TCP_RECV_CHUNK_BYTES: int = 4_096
 _MAX_UDP_DGRAM_BYTES: int = 65_535
 
 # Log a UDP drop warning every N drops.
-# 1,000 matches the client-side UDP_WARN_EVERY / DROP_WARN_INTERVAL policy
-# for consistent log volume across all drop-counting paths.
 _UDP_DROP_WARN_EVERY: int = 1_000
 
 # select() timeout — 10 ms balances interactive latency vs CPU overhead.
@@ -178,53 +158,103 @@ _WRITER_JOIN_TIMEOUT_SECS: float = 5.0
 _HALF_CLOSE_DEADLINE_SECS: float = 30.0
 
 # select() timeout used in _send_all_nonblocking() while waiting for a slow
-# remote TCP peer to become writable.  5 s is generous but bounded.
+# remote TCP peer to become writable.
 _SEND_WRITABLE_TIMEOUT_SECS: float = 5.0
 
-# Maximum inbound frame length accepted by dispatch() — mirrors the client-side
-# MAX_FRAME_LEN constant in protocol/frames.py.  Frames longer than this are
-# silently dropped to prevent unbounded memory allocation.
+# Maximum inbound frame length accepted by dispatch().
 _MAX_INBOUND_FRAME_LEN: int = 8_192
 
-# Regex pattern for valid connection / flow IDs — mirrors the client-side
-# ID_RE = r"[cu][0-9a-f]{24}" in protocol/ids.py.
+# Regex pattern for valid connection / flow IDs.
 _ID_RE: _re.Pattern[str] = _re.compile(r"^[cu][0-9a-f]{24}$")
 
+# Timeout for each Queue.put() attempt in emit_data().
+_EMIT_DATA_PUT_TIMEOUT_SECS: float = 1.0
 
-# ── SIGPIPE handler ───────────────────────────────────────────────────────────
+# Grace period for worker threads to emit final frames during shutdown.
+_WORKER_SHUTDOWN_GRACE_SECS: float = 3.0
+
+
+class _DnsCache:
+    """Thread-safe DNS cache with per-key deduplication.
+
+    Only the first caller for a given ``(host, port, socktype)`` key blocks
+    on ``getaddrinfo``; concurrent callers wait on a per-key lock.
+
+    The cache never expires — the agent process is short-lived.
+    """
+
+    __slots__ = ("_cache", "_key_locks", "_mu")
+
+    def __init__(self) -> None:
+        self._cache: dict[tuple[str, int, int], list[tuple]] = {}
+        self._key_locks: dict[tuple[str, int, int], threading.Lock] = {}
+        self._mu = threading.Lock()
+
+    def getaddrinfo(
+        self,
+        host: str,
+        port: int,
+        *,
+        socktype: int = 0,
+    ) -> list[tuple]:
+        key = (host, port, socktype)
+
+        with self._mu:
+            cached = self._cache.get(key)
+            if cached is not None:
+                return cached
+            key_lock = self._key_locks.get(key)
+            if key_lock is None:
+                key_lock = threading.Lock()
+                self._key_locks[key] = key_lock
+
+        with key_lock:
+            with self._mu:
+                cached = self._cache.get(key)
+                if cached is not None:
+                    return cached
+
+            infos = socket.getaddrinfo(host, port, type=socktype)
+
+            with self._mu:
+                self._cache[key] = infos
+            return infos
+
+
+def _create_connection_cached(
+    dns_cache: _DnsCache,
+    host: str,
+    port: int,
+    timeout: float,
+) -> socket.socket:
+    """Like ``socket.create_connection`` but uses the shared DNS cache."""
+    infos = dns_cache.getaddrinfo(host, port, socktype=socket.SOCK_STREAM)
+    if not infos:
+        raise OSError(f"getaddrinfo returned no results for {host!r}:{port}")
+
+    last_exc: OSError | None = None
+    for family, socktype, proto, _, addr in infos:
+        sock = socket.socket(family, socktype, proto)
+        try:
+            sock.settimeout(timeout)
+            sock.connect(addr)
+            return sock
+        except OSError as exc:
+            last_exc = exc
+            with contextlib.suppress(OSError):
+                sock.close()
+
+    raise last_exc or OSError(f"could not connect to {host}:{port}")
 
 
 def _install_sigpipe_handler() -> None:
-    """Ignore SIGPIPE so the process does not crash on stdout EPIPE.
-
-    When the kubectl exec channel closes while the writer thread is mid-send,
-    the OS delivers SIGPIPE.  Ignoring it lets the writer thread catch the
-    ``OSError`` at the Python level instead of crashing the process.
-
-    No-op on platforms that do not support SIGPIPE (e.g. Windows).
-    """
     try:
         signal.signal(signal.SIGPIPE, signal.SIG_IGN)
     except (OSError, ValueError):
         pass
 
 
-# ── Fault-tolerant stdout wrapper ─────────────────────────────────────────────
-
-
 class _FaultTolerantStdout:
-    """Wraps ``sys.stdout`` and catches ``OSError`` / ``BrokenPipeError`` silently.
-
-    Python's C-level ``io.BufferedWriter`` prints
-    ``"socket.send() raised exception."`` to stderr when it catches an
-    ``OSError`` it cannot propagate.  By catching the exception at the Python
-    level before it reaches the C layer, we prevent that message entirely.
-
-    Once a write or flush fails, the wrapper marks itself dead and all
-    subsequent calls are no-ops.  The ``_FrameWriter`` checks ``is_dead``
-    and exits its loop promptly.
-    """
-
     __slots__ = ("_inner", "_dead")
 
     def __init__(self, inner: object) -> None:
@@ -254,9 +284,6 @@ class _FaultTolerantStdout:
         return self._dead
 
 
-# ── Base64url helpers (no padding) ────────────────────────────────────────────
-
-
 def _b64encode(data: bytes) -> str:
     """URL-safe base64 encode with no padding."""
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
@@ -275,19 +302,6 @@ def _b64decode(s: str) -> bytes:
         raise ValueError(f"invalid base64url: {s!r}") from exc
 
 
-# ── IPv6 bracket helper ───────────────────────────────────────────────────────
-
-
-def _strip_brackets(host: str) -> str:
-    """Remove RFC 2732 brackets from an IPv6 address literal."""
-    if host.startswith("[") and host.endswith("]"):
-        return host[1:-1]
-    return host
-
-
-# ── Logging ───────────────────────────────────────────────────────────────────
-
-
 def _log(level: str, msg: str, *args: object) -> None:
     """Write agent diagnostics to stderr without polluting the frame channel."""
     lvl = _LOG_LEVELS.get(level.lower(), 30)
@@ -297,9 +311,6 @@ def _log(level: str, msg: str, *args: object) -> None:
     ts = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     sys.stderr.write(f"{ts} {level.upper():7s} agent: {text}\n")
     sys.stderr.flush()
-
-
-# ── Frame construction helpers ────────────────────────────────────────────────
 
 
 def _make_frame(*parts: str) -> str:
@@ -312,20 +323,47 @@ def _make_error_frame(conn_id: str, reason: str) -> str:
     return _make_frame("ERROR", conn_id, _b64encode(reason.encode()))
 
 
-# ── Frame parsing helpers ─────────────────────────────────────────────────────
-
-
 def _parse_host_port(
     raw: str,
     frame_id: str,
     frame_type: str,
 ) -> tuple[str, int] | None:
     """Parse a ``[host]:port`` or ``host:port`` string into ``(host, port)``."""
-    host_raw, sep, port_str = raw.rpartition(":")
-    if not sep or not host_raw or not port_str:
-        _log("debug", "invalid %s payload for %s: %r", frame_type, frame_id, raw)
+    if raw.startswith("["):
+        bracket_end = raw.find("]")
+        if bracket_end == -1 or raw[bracket_end + 1 : bracket_end + 2] != ":":
+            _log(
+                "debug",
+                "malformed bracketed host in %s payload for %s: %r",
+                frame_type,
+                frame_id,
+                raw,
+            )
+            return None
+        host = raw[1:bracket_end]
+        port_str = raw[bracket_end + 2 :]
+    else:
+        host, sep, port_str = raw.rpartition(":")
+        if not sep or not host:
+            _log(
+                "debug",
+                "invalid %s payload for %s: %r",
+                frame_type,
+                frame_id,
+                raw,
+            )
+            return None
+
+    if not port_str:
+        _log(
+            "debug",
+            "missing port in %s payload for %s: %r",
+            frame_type,
+            frame_id,
+            raw,
+        )
         return None
-    host = _strip_brackets(host_raw)
+
     try:
         port = int(port_str)
     except ValueError:
@@ -349,30 +387,7 @@ def _parse_host_port(
     return host, port
 
 
-# ── Frame writer ──────────────────────────────────────────────────────────────
-
-
 class _FrameWriter:
-    """Single daemon thread that serialises all stdout writes.
-
-    Owns a ``_FaultTolerantStdout`` wrapper around ``sys.stdout`` so that
-    ``OSError`` / ``BrokenPipeError`` from the kubectl exec channel are caught
-    at the Python level before the C-layer ``io.BufferedWriter`` can print
-    ``"socket.send() raised exception."`` to stderr.
-
-    Backpressure interface
-    ----------------------
-    :attr:`data_queue_size` is read by ``TcpConnectionWorker._io_loop`` to
-    decide whether to pause ``sock.recv()``.  When the queue exceeds
-    ``_STDOUT_DATA_QUEUE_BACKPRESSURE_THRESHOLD``, the IO loop skips recv
-    for that iteration, letting the OS TCP receive buffer fill and propagating
-    backpressure to the remote sender.
-
-    This prevents the queue from reaching 100% capacity, which would cause
-    the writer thread to block on ``out.write()`` / ``out.flush()``, which
-    would eventually cause EPIPE and kill the writer thread permanently.
-    """
-
     _STOP: object = object()
 
     def __init__(self) -> None:
@@ -391,13 +406,18 @@ class _FrameWriter:
         self._ctrl.put(line)
 
     def emit_data(self, line: str) -> None:
-        """Enqueue a data frame — blocks the caller when the queue is full.
+        """Enqueue a data frame with periodic liveness checks.
 
-        Backpressure propagates naturally through the kernel TCP receive
-        buffer to the remote sender when ``TcpConnectionWorker._io_loop``
-        pauses ``sock.recv()`` based on :attr:`data_queue_size`.
+        Blocks the calling thread when the stdout queue is full, but
+        periodically checks whether the writer thread's stdout channel is
+        dead.  If dead, the frame is silently dropped.
         """
-        self._data.put(line)
+        while not self._out.is_dead:
+            try:
+                self._data.put(line, timeout=_EMIT_DATA_PUT_TIMEOUT_SECS)
+                return
+            except queue.Full:
+                continue
 
     def stop(self) -> None:
         """Signal the writer thread to flush remaining frames and exit."""
@@ -408,12 +428,6 @@ class _FrameWriter:
 
     @property
     def data_queue_size(self) -> int:
-        """Current number of items in the data queue.
-
-        Read by ``TcpConnectionWorker._io_loop`` to implement backpressure.
-        ``qsize()`` is approximate on some platforms but accurate enough for
-        a soft threshold check — we do not need exact precision here.
-        """
         return self._data.qsize()
 
     @property
@@ -439,19 +453,11 @@ class _FrameWriter:
                 item = None
 
             if item is stop:
-                # Drain ALL remaining non-sentinel data frames before exiting.
-                while True:
-                    if out.is_dead:
-                        return
-                    try:
-                        d = data.get_nowait()
-                    except queue.Empty:
-                        break
-                    if d is stop:
-                        continue
-                    if isinstance(d, str):
-                        out.write(d + "\n")
-                out.flush()
+                # Drain ALL remaining ctrl AND data frames before exiting.
+                # Ctrl frames (CONN_CLOSE / UDP_CLOSE) emitted by workers
+                # during shutdown may have arrived after the last ctrl-drain
+                # but before STOP.
+                self._drain_remaining(out, ctrl, data, stop)
                 return
 
             if item is not None and isinstance(item, str):
@@ -466,6 +472,7 @@ class _FrameWriter:
                         break
                     if nxt is stop:
                         out.flush()
+                        # Re-queue stop so the outer loop picks it up.
                         ctrl.put(stop)
                         break
                     if isinstance(nxt, str):
@@ -492,8 +499,43 @@ class _FrameWriter:
             if item is not None or batch > 0:
                 out.flush()
 
+    @staticmethod
+    def _drain_remaining(
+        out: _FaultTolerantStdout,
+        ctrl: queue.SimpleQueue[str | object],
+        data: queue.Queue[str | object],
+        stop: object,
+    ) -> None:
+        """Drain all remaining ctrl and data frames on shutdown."""
+        # Drain ctrl first — these are CONN_CLOSE / UDP_CLOSE frames
+        # that must be emitted before the process exits.
+        while True:
+            if out.is_dead:
+                return
+            try:
+                c = ctrl.get_nowait()
+            except queue.Empty:
+                break
+            if c is stop:
+                continue
+            if isinstance(c, str):
+                out.write(c + "\n")
 
-# ── Module-level writer — set in main() before any threads start ──────────────
+        # Then drain data.
+        while True:
+            if out.is_dead:
+                return
+            try:
+                d = data.get_nowait()
+            except queue.Empty:
+                break
+            if d is stop:
+                continue
+            if isinstance(d, str):
+                out.write(d + "\n")
+
+        out.flush()
+
 
 _writer: _FrameWriter | None = None
 
@@ -517,24 +559,9 @@ def _emit_data(line: str) -> None:
 
 
 def _stdout_backpressure_active() -> bool:
-    """Return ``True`` when the stdout data queue exceeds the backpressure threshold.
-
-    Called by ``TcpConnectionWorker._io_loop`` before each ``sock.recv()``
-    to decide whether to pause reading from the TCP socket.
-
-    When ``True``, the IO loop skips ``sock.recv()`` for that iteration,
-    allowing the OS TCP receive buffer to fill.  This propagates backpressure
-    to the remote sender (CDN / target service) without blocking any thread.
-
-    Returns ``False`` when no writer is active (e.g. during testing without
-    a ``_FrameWriter`` instance) so that the IO loop always reads in that case.
-    """
     if _writer is None:
         return False
     return _writer.data_queue_size >= _STDOUT_DATA_QUEUE_BACKPRESSURE_THRESHOLD
-
-
-# ── Terminal helpers ──────────────────────────────────────────────────────────
 
 
 def _disable_echo() -> None:
@@ -548,15 +575,7 @@ def _disable_echo() -> None:
         _log("debug", "stdin is not a tty; skipping echo disable")
 
 
-# ── Non-blocking send ─────────────────────────────────────────────────────────
-
-
 def _send_all_nonblocking(sock: socket.socket, data: bytes) -> bool:
-    """Send all of *data* through a non-blocking *sock*.
-
-    Returns:
-        ``True`` on success, ``False`` if the socket closed or errored.
-    """
     offset = 0
     total = len(data)
     while offset < total:
@@ -574,59 +593,20 @@ def _send_all_nonblocking(sock: socket.socket, data: bytes) -> bool:
     return True
 
 
-# ── TCP connection worker ─────────────────────────────────────────────────────
-
-
 class TcpConnectionWorker:
-    """Manages one TCP connection to ``(host, port)`` on behalf of *conn_id*.
-
-    The worker thread runs a ``select()`` loop:
-
-    * **readable socket**  → emit ``DATA`` frame to stdout (base64url, no padding)
-    * **notify pipe**      → drain inbound queue → send to socket
-    * **``_closed`` flag** → ``SHUT_WR`` then wait for remote FIN
-
-    Backpressure
-    ------------
-    Before calling ``sock.recv()``, the IO loop checks
-    ``_stdout_backpressure_active()``.  When the stdout data queue exceeds
-    ``_STDOUT_DATA_QUEUE_BACKPRESSURE_THRESHOLD``, recv is skipped for that
-    iteration.  The OS TCP receive buffer fills, propagating backpressure to
-    the remote sender without blocking any thread.
-
-    This prevents the stdout data queue from reaching 100% capacity, which
-    would cause the writer thread to block on ``out.write()`` / ``out.flush()``,
-    eventually causing EPIPE and permanently killing the writer thread.
-
-    Half-close semantics
-    --------------------
-    When the client signals ``CONN_CLOSE`` (local EOF), :meth:`signal_eof`
-    sets ``_closed``.  The IO loop drains any remaining inbound chunks, calls
-    ``SHUT_WR``, then waits up to :data:`_HALF_CLOSE_DEADLINE_SECS` for the
-    remote to close its write side before tearing down.
-
-    Saturation
-    ----------
-    If the inbound queue reaches :data:`_MAX_TCP_INBOUND_CHUNKS`, the
-    connection is declared saturated: ``_closed`` is set and an ``ERROR``
-    frame is emitted.
-
-    Resource cleanup
-    ----------------
-    Pipe FDs and the socket are always closed in ``_run``'s ``finally`` block.
-    ``CONN_CLOSE`` is always emitted in the ``finally`` block.
-    """
 
     def __init__(
         self,
         conn_id: str,
         host: str,
         port: int,
+        dns_cache: _DnsCache,
         on_close: Callable[[], None] | None = None,
     ) -> None:
         self.conn_id = conn_id
         self._host = host
         self._port = port
+        self._dns_cache = dns_cache
         self._on_close = on_close
 
         self._sock: socket.socket | None = None
@@ -646,18 +626,16 @@ class TcpConnectionWorker:
         )
 
     def start(self) -> None:
-        """Start the worker thread."""
         self._thread.start()
 
+    def join(self, timeout: float | None = None) -> None:
+        self._thread.join(timeout=timeout)
+
+    @property
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
+
     def feed(self, data: bytes) -> None:
-        """Enqueue *data* to be sent to the remote TCP peer.
-
-        If the inbound queue is full, the connection is declared saturated:
-        ``_closed`` is set, an ``ERROR`` frame is emitted, and all subsequent
-        calls are no-ops.
-
-        Thread-safe — called from the dispatcher thread.
-        """
         saturated = False
         with self._inbound_lock:
             if self._saturated:
@@ -682,10 +660,6 @@ class TcpConnectionWorker:
             os.write(self._notify_w, b"\x00")
 
     def signal_eof(self) -> None:
-        """Signal that the client has sent EOF — no more data will arrive.
-
-        Thread-safe — called from the dispatcher thread.
-        """
         self._closed = True
         with contextlib.suppress(OSError):
             os.write(self._notify_w, b"\x00")
@@ -693,8 +667,10 @@ class TcpConnectionWorker:
     def _run(self) -> None:
         cid = self.conn_id
         try:
-            sock = socket.create_connection(
-                (self._host, self._port),
+            sock = _create_connection_cached(
+                self._dns_cache,
+                self._host,
+                self._port,
                 timeout=_TCP_CONNECT_TIMEOUT_SECS,
             )
             sock.setblocking(False)
@@ -708,14 +684,11 @@ class TcpConnectionWorker:
             return
 
         self._sock = sock
-        # CONN_ACK emitted immediately after successful connect.
         _emit_ctrl(_make_frame("CONN_ACK", cid))
 
         try:
             self._io_loop(sock, cid)
         finally:
-            # Always close resources regardless of how _io_loop exits.
-            # CONN_CLOSE is always emitted — never omitted on any teardown path.
             sock.close()
             os.close(self._notify_r)
             os.close(self._notify_w)
@@ -724,59 +697,43 @@ class TcpConnectionWorker:
                 self._on_close()
 
     def _io_loop(self, sock: socket.socket, cid: str) -> None:
-        """Main select loop — runs until the connection is fully closed.
-
-        Backpressure
-        ------------
-        Before calling ``sock.recv()``, the loop checks
-        ``_stdout_backpressure_active()``.  When the stdout data queue is
-        near capacity, recv is skipped for that iteration.  The OS TCP receive
-        buffer fills, propagating backpressure to the remote sender.
-
-        This is the critical fix for the SSL handshake failure: without
-        backpressure, the agent floods the stdout channel with DATA frames
-        faster than the exec WebSocket can drain them, causing EPIPE, killing
-        the writer thread, and truncating the TLS record stream mid-handshake.
-        """
         local_shut = False
         local_shut_deadline: float | None = None
 
         while True:
+            # When stdout backpressure is active, exclude the remote socket
+            # from the readable set.  This prevents the busy-loop that would
+            # occur if select() returned immediately because the socket has
+            # unread data that we'd skip reading anyway.  The self-pipe is
+            # always monitored so inbound data from the client can still be
+            # forwarded to the remote.
+            backpressure = _stdout_backpressure_active()
+            read_fds: list[int | socket.socket] = [self._notify_r]
+            if not backpressure:
+                read_fds.append(sock)
+
             readable, _, errored = select.select(
-                [sock, self._notify_r], [], [sock], _SELECT_TIMEOUT_SECS
+                read_fds, [], [sock], _SELECT_TIMEOUT_SECS
             )
 
             if errored:
                 break
 
-            # ── Receive from remote ───────────────────────────────────────────
             remote_closed = False
             if sock in readable:
-                # Backpressure check: skip recv when stdout data queue is near
-                # capacity.  This lets the OS TCP receive buffer fill, which
-                # propagates backpressure to the remote sender (CDN / target).
-                # The select() timeout (10ms) means we re-check every 10ms,
-                # so backpressure is released promptly when the queue drains.
-                if _stdout_backpressure_active():
-                    # Do not recv — let TCP buffer fill.
-                    # Still process notify pipe and inbound sends below.
-                    pass
+                try:
+                    chunk = sock.recv(_TCP_RECV_CHUNK_BYTES)
+                except OSError:
+                    break
+                if not chunk:
+                    remote_closed = True
                 else:
-                    try:
-                        chunk = sock.recv(_TCP_RECV_CHUNK_BYTES)
-                    except OSError:
-                        break
-                    if not chunk:
-                        remote_closed = True
-                    else:
-                        _emit_data(_make_frame("DATA", cid, _b64encode(chunk)))
+                    _emit_data(_make_frame("DATA", cid, _b64encode(chunk)))
 
-            # ── Drain notify pipe ─────────────────────────────────────────────
             if self._notify_r in readable:
                 with contextlib.suppress(OSError):
                     os.read(self._notify_r, 4_096)
 
-            # ── Send pending inbound data ─────────────────────────────────────
             if not local_shut:
                 with self._inbound_lock:
                     pending, self._inbound = self._inbound, []
@@ -786,16 +743,15 @@ class TcpConnectionWorker:
             else:
                 pending = []
 
-            # ── Remote closed its write side ──────────────────────────────────
             if remote_closed:
                 if not local_shut:
                     with self._inbound_lock:
                         remaining, self._inbound = self._inbound, []
                     for chunk in remaining:
-                        _send_all_nonblocking(sock, chunk)
+                        if not _send_all_nonblocking(sock, chunk):
+                            break
                 break
 
-            # ── Half-close: local side done sending ───────────────────────────
             if self._closed and not local_shut:
                 with self._inbound_lock:
                     still_pending = bool(self._inbound)
@@ -805,7 +761,6 @@ class TcpConnectionWorker:
                     with contextlib.suppress(OSError):
                         sock.shutdown(socket.SHUT_WR)
 
-            # ── Half-close deadline ───────────────────────────────────────────
             if (
                 local_shut
                 and local_shut_deadline is not None
@@ -814,26 +769,19 @@ class TcpConnectionWorker:
                 break
 
 
-# ── UDP flow worker ───────────────────────────────────────────────────────────
-
-
 class UdpFlowWorker:
-    """UDP flow: datagrams sent to ``(host, port)``; responses forwarded back.
-
-    UDP is best-effort — no backpressure is applied to the recv loop.
-    Inbound saturation drops datagrams silently (UDP semantics).
-    """
-
     def __init__(
         self,
         flow_id: str,
         host: str,
         port: int,
+        dns_cache: _DnsCache,
         on_close: Callable[[], None] | None = None,
     ) -> None:
         self._id = flow_id
         self._host = host
         self._port = port
+        self._dns_cache = dns_cache
         self._on_close = on_close
 
         self._sock: socket.socket | None = None
@@ -846,20 +794,26 @@ class UdpFlowWorker:
 
         self._closed = False
         self._drop_count: int = 0
+        self._send_block_count: int = 0
 
         self._thread = threading.Thread(
             target=self._run, daemon=True, name=f"udp-flow-{flow_id}"
         )
 
     def start(self) -> None:
-        """Start the worker thread."""
         self._thread.start()
+
+    def join(self, timeout: float | None = None) -> None:
+        self._thread.join(timeout=timeout)
+
+    @property
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
 
     def feed(self, data: bytes) -> None:
         """Enqueue *data* to be sent to the remote UDP peer.
 
         Silently drops when the inbound queue is full — UDP semantics.
-        Thread-safe — called from the dispatcher thread.
         """
         with self._inbound_lock:
             if len(self._inbound) >= _MAX_UDP_INBOUND_DGRAMS:
@@ -881,10 +835,7 @@ class UdpFlowWorker:
             os.write(self._notify_w, b"\x00")
 
     def close(self) -> None:
-        """Signal the IO loop to exit after draining pending sends.
-
-        Thread-safe — called from the dispatcher thread.
-        """
+        """Signal the IO loop to exit after draining pending sends."""
         self._closed = True
         with contextlib.suppress(OSError):
             os.write(self._notify_w, b"\x00")
@@ -893,7 +844,9 @@ class UdpFlowWorker:
         fid = self._id
 
         try:
-            infos = socket.getaddrinfo(self._host, self._port, type=socket.SOCK_DGRAM)
+            infos = self._dns_cache.getaddrinfo(
+                self._host, self._port, socktype=socket.SOCK_DGRAM
+            )
             if not infos:
                 raise OSError(f"could not resolve {self._host!r}")
         except OSError as exc:
@@ -940,10 +893,6 @@ class UdpFlowWorker:
                 self._on_close()
 
     def _io_loop(self, sock: socket.socket, fid: str) -> None:
-        """Main select loop — runs until ``_closed`` is set and pending sends drain."""
-        # Note: datagrams enqueued via feed() after _closed is set but before
-        # the loop checks the flag are silently dropped.  This is intentional
-        # — UDP is best-effort and draining on close is not required.
         while not self._closed:
             readable, _, errored = select.select(
                 [sock, self._notify_r], [], [sock], _SELECT_TIMEOUT_SECS
@@ -973,22 +922,24 @@ class UdpFlowWorker:
                 try:
                     sock.send(dgram)
                 except BlockingIOError:
-                    pass
+                    # UDP send buffer full — drop the datagram (UDP semantics).
+                    self._send_block_count += 1
+                    if (
+                        self._send_block_count == 1
+                        or self._send_block_count % _UDP_DROP_WARN_EVERY == 0
+                    ):
+                        _log(
+                            "debug",
+                            "udp flow %s send blocked; datagram dropped "
+                            "(send_blocks=%d)",
+                            fid,
+                            self._send_block_count,
+                        )
                 except OSError:
                     return
 
 
-# ── Dispatcher ────────────────────────────────────────────────────────────────
-
-
 class _Dispatcher:
-    """Owns the TCP and UDP worker registries and dispatches incoming frames.
-
-    Registry discipline
-    -------------------
-    ``on_close`` callbacks are the **only** place where entries are removed
-    from the registries.  Frame handlers never pop from the maps directly.
-    """
 
     def __init__(
         self,
@@ -1002,12 +953,23 @@ class _Dispatcher:
         self._udp_map: dict[str, UdpFlowWorker] = {}
         self._conn_lock = threading.Lock()
         self._udp_lock = threading.Lock()
+        self._dns_cache = _DnsCache()
 
     def dispatch(self, line: str) -> None:
         """Parse and dispatch one raw frame line."""
+        line = line.strip()
+
         if len(line) > _MAX_INBOUND_FRAME_LEN:
             _log("debug", "oversized frame dropped (%d chars)", len(line))
             return
+
+        # ── Proxy suffix tolerance ────────────────────────────────────────
+        if line.startswith(_FRAME_PREFIX):
+            suffix_pos = line.rfind(_FRAME_SUFFIX)
+            if suffix_pos != -1:
+                line = line[: suffix_pos + len(_FRAME_SUFFIX)]
+        # ──────────────────────────────────────────────────────────────────
+
         if not (line.startswith(_FRAME_PREFIX) and line.endswith(_FRAME_SUFFIX)):
             return
 
@@ -1033,6 +995,46 @@ class _Dispatcher:
                 pass
             case _:
                 _log("debug", "unknown frame type ignored: %s", parts[0])
+
+    def shutdown(self) -> None:
+        """Signal all workers to close and wait briefly for clean teardown.
+
+        Called by ``main()`` before stopping the writer so that workers have
+        a chance to emit final ``CONN_CLOSE`` / ``UDP_CLOSE`` frames while
+        the writer is still alive.
+        """
+        with self._conn_lock:
+            tcp_workers = list(self._conn_map.values())
+        for worker in tcp_workers:
+            worker.signal_eof()
+
+        with self._udp_lock:
+            udp_workers = list(self._udp_map.values())
+        for flow in udp_workers:
+            flow.close()
+
+        deadline = time.monotonic() + _WORKER_SHUTDOWN_GRACE_SECS
+        for worker in tcp_workers:
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0:
+                break
+            worker.join(timeout=remaining)
+        for flow in udp_workers:
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0:
+                break
+            flow.join(timeout=remaining)
+
+        still_alive = sum(1 for w in tcp_workers if w.is_alive) + sum(
+            1 for f in udp_workers if f.is_alive
+        )
+        if still_alive:
+            _log(
+                "debug",
+                "shutdown: %d worker(s) still alive after grace period — "
+                "will be killed on process exit",
+                still_alive,
+            )
 
     def _on_conn_open(self, parts: list[str]) -> None:
         if len(parts) < 2:
@@ -1070,12 +1072,10 @@ class _Dispatcher:
             with self._conn_lock:
                 self._conn_map.pop(conn_id, None)
 
-        worker = TcpConnectionWorker(cid, host, port, on_close=on_close)
+        worker = TcpConnectionWorker(
+            cid, host, port, dns_cache=self._dns_cache, on_close=on_close
+        )
         with self._conn_lock:
-            # Re-check inside the lock to close the window between the earlier
-            # duplicate check and this insert.  The dispatcher is single-
-            # threaded so this cannot race in practice, but the pattern is
-            # correct if concurrency is ever introduced.
             if cid in self._conn_map:
                 _log(
                     "debug",
@@ -1120,12 +1120,6 @@ class _Dispatcher:
             _log("debug", "UDP_OPEN invalid flow_id format: %r", fid)
             return
 
-        with self._udp_lock:
-            if fid in self._udp_map:
-                _log("debug", "duplicate UDP_OPEN for %s — sending UDP_CLOSE", fid)
-                _emit_ctrl(_make_frame("UDP_CLOSE", fid))
-                return
-
         result = _parse_host_port(parts[2], fid, "UDP_OPEN")
         if result is None:
             _emit_ctrl(_make_frame("UDP_CLOSE", fid))
@@ -1136,8 +1130,14 @@ class _Dispatcher:
             with self._udp_lock:
                 self._udp_map.pop(flow_id, None)
 
-        flow = UdpFlowWorker(fid, host, port, on_close=on_close)
+        flow = UdpFlowWorker(
+            fid, host, port, dns_cache=self._dns_cache, on_close=on_close
+        )
         with self._udp_lock:
+            if fid in self._udp_map:
+                _log("debug", "duplicate UDP_OPEN for %s — sending UDP_CLOSE", fid)
+                _emit_ctrl(_make_frame("UDP_CLOSE", fid))
+                return
             self._udp_map[fid] = flow
         flow.start()
 
@@ -1173,9 +1173,6 @@ class _Dispatcher:
         _log("info", "stdin EOF — dispatcher exiting")
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
-
-
 def main() -> None:
     """Parse arguments, initialise the writer, and run the dispatcher."""
     _install_sigpipe_handler()
@@ -1201,14 +1198,16 @@ def main() -> None:
         with contextlib.suppress(OSError):
             os.unlink(path)
 
-    global _writer
+    global _writer  # noqa: PLW0603
     _disable_echo()
     _writer = _FrameWriter()
     _emit_ctrl(_make_frame("AGENT_READY"))
 
+    dispatcher = _Dispatcher(fixed_host, fixed_port)
     try:
-        _Dispatcher(fixed_host, fixed_port).run()
+        dispatcher.run()
     finally:
+        dispatcher.shutdown()
         if _writer is not None:
             _writer.stop()
 
