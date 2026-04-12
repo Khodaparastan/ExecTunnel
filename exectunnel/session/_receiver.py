@@ -213,8 +213,15 @@ class FrameReceiver:
         metrics_inc("session.frames.inbound", msg_type=msg_type)
 
         try:
+            if conn_id is None:
+                logger.debug("recv: frame with no conn_id: %r", frame)
+                metrics_inc("session.frames.no_conn_id")
+                return
+
             async with aspan(
-                "session.handle_frame", msg_type=msg_type, conn_id=conn_id,
+                "session.handle_frame",
+                msg_type=msg_type,
+                conn_id=conn_id,
             ):
                 match msg_type:
                     case "CONN_ACK":
@@ -237,8 +244,7 @@ class FrameReceiver:
 
                     case "AGENT_READY":
                         raise UnexpectedFrameError(
-                            "AGENT_READY received after session was "
-                            "established.",
+                            "AGENT_READY received after session was established.",
                             details={
                                 "state": "running",
                                 "frame_type": "AGENT_READY",
@@ -247,8 +253,7 @@ class FrameReceiver:
 
                     case "CONN_OPEN" | "UDP_OPEN" | "KEEPALIVE":
                         raise UnexpectedFrameError(
-                            f"{msg_type} received from agent — unexpected "
-                            "direction.",
+                            f"{msg_type} received from agent — unexpected direction.",
                             details={
                                 "state": "running",
                                 "frame_type": msg_type,
@@ -291,12 +296,12 @@ class FrameReceiver:
             pending.ack_future.set_result(AckStatus.OK)
         else:
             logger.debug(
-                "recv: CONN_ACK for unknown or already-resolved conn_id "
-                "%r — ignoring",
+                "recv: CONN_ACK for unknown or already-resolved conn_id %r — ignoring",
                 conn_id,
             )
             metrics_inc(
-                "session.frames.orphaned", frame_type="CONN_ACK",
+                "session.frames.orphaned",
+                frame_type="CONN_ACK",
             )
 
     def _on_data(self, conn_id: str, payload: str) -> None:
@@ -375,7 +380,8 @@ class FrameReceiver:
         handler = self._tcp_registry.get(conn_id)
         if handler is None:
             metrics_inc(
-                "session.frames.orphaned", frame_type="CONN_CLOSE",
+                "session.frames.orphaned",
+                frame_type="CONN_CLOSE",
             )
             return
         pending = self._pending_connects.get(conn_id)
@@ -393,7 +399,8 @@ class FrameReceiver:
         flow = self._udp_registry.get(flow_id)
         if flow is None:
             metrics_inc(
-                "session.frames.orphaned", frame_type="UDP_DATA",
+                "session.frames.orphaned",
+                frame_type="UDP_DATA",
             )
             return
         data = decode_binary_payload(payload)
@@ -407,7 +414,8 @@ class FrameReceiver:
             flow.on_remote_closed()
         else:
             metrics_inc(
-                "session.frames.orphaned", frame_type="UDP_CLOSE",
+                "session.frames.orphaned",
+                frame_type="UDP_CLOSE",
             )
 
     async def _on_error(self, conn_id: str, payload: str) -> None:
