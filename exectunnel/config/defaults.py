@@ -42,7 +42,7 @@ class Defaults:
     # Reconnect policy — exponential backoff with jitter.
     # 5 retries × max_delay 30 s ≈ up to ~2.5 min of retry window.
     # Enough to survive a rolling API server restart without giving up.
-    WS_RECONNECT_MAX_RETRIES: int = 5
+    WS_RECONNECT_MAX_RETRIES: int = 10
     WS_RECONNECT_BASE_DELAY_SECS: float = 1.0
     WS_RECONNECT_MAX_DELAY_SECS: float = 30.0
 
@@ -93,6 +93,13 @@ class Defaults:
     # preventing perfectly synchronised bursts from multiple coroutines.
     CONNECT_PACE_JITTER_CAP_SECS: float = 0.02
 
+    # Minimum seconds between successive CONN_OPEN frames to the same host.
+    # Prevents thundering-herd bursts to a single destination on reconnect.
+    # 0 disables pacing entirely (default — pacing caused SSL handshake aborts
+    # for tools like aria2 that open many parallel connections to the same host,
+    # because connections 2-N were delayed 3 s each before CONN_OPEN was sent).
+    CONNECT_PACE_INTERVAL_SECS: float = 0.0
+
     # Timeout waiting for the agent to ACK a CONN_OPEN.
     # The agent should ACK within one tunnel RTT (50–500 ms on healthy clusters).
     # 10 s is generous enough to survive a congested cluster (3× worst-case RTT
@@ -109,7 +116,7 @@ class Defaults:
     #   → trigger fires when 5 × 10 s = 50 s of ACK wait accumulates in 60 s
     #   → correctly identifies a degraded tunnel without false-positives on
     #     transient single-connection failures.
-    CONN_ACK_TIMEOUT_SECS: float = 10.0
+    CONN_ACK_TIMEOUT_SECS: float = 30.0
 
     # Pre-ACK buffer: bytes buffered before the agent ACKs CONN_OPEN.
     # 64 KiB = 16 × PIPE_READ_CHUNK_BYTES — holds a full TLS ClientHello +
@@ -174,17 +181,22 @@ class Defaults:
     # and avoids splitting multi-byte sequences in the base64 alphabet.
     BOOTSTRAP_CHUNK_SIZE_CHARS: int = 200
 
-    # Default GitHub raw URL used to fetch the agent when bootstrap_delivery="github".
+    # Default fetch raw URL used to fetch the agent when bootstrap_delivery="fetch".
     # Points to the main branch of the canonical repository.  Override via
-    # EXECTUNNEL_GITHUB_AGENT_URL to pin a specific commit or use a fork.
-    BOOTSTRAP_GITHUB_AGENT_URL: str = "https://raw.githubusercontent.com/Khodaparastan/ExecTunnel/refs/heads/main/exectunnel/payload/agent.py"
+    # EXECTUNNEL_FETCH_AGENT_URL to pin a specific commit or use a fork.
+    BOOTSTRAP_FETCH_AGENT_URL: str = "https://raw.githubusercontent.com/Khodaparastan/ExecTunnel/refs/heads/main/exectunnel/payload/agent.py"
 
-    # Fixed sleep after the curl/wget fetch command to allow the download to
-    # complete before the syntax check reads the output file.  10 s is generous
-    # for a ~50 KiB file over a typical cluster egress path (1–5 Mbit/s).
-    # Increase via EXECTUNNEL_BOOTSTRAP_GITHUB_FETCH_DELAY if the pod's egress
-    # is unusually slow.
-    BOOTSTRAP_GITHUB_FETCH_DELAY_SECS: float = 10.0
+    # Maximum time to wait for the curl/wget fetch to complete before proceeding.
+    # The bootstrapper polls for file existence every BOOTSTRAP_FETCH_FETCH_POLL_SECS
+    # and gives up after this many seconds (logging a warning and continuing).
+    # 10 s is generous for a ~50 KiB file over a typical cluster egress path
+    # (1–5 Mbit/s).  Increase via EXECTUNNEL_BOOTSTRAP_FETCH_FETCH_DELAY if
+    # the pod's egress is unusually slow.
+    BOOTSTRAP_FETCH_FETCH_DELAY_SECS: float = 10.0
+
+    # Polling interval when waiting for the fetch-fetched agent file to appear.
+    # 0.5 s gives sub-second detection on fast clusters without busy-looping.
+    BOOTSTRAP_FETCH_FETCH_POLL_SECS: float = 0.5
 
     # Path of the sentinel file written inside the pod after a successful syntax
     # check.  When bootstrap_skip_if_present=True and bootstrap_syntax_check=True,
@@ -218,6 +230,7 @@ class Defaults:
     # 64 provides headroom above the 50-item steady-state for QUIC bursts.
     UDP_RELAY_QUEUE_CAP: int = 64
 
+
     # Emit a logger.warning every N drops after the first (which always warns).
     # At ~1,000 datagrams/s burst rate, this yields ~1 warning/s under pressure.
     UDP_WARN_EVERY: int = 1_000
@@ -247,12 +260,12 @@ class Defaults:
     # Congested cluster: 3 × 500 ms + 50 ms  = 1,550 ms
     # 5 s matches the RFC 1035 DNS client retry interval (glibc/musl/Go default)
     # so a timeout causes a clean client retry rather than a duplicate in-flight.
-    DNS_QUERY_TIMEOUT_SECS: float = 5.0
+    DNS_QUERY_TIMEOUT_SECS: float = 8.0
 
     # Maximum concurrent in-flight DNS queries.
     # At 100 q/s × 5 s timeout = 500 inflight at steady state.
     # 512 covers this with a small safety margin; memory ≈ 512 × 4 KiB ≈ 2 MiB.
-    DNS_MAX_INFLIGHT: int = 512
+    DNS_MAX_INFLIGHT: int = 1_024
 
     # ── Send / Metrics ────────────────────────────────────────────────────────────
 
@@ -273,3 +286,10 @@ class Defaults:
 
     # Default SOCKS5 listen port.  1080 is the IANA-registered SOCKS port.
     SOCKS_DEFAULT_PORT: int = 1080
+    # asyncio.Queue capacity for completed SOCKS5 handshakes awaiting dispatch.
+    # 256 absorbs short bursts of parallel browser connections (Chrome opens
+    # up to 6 connections per host × ~40 tabs = ~240 simultaneous handshakes).
+    SOCKS_REQUEST_QUEUE_CAP: int = 256
+    # Max seconds to enqueue a completed handshake before dropping it.
+    # 5 s matches the default TCP connect timeout on most OS stacks.
+    SOCKS_QUEUE_PUT_TIMEOUT_SECS: float = 5.0
