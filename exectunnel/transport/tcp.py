@@ -65,10 +65,10 @@ from exectunnel.exceptions import (
     WebSocketSendTimeoutError,
 )
 from exectunnel.observability import (
+    aspan,
     metrics_gauge_dec,
     metrics_inc,
     metrics_observe,
-    span,
 )
 from exectunnel.protocol import encode_conn_close_frame, encode_data_frame
 
@@ -701,7 +701,7 @@ class TcpConnection:
         task was not cancelled — a cancelled upstream means cleanup will send
         ``CONN_CLOSE`` as a safety net via :meth:`_cleanup`.
         """
-        with span("tcp.connection.upstream"):
+        async with aspan("tcp.connection.upstream"):
             start = asyncio.get_running_loop().time()
             metrics_inc("tcp.connection.upstream.started")
             _cancelled = False
@@ -717,6 +717,11 @@ class TcpConnection:
 
                     # Account bytes only after successful send.
                     self._bytes_upstream += len(chunk)
+                    metrics_inc(
+                        "tcp.connection.upstream.bytes",
+                        conn_id=self._id,
+                        bytes=len(chunk),
+                    )
 
                 self._upstream_ended_cleanly = True
 
@@ -780,7 +785,7 @@ class TcpConnection:
         not be cancelled mid-loop.  The ``finally`` block handles ``close_task``
         cleanup unconditionally on exit.
         """
-        with span("tcp.connection.downstream"):
+        async with aspan("tcp.connection.downstream"):
             start = asyncio.get_running_loop().time()
             metrics_inc("tcp.connection.downstream.started")
 
@@ -806,7 +811,13 @@ class TcpConnection:
                             self._writer.write(chunk)
                         try:
                             await self._writer.drain()
-                            self._bytes_downstream += sum(len(c) for c in batch)
+                            batch_bytes = sum(len(c) for c in batch)
+                            self._bytes_downstream += batch_bytes
+                            metrics_inc(
+                                "tcp.connection.downstream.bytes",
+                                conn_id=self._id,
+                                bytes=batch_bytes,
+                            )
                         except OSError as exc:
                             metrics_inc(
                                 "tcp.connection.downstream.error", error="os_drain"
@@ -868,6 +879,11 @@ class TcpConnection:
                         try:
                             await self._writer.drain()
                             self._bytes_downstream += len(chunk)
+                            metrics_inc(
+                                "tcp.connection.downstream.bytes",
+                                conn_id=self._id,
+                                bytes=len(chunk),
+                            )
                         except OSError as exc:
                             metrics_inc(
                                 "tcp.connection.downstream.error", error="os_drain"
