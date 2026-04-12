@@ -57,7 +57,7 @@ import contextlib
 import logging
 from typing import Final
 
-from exectunnel.config.defaults import Defaults
+from exectunnel.defaults import Defaults
 from exectunnel.exceptions import (
     ConnectionClosedError,
     ExecTunnelError,
@@ -568,7 +568,7 @@ class TcpConnection:
                 f"conn {self._id!r}: feed_async() called on a closed connection.",
                 error_code="transport.feed_async_on_closed",
                 details={"conn_id": self._id},
-                hint="Check is_closed before calling feed_async().",
+                hint="Check _closed before calling feed_async().",
             )
 
         # Queue.put() only raises CancelledError — no broad except needed.
@@ -1154,7 +1154,7 @@ class TcpConnection:
     def closed_event(self) -> asyncio.Event:
         """Read-only view of the closed event for external waiters.
 
-        Prefer :attr:`is_closed` for simple boolean checks.  Use this only
+        Prefer :attr:`_closed` for simple boolean checks.  Use this only
         when you need to ``await`` the event directly.
 
         Warning:

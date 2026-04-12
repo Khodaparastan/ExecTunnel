@@ -57,14 +57,14 @@ surface.  No other layer should import from ``exectunnel.transport`` directly.
 
 from __future__ import annotations
 
-from exectunnel.transport._types import (
+from ._types import (
     TcpRegistry,
     TransportHandler,
     UdpRegistry,
     WsSendCallable,
 )
-from exectunnel.transport.tcp import TcpConnection
-from exectunnel.transport.udp import UdpFlow
+from .tcp import TcpConnection
+from .udp import UdpFlow
 
 __all__ = [
     # Protocols — import these to annotate injection points and registries.

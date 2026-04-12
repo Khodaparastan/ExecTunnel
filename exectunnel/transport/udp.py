@@ -46,7 +46,7 @@ import asyncio
 import contextlib
 import logging
 
-from exectunnel.config.defaults import Defaults
+from exectunnel.defaults import Defaults
 from exectunnel.exceptions import (
     ConnectionClosedError,
     TransportError,
@@ -58,8 +58,9 @@ from exectunnel.protocol import (
     encode_udp_data_frame,
     encode_udp_open_frame,
 )
-from exectunnel.transport._types import UdpRegistry, WsSendCallable
-from exectunnel.transport._validation import require_bytes
+
+from ._types import UdpRegistry, WsSendCallable
+from ._validation import require_bytes
 
 __all__ = ["UdpFlow"]
 

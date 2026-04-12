@@ -41,8 +41,8 @@ from collections.abc import Coroutine
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from exectunnel.transport.tcp import TcpConnection
-    from exectunnel.transport.udp import UdpFlow
+    from .tcp import TcpConnection
+    from .udp import UdpFlow
 
 __all__ = [
     "TcpRegistry",
