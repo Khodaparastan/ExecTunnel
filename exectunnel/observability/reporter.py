@@ -58,12 +58,12 @@ async def run_metrics_reporter(
         )
 
     logger = logging.getLogger(logger_name)
-    verbose = parse_bool_env("EXECTUNNEL_METRICS_VERBOSE", False)
+    verbose = parse_bool_env("EXECTUNNEL_METRICS_VERBOSE")
     top_n = parse_int_env("EXECTUNNEL_METRICS_TOP_N", 12, min_value=1)
 
     log_fn = (
         logger.info
-        if parse_bool_env("EXECTUNNEL_METRICS_LOG_LEVEL_INFO", False)
+        if parse_bool_env("EXECTUNNEL_METRICS_LOG_LEVEL_INFO")
         else logger.debug
     )
 

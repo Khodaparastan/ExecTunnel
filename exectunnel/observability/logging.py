@@ -94,7 +94,7 @@ class _JsonLogFormatter(logging.Formatter):
                 payload[key] = val
         if record.exc_info:
             payload["exc_info"] = self.formatException(record.exc_info)
-        return json.dumps(payload, ensure_ascii=True)
+        return json.dumps(payload)
 
 
 class _ConsoleFormatter(logging.Formatter):
@@ -183,7 +183,7 @@ def _configure_structlog(
         _add_observability_context,
     ]
     if log_format == "json":
-        renderer = _structlog.processors.JSONRenderer(serializer=json.dumps)
+        renderer = _structlog.processors.JSONRenderer()
     else:
         renderer = _structlog.dev.ConsoleRenderer(colors=enable_color)
 

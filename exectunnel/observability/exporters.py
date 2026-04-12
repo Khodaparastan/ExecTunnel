@@ -205,7 +205,7 @@ def build_exporters(
                 f"({current_size} >= {file_max_bytes} bytes); skipping write",
             )
         with open(file_path, "a", encoding="utf-8") as fp:
-            fp.write(json.dumps(payload, ensure_ascii=True, sort_keys=True) + "\n")
+            fp.write(json.dumps(payload, sort_keys=True) + "\n")
 
     async def _emit_file(payload: dict[str, object]) -> None:
         await asyncio.to_thread(_write_file, payload)
@@ -215,7 +215,7 @@ def build_exporters(
     # ------------------------------------------------------------------
 
     def _post_http(payload: dict[str, object]) -> None:
-        body = json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")
+        body = json.dumps(payload, sort_keys=True).encode()
         headers = {"Content-Type": "application/json", **extra_headers}
         last_exc: Exception | None = None
         attempts = max(1, http_max_retries + 1)
