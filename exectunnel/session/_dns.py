@@ -16,7 +16,14 @@ from exectunnel.exceptions import (
     TransportError,
     WebSocketSendTimeoutError,
 )
-from exectunnel.observability import metrics_inc, metrics_observe
+from exectunnel.observability import (
+    aspan,
+    metrics_gauge_dec,
+    metrics_gauge_inc,
+    metrics_gauge_set,
+    metrics_inc,
+    metrics_observe,
+)
 from exectunnel.protocol import new_flow_id
 from exectunnel.transport import UdpFlow, WsSendCallable
 
@@ -41,7 +48,9 @@ class _DnsDatagramProtocol(asyncio.DatagramProtocol):
                 "forwarder will not function correctly.",
                 type(transport).__name__,
             )
-            metrics_inc("dns.forwarder.bad_transport_type")
+            metrics_inc(
+                "dns.forwarder.error", error="bad_transport_type",
+            )
             transport.close()
             return
         self._forwarder.on_transport_ready(transport)
@@ -50,7 +59,11 @@ class _DnsDatagramProtocol(asyncio.DatagramProtocol):
         self._forwarder.on_query(data, addr)
 
     def error_received(self, exc: Exception) -> None:
-        metrics_inc("dns.forwarder.socket_error", reason=type(exc).__name__)
+        metrics_inc(
+            "dns.forwarder.error",
+            error="socket_error",
+            reason=type(exc).__name__,
+        )
         logger.debug(
             "dns forwarder socket error [%s]: %s",
             type(exc).__name__,
@@ -166,7 +179,7 @@ class DnsForwarder:
         transport and the transport actually shutting down.
         """
         if self._stopped:
-            metrics_inc("dns.query.drop.after_stop")
+            metrics_inc("dns.query.drop", reason="after_stop")
             return
 
         metrics_inc("dns.query.received")
@@ -174,7 +187,7 @@ class DnsForwarder:
         if len(self._tasks) >= self._max_inflight:
             self._saturation_drop_count += 1
             self._total_drop_count += 1
-            metrics_inc("dns.query.drop.saturated")
+            metrics_inc("dns.query.drop", reason="saturated")
             if (
                 self._saturation_drop_count == 1
                 or self._saturation_drop_count % Defaults.UDP_WARN_EVERY == 0
@@ -195,7 +208,7 @@ class DnsForwarder:
             name=f"dns-fwd-{addr[0]}_{addr[1]}-{flow_id[:8]}",
         )
         self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        task.add_done_callback(self._task_done)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -218,8 +231,6 @@ class DnsForwarder:
                 local_addr=("127.0.0.1", self._local_port),
             )
         except OSError as exc:
-            # Narrow to OSError — the only failure mode for create_datagram_endpoint
-            # on a valid address is an OS-level bind failure.
             raise TransportError(
                 f"DNS forwarder failed to bind on 127.0.0.1:{self._local_port}.",
                 error_code="transport.dns_bind_failed",
@@ -252,6 +263,7 @@ class DnsForwarder:
         # assignment that start() guarantees.
         self._transport = transport
         metrics_inc("dns.forwarder.started")
+        metrics_gauge_set("dns.forwarder.inflight", 0.0)
         logger.info(
             "DNS forwarder listening on 127.0.0.1:%d → %s:%d",
             self._local_port,
@@ -273,12 +285,23 @@ class DnsForwarder:
             self._transport.close()
 
         if self._tasks:
-            # Snapshot once — done-callbacks may mutate self._tasks between
-            # the cancel loop and the gather call.
             snapshot = list(self._tasks)
             for task in snapshot:
                 task.cancel()
             await asyncio.gather(*snapshot, return_exceptions=True)
+
+        metrics_gauge_set("dns.forwarder.inflight", 0.0)
+
+    # ── Task bookkeeping ──────────────────────────────────────────────────────
+
+    def _task_done(self, task: asyncio.Task[None]) -> None:
+        """Done-callback for forwarding tasks — update set and gauge."""
+        self._tasks.discard(task)
+        self._emit_inflight_gauge()
+
+    def _emit_inflight_gauge(self) -> None:
+        """Publish the current number of in-flight DNS queries as a gauge."""
+        metrics_gauge_set("dns.forwarder.inflight", float(len(self._tasks)))
 
     # ── Core forwarding logic ─────────────────────────────────────────────────
 
@@ -288,13 +311,11 @@ class DnsForwarder:
         client_addr: tuple[str, int],
         flow_id: str,
     ) -> None:
-        """Open a UDP flow, forward *query*, wait for the response, reply to client.
+        """Open a UDP flow, forward *query*, wait for the response, reply.
 
-        DNS is a single-request/single-response protocol.  One ``recv_datagram()``
-        call is made intentionally — the flow is closed immediately after the
-        first response.  This is a documented deviation from the transport
-        invariant that requires looping until ``None``; the loop is omitted
-        because the flow is closed synchronously after the single recv.
+        DNS is a single-request/single-response protocol.  One
+        ``recv_datagram()`` call is made intentionally — the flow is closed
+        immediately after the first response.
 
         All structured exceptions are caught here and converted into metrics +
         log entries so that a single bad query never tears down the forwarder.
@@ -302,6 +323,10 @@ class DnsForwarder:
         start = asyncio.get_running_loop().time()
         agent_closed = False
         opened = False
+
+        # Emit inflight gauge after task is registered in on_query().
+        self._emit_inflight_gauge()
+        metrics_gauge_inc("session.active.udp_flows")
 
         handler = UdpFlow(
             flow_id,
@@ -314,149 +339,202 @@ class DnsForwarder:
         self._udp_registry[flow_id] = handler
 
         try:
-            await handler.open()
-            opened = True
+            async with aspan(
+                "dns.forward",
+                flow_id=flow_id,
+                upstream=self._upstream,
+                port=self._upstream_port,
+            ):
+                await handler.open()
+                opened = True
 
-            self._query_count += 1
-            self._bytes_in += len(query)
-            metrics_observe("dns.query.bytes.in", float(len(query)))
+                self._query_count += 1
+                self._bytes_in += len(query)
+                metrics_inc("dns.query.bytes.in.total", value=len(query))
+                metrics_observe("dns.query.bytes.in", float(len(query)))
 
-            await handler.send_datagram(query)
+                await handler.send_datagram(query)
 
-            # Single recv — DNS is request/response.  Flow is closed in the
-            # finally block immediately after.
-            try:
-                async with asyncio.timeout(self._query_timeout):
-                    response = await handler.recv_datagram()
-            except TimeoutError:
-                self._error_drop_count += 1
-                self._total_drop_count += 1
-                metrics_inc("dns.query.timeout")
-                logger.debug(
-                    "dns query timed out for %s:%d (flow=%s, timeout_s=%s)",
-                    client_addr[0],
-                    client_addr[1],
-                    flow_id,
-                    self._query_timeout,
+                response = await self._recv_response(
+                    handler, client_addr, flow_id,
                 )
-                return  # finally block handles cleanup.
+                if response is None:
+                    # Timeout or agent-closed — already handled inside
+                    # _recv_response; determine which for cleanup.
+                    if handler._closed:  # noqa: SLF001 — transport internals
+                        agent_closed = True
+                    return
 
-            if response is None:
+                if (
+                    self._transport is not None
+                    and not self._transport.is_closing()
+                ):
+                    self._transport.sendto(response, client_addr)
+                    self._ok_count += 1
+                    self._bytes_out += len(response)
+                    metrics_inc("dns.query.ok")
+                    metrics_inc(
+                        "dns.query.bytes.out.total", value=len(response),
+                    )
+                    metrics_observe(
+                        "dns.query.bytes.out", float(len(response)),
+                    )
+                else:
+                    logger.debug(
+                        "dns query for %s:%d — transport closed before "
+                        "reply (flow=%s)",
+                        client_addr[0],
+                        client_addr[1],
+                        flow_id,
+                    )
+
+        except (
+            WebSocketSendTimeoutError,
+            ConnectionClosedError,
+            TransportError,
+            ExecTunnelError,
+        ) as exc:
+            self._record_query_error(exc, client_addr, flow_id)
+            if isinstance(exc, ConnectionClosedError):
                 agent_closed = True
-                metrics_inc("dns.query.error", error="agent_closed_no_response")
-                logger.debug(
-                    "dns query for %s:%d — agent closed flow before response (flow=%s)",
-                    client_addr[0],
-                    client_addr[1],
-                    flow_id,
-                )
-                return
-
-            if self._transport is not None and not self._transport.is_closing():
-                self._transport.sendto(response, client_addr)
-                self._ok_count += 1
-                self._bytes_out += len(response)
-                metrics_inc("dns.query.ok")
-                metrics_observe("dns.query.bytes.out", float(len(response)))
-            else:
-                logger.debug(
-                    "dns query for %s:%d — transport closed before reply (flow=%s)",
-                    client_addr[0],
-                    client_addr[1],
-                    flow_id,
-                )
-
-        except WebSocketSendTimeoutError as exc:
-            self._error_drop_count += 1
-            self._total_drop_count += 1
-            metrics_inc("dns.query.error", error="ws_send_timeout")
-            logger.warning(
-                "dns query for %s:%d dropped — WebSocket send timed out "
-                "(flow=%s, error_id=%s)",
-                client_addr[0],
-                client_addr[1],
-                flow_id,
-                exc.error_id,
-            )
-
-        except ConnectionClosedError as exc:
-            self._error_drop_count += 1
-            self._total_drop_count += 1
-            agent_closed = True
-            metrics_inc("dns.query.error", error="connection_closed")
-            logger.warning(
-                "dns query for %s:%d dropped — tunnel connection closed "
-                "(flow=%s, error_id=%s)",
-                client_addr[0],
-                client_addr[1],
-                flow_id,
-                exc.error_id,
-            )
-
-        except TransportError as exc:
-            self._error_drop_count += 1
-            self._total_drop_count += 1
-            metrics_inc("dns.query.error", error=exc.error_code.replace(".", "_"))
-            logger.debug(
-                "dns query for %s:%d dropped — transport error [%s]: %s "
-                "(flow=%s, error_id=%s)",
-                client_addr[0],
-                client_addr[1],
-                exc.error_code,
-                exc.message,
-                flow_id,
-                exc.error_id,
-            )
-
-        except ExecTunnelError as exc:
-            self._error_drop_count += 1
-            self._total_drop_count += 1
-            metrics_inc("dns.query.error", error=exc.error_code.replace(".", "_"))
-            logger.warning(
-                "dns query for %s:%d failed [%s]: %s (flow=%s, error_id=%s)",
-                client_addr[0],
-                client_addr[1],
-                exc.error_code,
-                exc.message,
-                flow_id,
-                exc.error_id,
-            )
 
         except Exception as exc:
-            self._error_drop_count += 1
-            self._total_drop_count += 1
-            metrics_inc("dns.query.error", error=type(exc).__name__)
-            logger.warning(
-                "dns query for %s:%d unexpected failure: %s (flow=%s)",
-                client_addr[0],
-                client_addr[1],
-                exc,
-                flow_id,
-                exc_info=True,
-            )
+            self._record_query_error(exc, client_addr, flow_id)
 
         finally:
             metrics_observe(
                 "dns.query.duration_sec",
                 asyncio.get_running_loop().time() - start,
             )
-            if agent_closed:
-                # Agent already tore down the flow — just clean up local state.
-                handler.on_remote_closed()
-            elif opened:
-                # Flow was successfully opened — send UDP_CLOSE to the agent.
-                try:
-                    await handler.close()
-                except (ExecTunnelError, OSError) as _close_exc:
-                    logger.debug(
-                        "dns flow %s: UDP_CLOSE send failed during cleanup: %s",
-                        flow_id,
-                        _close_exc,
-                    )
-            else:
-                # open() never succeeded — agent doesn't know about this flow.
-                # Just evict from registry; no UDP_CLOSE needed.
-                handler.on_remote_closed()
+            await self._cleanup_flow(handler, flow_id, opened, agent_closed)
+            metrics_gauge_dec("session.active.udp_flows")
+
+    async def _recv_response(
+        self,
+        handler: UdpFlow,
+        client_addr: tuple[str, int],
+        flow_id: str,
+    ) -> bytes | None:
+        """Wait for a single DNS response datagram.
+
+        Returns ``None`` on timeout or agent-closed-before-response.  Both
+        cases are metricked and logged here so the caller can simply
+        short-circuit on ``None``.
+        """
+        try:
+            async with asyncio.timeout(self._query_timeout):
+                response = await handler.recv_datagram()
+        except TimeoutError:
+            self._error_drop_count += 1
+            self._total_drop_count += 1
+            metrics_inc("dns.query.timeout")
+            logger.debug(
+                "dns query timed out for %s:%d (flow=%s, timeout_s=%s)",
+                client_addr[0],
+                client_addr[1],
+                flow_id,
+                self._query_timeout,
+            )
+            return None
+
+        if response is None:
+            metrics_inc("dns.query.error", error="agent_closed_no_response")
+            logger.debug(
+                "dns query for %s:%d — agent closed flow before response "
+                "(flow=%s)",
+                client_addr[0],
+                client_addr[1],
+                flow_id,
+            )
+            return None
+
+        return response
+
+    def _record_query_error(
+        self,
+        exc: Exception,
+        client_addr: tuple[str, int],
+        flow_id: str,
+    ) -> None:
+        """Centralised error recording for all _forward_query exception paths."""
+        self._error_drop_count += 1
+        self._total_drop_count += 1
+
+        if isinstance(exc, WebSocketSendTimeoutError):
+            error_tag = "ws_send_timeout"
+            log_fn = logger.warning
+            msg = (
+                "dns query for %s:%d dropped — WebSocket send timed out "
+                "(flow=%s, error_id=%s)"
+            )
+            args: tuple[object, ...] = (
+                client_addr[0], client_addr[1], flow_id, exc.error_id,
+            )
+        elif isinstance(exc, ConnectionClosedError):
+            error_tag = "connection_closed"
+            log_fn = logger.warning
+            msg = (
+                "dns query for %s:%d dropped — tunnel connection closed "
+                "(flow=%s, error_id=%s)"
+            )
+            args = (client_addr[0], client_addr[1], flow_id, exc.error_id)
+        elif isinstance(exc, TransportError):
+            error_tag = exc.error_code.replace(".", "_")
+            log_fn = logger.debug
+            msg = (
+                "dns query for %s:%d dropped — transport error [%s]: %s "
+                "(flow=%s, error_id=%s)"
+            )
+            args = (
+                client_addr[0], client_addr[1],
+                exc.error_code, exc.message, flow_id, exc.error_id,
+            )
+        elif isinstance(exc, ExecTunnelError):
+            error_tag = exc.error_code.replace(".", "_")
+            log_fn = logger.warning
+            msg = (
+                "dns query for %s:%d failed [%s]: %s "
+                "(flow=%s, error_id=%s)"
+            )
+            args = (
+                client_addr[0], client_addr[1],
+                exc.error_code, exc.message, flow_id, exc.error_id,
+            )
+        else:
+            error_tag = type(exc).__name__
+            log_fn = logger.warning
+            msg = (
+                "dns query for %s:%d unexpected failure: %s (flow=%s)"
+            )
+            args = (client_addr[0], client_addr[1], exc, flow_id)
+
+        metrics_inc("dns.query.error", error=error_tag)
+        log_fn(msg, *args, exc_info=not isinstance(exc, ExecTunnelError))
+
+    @staticmethod
+    async def _cleanup_flow(
+        handler: UdpFlow,
+        flow_id: str,
+        opened: bool,
+        agent_closed: bool,
+    ) -> None:
+        """Tear down a UDP flow after a query completes or fails."""
+        if agent_closed:
+            # Agent already tore down the flow — just clean up local state.
+            handler.on_remote_closed()
+        elif opened:
+            # Flow was successfully opened — send UDP_CLOSE to the agent.
+            try:
+                await handler.close()
+            except (ExecTunnelError, OSError) as exc:
+                logger.debug(
+                    "dns flow %s: UDP_CLOSE send failed during cleanup: %s",
+                    flow_id,
+                    exc,
+                )
+        else:
+            # open() never succeeded — agent doesn't know about this flow.
+            handler.on_remote_closed()
 
     # ── Properties ────────────────────────────────────────────────────────────
 
@@ -513,10 +591,14 @@ class DnsForwarder:
     # ── Debug ─────────────────────────────────────────────────────────────────
 
     def __repr__(self) -> str:
-        state = "running" if self.is_running else ("stopped" if self._stopped else "new")
+        state = (
+            "running"
+            if self.is_running
+            else ("stopped" if self._stopped else "new")
+        )
         return (
             f"<DnsForwarder 127.0.0.1:{self._local_port} → "
             f"{self._upstream}:{self._upstream_port} "
-            f"state={state} inflight={len(self._tasks)} "
+            f"state={state} inflight={self.inflight_count} "
             f"ok={self._ok_count} drops={self._total_drop_count}>"
         )

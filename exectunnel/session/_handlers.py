@@ -25,10 +25,12 @@ from exectunnel.exceptions import (
     WebSocketSendTimeoutError,
 )
 from exectunnel.observability import (
+    aspan,
+    metrics_gauge_dec,
     metrics_gauge_inc,
+    metrics_gauge_set,
     metrics_inc,
     metrics_observe,
-    span,
 )
 from exectunnel.protocol import (
     Reply,
@@ -117,16 +119,16 @@ class RequestDispatcher:
 
         self._connect_gate = asyncio.Semaphore(tun_cfg.connect_max_pending)
         self._host_semaphores: LruDict[str, asyncio.Semaphore] = LruDict(
-            _HOST_SEMAPHORE_CAPACITY
+            _HOST_SEMAPHORE_CAPACITY,
         )
         self._host_connect_open_locks: LruDict[str, asyncio.Lock] = LruDict(
-            _HOST_SEMAPHORE_CAPACITY
+            _HOST_SEMAPHORE_CAPACITY,
         )
         self._host_connect_last_open_at: LruDict[str, float] = LruDict(
-            _HOST_SEMAPHORE_CAPACITY
+            _HOST_SEMAPHORE_CAPACITY,
         )
         self._connect_failures_by_host: LruDict[str, int] = LruDict(
-            _HOST_SEMAPHORE_CAPACITY
+            _HOST_SEMAPHORE_CAPACITY,
         )
 
         # ACK failure tracking.
@@ -142,7 +144,7 @@ class RequestDispatcher:
         # and reused by all concurrent _await_conn_ack calls.
         self._ws_closed_task: asyncio.Task[bool] = (
             asyncio.get_running_loop().create_task(
-                ws_closed.wait(), name="ws-closed-sentinel"
+                ws_closed.wait(), name="ws-closed-sentinel",
             )
         )
 
@@ -162,10 +164,10 @@ class RequestDispatcher:
     async def dispatch(self, req: Socks5Request) -> None:
         """Dispatch a SOCKS5 request to the appropriate handler."""
         if req.is_connect:
-            with span("socks.connect", host=req.host, port=req.port):
+            async with aspan("socks.connect", host=req.host, port=req.port):
                 await self._handle_connect(req)
         elif req.is_udp_associate:
-            with span("socks.udp_associate"):
+            async with aspan("socks.udp_associate"):
                 await self._handle_udp_associate(req)
         elif not req.replied:
             await req.send_reply_error(Reply.CMD_NOT_SUPPORTED)
@@ -190,20 +192,37 @@ class RequestDispatcher:
         port: int,
     ) -> None:
         """Open a direct TCP connection for excluded hosts."""
-        logger.debug("direct connect %s:%d (excluded)", host, port)
-        try:
-            async with asyncio.timeout(_DIRECT_CONNECT_TIMEOUT_SECS):
-                rem_reader, rem_writer = await asyncio.open_connection(host, port)
-        except (OSError, TimeoutError) as exc:
-            logger.debug("direct connect failed: %s", exc)
-            metrics_inc("socks_reply_code", code=int(Reply.HOST_UNREACHABLE))
-            if not req.replied:
-                await req.send_reply_error(Reply.HOST_UNREACHABLE)
-            return
+        async with aspan("socks.connect.direct", host=host, port=port):
+            logger.debug("direct connect %s:%d (excluded)", host, port)
+            try:
+                async with asyncio.timeout(_DIRECT_CONNECT_TIMEOUT_SECS):
+                    rem_reader, rem_writer = await asyncio.open_connection(
+                        host, port,
+                    )
+            except (OSError, TimeoutError) as exc:
+                logger.debug("direct connect failed: %s", exc)
+                metrics_inc("socks.reply", code=int(Reply.HOST_UNREACHABLE))
+                if not req.replied:
+                    await req.send_reply_error(Reply.HOST_UNREACHABLE)
+                return
 
-        metrics_inc("socks_reply_code", code=int(Reply.SUCCESS))
-        await req.send_reply_success()
-        await _pipe(req.reader, req.writer, rem_reader, rem_writer)
+            try:
+                await req.send_reply_success()
+            except OSError as exc:
+                logger.debug(
+                    "direct connect %s:%d — client closed before reply: %s",
+                    host,
+                    port,
+                    exc,
+                )
+                metrics_inc("socks.reply", code=int(Reply.GENERAL_FAILURE))
+                rem_writer.close()
+                with contextlib.suppress(OSError):
+                    await rem_writer.wait_closed()
+                return
+
+            metrics_inc("socks.reply", code=int(Reply.SUCCESS))
+            await _pipe(req.reader, req.writer, rem_reader, rem_writer)
 
     async def _handle_tunnel_connect(
         self,
@@ -230,7 +249,7 @@ class RequestDispatcher:
         # Insert into registry BEFORE sending CONN_OPEN — agent may reply
         # before the await returns.
         self._tcp_registry[conn_id] = handler
-        metrics_gauge_inc("session_active_tcp_connections")
+        metrics_gauge_inc("session.active.tcp_connections")
         self._pending_connects[conn_id] = pending
         self._emit_pending_gauge()
 
@@ -240,74 +259,93 @@ class RequestDispatcher:
         failure_reason: AckStatus | None = None
 
         try:
-            async with self._connect_gate, host_gate:
-                host_key = _normalise_host_key(host)
-                await self._pace_connection(host_key)
+            async with aspan("tunnel.conn_open", conn_id=conn_id, host=host, port=port):
+                async with self._connect_gate, host_gate:
+                    host_key = _normalise_host_key(host)
+                    await self._pace_connection(host_key)
 
-                try:
-                    await self._ws_send(encode_conn_open_frame(conn_id, host, port))
-                except WebSocketSendTimeoutError as exc:
-                    failure_reason = AckStatus.WS_SEND_TIMEOUT
-                    ack_status = AckStatus.WS_SEND_TIMEOUT
-                    reply = Reply.GENERAL_FAILURE
-                    metrics_inc("tunnel.conn_open.error", error="ws_send_timeout")
-                    logger.warning(
-                        "conn %s: CONN_OPEN send timed out [%s] (error_id=%s)",
-                        conn_id,
-                        exc.error_code,
-                        exc.error_id,
-                        extra={
-                            "conn_id": conn_id,
-                            "error_code": exc.error_code,
-                            "error_id": exc.error_id,
-                        },
-                    )
-                except ConnectionClosedError as exc:
-                    failure_reason = AckStatus.WS_CLOSED
-                    ack_status = AckStatus.WS_CLOSED
-                    reply = Reply.NET_UNREACHABLE
-                    metrics_inc("tunnel.conn_open.error", error="connection_closed")
-                    logger.warning(
-                        "conn %s: CONN_OPEN failed — connection closed [%s] "
-                        "(error_id=%s)",
-                        conn_id,
-                        exc.error_code,
-                        exc.error_id,
-                        extra={
-                            "conn_id": conn_id,
-                            "error_code": exc.error_code,
-                            "error_id": exc.error_id,
-                        },
-                    )
-                else:
-                    logger.debug(
-                        "tunnel CONNECT %s:%d conn=%s",
-                        host,
-                        port,
-                        conn_id,
-                        extra={"conn_id": conn_id, "host": host, "port": port},
-                    )
+                    try:
+                        await self._ws_send(
+                            encode_conn_open_frame(conn_id, host, port),
+                        )
+                    except WebSocketSendTimeoutError as exc:
+                        failure_reason = AckStatus.WS_SEND_TIMEOUT
+                        ack_status = AckStatus.WS_SEND_TIMEOUT
+                        reply = Reply.GENERAL_FAILURE
+                        metrics_inc(
+                            "tunnel.conn_open.error", error="ws_send_timeout",
+                        )
+                        logger.warning(
+                            "conn %s: CONN_OPEN send timed out [%s] (error_id=%s)",
+                            conn_id,
+                            exc.error_code,
+                            exc.error_id,
+                            extra={
+                                "conn_id": conn_id,
+                                "error_code": exc.error_code,
+                                "error_id": exc.error_id,
+                            },
+                        )
+                    except ConnectionClosedError as exc:
+                        failure_reason = AckStatus.WS_CLOSED
+                        ack_status = AckStatus.WS_CLOSED
+                        reply = Reply.NET_UNREACHABLE
+                        metrics_inc(
+                            "tunnel.conn_open.error", error="connection_closed",
+                        )
+                        logger.warning(
+                            "conn %s: CONN_OPEN failed — connection closed [%s] "
+                            "(error_id=%s)",
+                            conn_id,
+                            exc.error_code,
+                            exc.error_id,
+                            extra={
+                                "conn_id": conn_id,
+                                "error_code": exc.error_code,
+                                "error_id": exc.error_id,
+                            },
+                        )
+                    else:
+                        metrics_inc(
+                            "tunnel.conn_open",
+                            conn_id=conn_id,
+                            host=host,
+                            port=port,
+                        )
+                        logger.debug(
+                            "tunnel CONNECT %s:%d conn=%s",
+                            host,
+                            port,
+                            conn_id,
+                            extra={
+                                "conn_id": conn_id,
+                                "host": host,
+                                "port": port,
+                            },
+                        )
 
-            # Semaphores released after CONN_OPEN is sent — ACK wait happens
-            # outside the semaphore scope so a slow agent ACK does not block
-            # new connections from being opened.
-            if failure_reason is None:
-                failure_reason, reply = await self._await_conn_ack(
-                    conn_id, pending, ack_future
-                )
-                if failure_reason is not None:
-                    ack_status = failure_reason
+                # Semaphores released after CONN_OPEN is sent — ACK wait
+                # happens outside the semaphore scope so a slow agent ACK
+                # does not block new connections.
+                if failure_reason is None:
+                    async with aspan(
+                        "tunnel.conn_ack.wait", conn_id=conn_id,
+                    ):
+                        failure_reason, reply = await self._await_conn_ack(
+                            conn_id, pending, ack_future,
+                        )
+                    if failure_reason is not None:
+                        ack_status = failure_reason
 
             if failure_reason is not None:
-                self._record_ack_failure(conn_id, failure_reason)
+                self._record_ack_failure(conn_id, failure_reason, host=host, port=port)
                 self._record_connect_failure(host, failure_reason, reply)
                 await self._teardown_failed_connection(conn_id, handler)
                 if not req.replied:
                     await req.send_reply_error(reply)
                 return
 
-            metrics_inc("tunnel.conn_ack.ok")
-            metrics_inc("socks_reply_code", code=int(Reply.SUCCESS))
+            metrics_inc("tunnel.conn_ack.ok", conn_id=conn_id, host=host, port=port)
 
             # send_reply_success() can raise OSError when the SOCKS5 client
             # closes its socket before we send the reply — normal race.
@@ -320,18 +358,27 @@ class RequestDispatcher:
                     exc,
                     extra={"conn_id": conn_id},
                 )
-                metrics_inc("socks_reply_code", code=int(Reply.GENERAL_FAILURE))
+                metrics_inc("socks.reply", code=int(Reply.GENERAL_FAILURE))
                 await self._teardown_failed_connection(conn_id, handler)
                 return
 
+            metrics_inc("socks.reply", code=int(Reply.SUCCESS))
             handler.start()
             await handler.closed_event.wait()
+            metrics_inc("tunnel.conn.completed", conn_id=conn_id, host=host, port=port)
 
         except ExecTunnelError as exc:
             ack_status = AckStatus.LIBRARY_ERROR
             reply = Reply.GENERAL_FAILURE
-            self._record_ack_failure(conn_id, AckStatus.LIBRARY_ERROR)
+            self._record_ack_failure(conn_id, AckStatus.LIBRARY_ERROR, host=host, port=port)
             self._record_connect_failure(host, AckStatus.LIBRARY_ERROR, reply)
+            metrics_inc(
+                "tunnel.conn.error",
+                conn_id=conn_id,
+                host=host,
+                port=port,
+                error=exc.error_code.replace(".", "_"),
+            )
             logger.warning(
                 "conn %s: tunnel error [%s]: %s (error_id=%s)",
                 conn_id,
@@ -357,7 +404,7 @@ class RequestDispatcher:
                 exc,
                 extra={"conn_id": conn_id},
             )
-            metrics_inc("socks_reply_code", code=int(Reply.GENERAL_FAILURE))
+            metrics_inc("socks.reply", code=int(Reply.GENERAL_FAILURE))
             await self._teardown_failed_connection(conn_id, handler)
             if not req.replied:
                 with contextlib.suppress(OSError):
@@ -366,8 +413,9 @@ class RequestDispatcher:
         except Exception as exc:
             ack_status = AckStatus.UNEXPECTED_ERROR
             reply = Reply.GENERAL_FAILURE
-            self._record_ack_failure(conn_id, AckStatus.UNEXPECTED_ERROR)
+            self._record_ack_failure(conn_id, AckStatus.UNEXPECTED_ERROR, host=host, port=port)
             self._record_connect_failure(host, AckStatus.UNEXPECTED_ERROR, reply)
+            metrics_inc("tunnel.conn.error", conn_id=conn_id, host=host, port=port, error="unexpected")
             logger.error(
                 "conn %s: unexpected error during tunnel connect: %s",
                 conn_id,
@@ -381,13 +429,17 @@ class RequestDispatcher:
 
         finally:
             self._pending_connects.pop(conn_id, None)
+            if conn_id not in self._tcp_registry:
+                # Handler was removed from registry (closed or aborted) →
+                # decrement the gauge that was incremented on insertion.
+                metrics_gauge_dec("session.active.tcp_connections")
             if not ack_future.done():
                 ack_future.cancel()
             self._emit_pending_gauge()
             metrics_observe(
                 "tunnel.conn_ack.wait_sec",
                 loop.time() - ack_wait_start,
-                status=ack_status,
+                status=ack_status.value,
             )
 
     async def _await_conn_ack(
@@ -410,7 +462,12 @@ class RequestDispatcher:
                     return_when=asyncio.FIRST_COMPLETED,
                 )
         except TimeoutError:
-            metrics_inc("connect_ack_timeout", host=_normalise_host_key(pending.host))
+            metrics_inc(
+                "tunnel.conn_ack.timeout",
+                conn_id=conn_id,
+                host=pending.host,
+                port=pending.port,
+            )
             return AckStatus.TIMEOUT, Reply.HOST_UNREACHABLE
 
         if ws_closed_task in done:
@@ -451,7 +508,8 @@ class RequestDispatcher:
         async with req:
             if req.udp_relay is None:
                 logger.error(
-                    "UDP ASSOCIATE request has no relay — this is a bug in _negotiate()"
+                    "UDP ASSOCIATE request has no relay — this is a bug in "
+                    "_negotiate()",
                 )
                 if not req.replied:
                     await req.send_reply_error(Reply.GENERAL_FAILURE)
@@ -482,28 +540,29 @@ class RequestDispatcher:
                 except OSError:
                     metrics_inc("udp.drain.error", error="os_error")
                 except (TransportError, ExecTunnelError) as exc:
-                    metrics_inc(
-                        "udp.drain.error",
-                        error=getattr(exc, "error_code", type(exc).__name__).replace(
-                            ".", "_"
-                        ),
-                    )
+                    err = getattr(
+                        exc, "error_code", type(exc).__name__,
+                    ).replace(".", "_")
+                    metrics_inc("udp.drain.error", error=err)
                     logger.debug(
                         "udp drain flow=%s [%s]: %s",
                         flow_handler.flow_id,
-                        getattr(exc, "error_code", type(exc).__name__),
+                        err,
                         exc,
                     )
                 except asyncio.CancelledError:
                     raise
                 finally:
                     active_flows.pop(flow_key, None)
+                    metrics_gauge_dec("session.active.udp_flows")
 
             async def _pump_inbound() -> None:
-                """Read datagrams from the SOCKS5 relay and forward through tunnel."""
+                """Read datagrams from the SOCKS5 relay and forward via tunnel."""
                 while True:
                     try:
-                        async with asyncio.timeout(self._tun.udp_pump_poll_timeout):
+                        async with asyncio.timeout(
+                            self._tun.udp_pump_poll_timeout,
+                        ):
                             result = await relay.recv()
                     except TimeoutError:
                         if req.reader.at_eof():
@@ -549,7 +608,7 @@ class RequestDispatcher:
                             self._udp_registry,
                         )
                         self._udp_registry[flow_id] = flow_handler
-                        metrics_gauge_inc("session_active_udp_flows")
+                        metrics_gauge_inc("session.active.udp_flows")
                         try:
                             await flow_handler.open()
                         except (
@@ -559,7 +618,7 @@ class RequestDispatcher:
                             ExecTunnelError,
                         ) as exc:
                             err = getattr(
-                                exc, "error_code", type(exc).__name__
+                                exc, "error_code", type(exc).__name__,
                             ).replace(".", "_")
                             metrics_inc("udp.flow.open.error", error=err)
                             logger.warning(
@@ -568,6 +627,7 @@ class RequestDispatcher:
                                 err,
                             )
                             flow_handler.on_remote_closed()
+                            metrics_gauge_dec("session.active.udp_flows")
                             continue
 
                         active_flows[key] = (flow_handler, src_ip)
@@ -587,9 +647,9 @@ class RequestDispatcher:
                         ConnectionClosedError,
                         TransportError,
                     ) as exc:
-                        err = getattr(exc, "error_code", type(exc).__name__).replace(
-                            ".", "_"
-                        )
+                        err = getattr(
+                            exc, "error_code", type(exc).__name__,
+                        ).replace(".", "_")
                         metrics_inc("udp.datagram.send.error", error=err)
                         logger.warning(
                             "udp flow %s send error [%s] — datagram dropped",
@@ -617,10 +677,23 @@ class RequestDispatcher:
 
     # ── ACK failure tracking ──────────────────────────────────────────────────
 
-    def _record_ack_failure(self, conn_id: str, reason: AckStatus) -> None:
-        """Record an ACK failure and trigger reconnect if threshold is exceeded."""
+    def _record_ack_failure(
+        self,
+        conn_id: str,
+        reason: AckStatus,
+        *,
+        host: str = "",
+        port: int = 0,
+    ) -> None:
+        """Record an ACK failure and trigger reconnect if threshold exceeded."""
         self._ack_failure_count += 1
-        metrics_inc("tunnel.conn_ack.failed", reason=reason.value)
+        metrics_inc(
+            "tunnel.conn_ack.failed",
+            conn_id=conn_id,
+            reason=reason.value,
+            host=host,
+            port=port,
+        )
 
         if reason == AckStatus.TIMEOUT:
             now = asyncio.get_running_loop().time()
@@ -729,8 +802,11 @@ class RequestDispatcher:
                         wait_for
                         + random.uniform(
                             0.0,
-                            min(Defaults.CONNECT_PACE_JITTER_CAP_SECS, interval / 2.0),
-                        )
+                            min(
+                                Defaults.CONNECT_PACE_JITTER_CAP_SECS,
+                                interval / 2.0,
+                            ),
+                        ),
                     )
             self._host_connect_last_open_at[host_key] = (
                 asyncio.get_running_loop().time()
@@ -738,18 +814,23 @@ class RequestDispatcher:
 
     def _emit_pending_gauge(self) -> None:
         """Emit the current pending-connect count as a gauge metric."""
-        metrics_observe("pending_connects", float(len(self._pending_connects)))
+        metrics_gauge_set(
+            "session.pending_connects",
+            float(len(self._pending_connects)),
+        )
 
     def _record_connect_failure(
-        self, host: str, reason: AckStatus, reply: Reply
+        self, host: str, reason: AckStatus, reply: Reply,
     ) -> None:
         """Increment per-host failure counter and emit metrics."""
         host_key = _normalise_host_key(host)
         self._connect_failures_by_host[host_key] = (
             self._connect_failures_by_host.get(host_key, 0) + 1
         )
-        metrics_inc("connect_fail_by_host", host=host_key, reason=reason.value)
-        metrics_inc("socks_reply_code", code=int(reply))
+        metrics_inc(
+            "tunnel.connect.fail_by_host", host=host_key, reason=reason.value,
+        )
+        metrics_inc("socks.reply", code=int(reply))
 
     # ── Debug ─────────────────────────────────────────────────────────────────
 
@@ -776,7 +857,7 @@ def _normalise_host_key(host: str) -> str:
 
 
 def _require_ip_literal(host: str) -> str:
-    """Return *host* unchanged if it is an IP literal, else raise ``ValueError``."""
+    """Return *host* unchanged if it is an IP literal, else raise ValueError."""
     ipaddress.ip_address(host)  # raises ValueError for non-IP
     return host
 
@@ -792,12 +873,6 @@ async def _pipe(
     Uses :class:`asyncio.TaskGroup` for half-close semantics: when one
     direction hits EOF and returns normally, the other continues until it
     also finishes.
-
-    ``copy()`` catches ``Exception`` (not just ``OSError``) so that an
-    unexpected error in one direction does not cause ``TaskGroup`` to emit
-    an ``ExceptionGroup`` that bypasses every ``except`` clause in the call
-    chain (``ExceptionGroup`` is a ``BaseException`` subclass that does not
-    match ``except Exception`` in Python 3.11+).
     """
 
     async def copy(
@@ -820,8 +895,7 @@ async def _pipe(
         except Exception:
             # Defensive: catch non-OSError exceptions (e.g. RuntimeError from
             # drain() on a closing transport) to prevent TaskGroup from
-            # wrapping them in an ExceptionGroup that would bypass all
-            # except-Exception handlers in the call chain.
+            # wrapping them in an ExceptionGroup.
             metrics_inc("pipe.copy.unexpected_error")
             logger.debug("pipe copy unexpected error", exc_info=True)
 
@@ -853,7 +927,6 @@ async def _direct_udp_relay(
     .. note::
         Only the **first** response datagram is relayed back to the client.
     """
-    # Invariant: is_host_excluded only matches IP literals.
     try:
         ipaddress.ip_address(dst_host)
     except ValueError:
