@@ -1,7 +1,7 @@
 """Async-safe UDP socket helpers for the session layer.
 
 ``make_udp_socket`` and ``resolve_address_family`` are used by the
-direct-UDP relay path in ``_handlers.py``.
+direct-UDP relay path in ``_dispatcher.py``.
 """
 
 from __future__ import annotations
