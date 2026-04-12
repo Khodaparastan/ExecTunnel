@@ -14,6 +14,12 @@ import ipaddress
 import logging
 
 from exectunnel.exceptions import ProtocolError, TransportError
+from exectunnel.observability import (
+    metrics_gauge_dec,
+    metrics_gauge_inc,
+    metrics_inc,
+    metrics_observe,
+)
 from exectunnel.protocol import AddrType
 from exectunnel.proxy._constants import (
     DEFAULT_QUEUE_CAPACITY,
@@ -101,7 +107,7 @@ class UdpRelay:
         # Reused across recv() calls to avoid per-call task allocation.
         self._recv_close_task: asyncio.Task[None] | None = None
 
-        # Telemetry counters.
+        # Internal counters kept for property access by callers.
         self._drop_count: int = 0
         self._foreign_client_count: int = 0
         self._accepted_count: int = 0
@@ -194,6 +200,7 @@ class UdpRelay:
         self._transport = transport
         self._local_port = transport.get_extra_info("sockname")[1]
         logger.debug("udp relay bound on 127.0.0.1:%d", self._local_port)
+        metrics_gauge_inc("socks5.udp.relays_active")
         return self._local_port
 
     def close(self) -> None:
@@ -205,6 +212,8 @@ class UdpRelay:
             return
         self._closed = True
         logger.debug("udp relay closing (port=%d)", self._local_port)
+        if self._started:
+            metrics_gauge_dec("socks5.udp.relays_active")
 
         if self._transport is not None:
             self._transport.close()
@@ -245,6 +254,7 @@ class UdpRelay:
                 and addr != self._expected_client_addr
             ):
                 self._foreign_client_count += 1
+                metrics_inc("socks5.udp.foreign_client_drops")
                 logger.debug(
                     "udp relay dropping datagram from %s:%d before client bound "
                     "(expected hint %s:%d)",
@@ -263,6 +273,7 @@ class UdpRelay:
             )
         elif addr != self._client_addr:
             self._foreign_client_count += 1
+            metrics_inc("socks5.udp.foreign_client_drops")
             if (
                 self._foreign_client_count == 1
                 or self._foreign_client_count % self._drop_warn_interval == 0
@@ -295,8 +306,11 @@ class UdpRelay:
         try:
             self._queue.put_nowait((payload, host, port))
             self._accepted_count += 1
+            metrics_inc("socks5.udp.datagrams_accepted")
+            metrics_observe("socks5.udp.datagram_size", len(data))
         except asyncio.QueueFull:
             self._drop_count += 1
+            metrics_inc("socks5.udp.datagrams_dropped")
             if (
                 self._drop_count == 1
                 or self._drop_count % self._drop_warn_interval == 0

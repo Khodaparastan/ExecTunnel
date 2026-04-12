@@ -12,6 +12,7 @@ import contextlib
 from dataclasses import dataclass, field
 
 from exectunnel.exceptions import ProtocolError
+from exectunnel.observability import metrics_inc
 from exectunnel.protocol import Cmd, Reply
 
 from ._wire import build_socks5_reply
@@ -149,6 +150,7 @@ class Socks5Request:
         self._assert_not_replied()
         self.writer.write(build_socks5_reply(Reply.SUCCESS, bind_host, bind_port))
         await self.writer.drain()
+        metrics_inc("socks5.replies.success", cmd=self.cmd.name)
 
     async def send_reply_error(
         self,
@@ -170,6 +172,7 @@ class Socks5Request:
             packet = build_socks5_reply(reply)
             with contextlib.suppress(OSError):
                 self.writer.write(packet)
+            metrics_inc("socks5.replies.error", reply=reply.name, cmd=self.cmd.name)
         finally:
             with contextlib.suppress(OSError):
                 await self.writer.drain()

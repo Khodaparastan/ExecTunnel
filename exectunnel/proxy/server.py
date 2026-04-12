@@ -14,12 +14,21 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from collections.abc import AsyncIterator
 
 from exectunnel.exceptions import (
     ExecTunnelError,
     ProtocolError,
     TransportError,
+)
+from exectunnel.observability import (
+    aspan,
+    metrics_gauge_dec,
+    metrics_gauge_inc,
+    metrics_inc,
+    metrics_observe,
+    start_trace,
 )
 from exectunnel.protocol import AuthMethod, Cmd, Reply
 
@@ -181,6 +190,10 @@ class Socks5Server:
         All failures are caught so a single bad client never tears down
         the server.
         """
+        start_trace()
+        metrics_inc("socks5.connections.accepted")
+        metrics_gauge_inc("socks5.connections.active")
+
         task = asyncio.current_task()
         if task is not None:
             self._handshake_tasks.add(task)
@@ -194,6 +207,7 @@ class Socks5Server:
             # Already logged inside _do_handshake; just ensure cleanup.
             await close_writer(writer)
         finally:
+            metrics_gauge_dec("socks5.connections.active")
             if task is not None:
                 self._handshake_tasks.discard(task)
 
@@ -203,75 +217,108 @@ class Socks5Server:
         writer: asyncio.StreamWriter,
     ) -> None:
         """Inner handshake logic, separated for cleaner exception handling."""
-        try:
-            async with asyncio.timeout(self._config.handshake_timeout):
-                req = await self._negotiate(reader, writer)
-        except TimeoutError:
-            logger.warning(
-                "socks5 handshake timed out after %.1fs",
-                self._config.handshake_timeout,
-            )
-            await close_writer(writer)
-            return
-        except ProtocolError as exc:
+        _t0 = time.monotonic()
+        async with aspan("socks5.handshake"):
+            try:
+                async with asyncio.timeout(self._config.handshake_timeout):
+                    req = await self._negotiate(reader, writer)
+            except TimeoutError:
+                metrics_inc("socks5.handshakes.timeout")
+                metrics_observe(
+                    "socks5.handshake_duration_sec", time.monotonic() - _t0
+                )
+                logger.warning(
+                    "socks5 handshake timed out after %.1fs",
+                    self._config.handshake_timeout,
+                )
+                await close_writer(writer)
+                return
+            except ProtocolError as exc:
+                metrics_inc("socks5.handshakes.error", reason="protocol")
+                metrics_inc("socks5.connections.rejected")
+                metrics_observe(
+                    "socks5.handshake_duration_sec", time.monotonic() - _t0
+                )
+                logger.debug(
+                    "socks5 handshake rejected [%s]: %s (error_id=%s)",
+                    exc.error_code,
+                    exc.message,
+                    exc.error_id,
+                )
+                await close_writer(writer)
+                return
+            except TransportError as exc:
+                metrics_inc("socks5.handshakes.error", reason="transport")
+                metrics_inc("socks5.connections.rejected")
+                metrics_observe(
+                    "socks5.handshake_duration_sec", time.monotonic() - _t0
+                )
+                logger.warning(
+                    "socks5 handshake transport error [%s]: %s (error_id=%s)",
+                    exc.error_code,
+                    exc.message,
+                    exc.error_id,
+                )
+                await close_writer(writer)
+                return
+            except ExecTunnelError as exc:
+                metrics_inc("socks5.handshakes.error", reason="library")
+                metrics_inc("socks5.connections.rejected")
+                metrics_observe(
+                    "socks5.handshake_duration_sec", time.monotonic() - _t0
+                )
+                logger.warning(
+                    "socks5 handshake library error [%s]: %s (error_id=%s)",
+                    exc.error_code,
+                    exc.message,
+                    exc.error_id,
+                )
+                await close_writer(writer)
+                return
+            except OSError as exc:
+                metrics_inc("socks5.handshakes.error", reason="os_error")
+                metrics_inc("socks5.connections.rejected")
+                metrics_observe(
+                    "socks5.handshake_duration_sec", time.monotonic() - _t0
+                )
+                logger.debug("socks5 handshake I/O error: %s", exc)
+                await close_writer(writer)
+                return
+
+            if req is None:
+                await close_writer(writer)
+                return
+
+            try:
+                await asyncio.wait_for(
+                    self._queue.put(req),
+                    timeout=self._config.queue_put_timeout,
+                )
+            except TimeoutError:
+                metrics_inc("socks5.handshakes.error", reason="queue_full")
+                metrics_inc("socks5.connections.rejected")
+                metrics_observe(
+                    "socks5.handshake_duration_sec", time.monotonic() - _t0
+                )
+                logger.warning(
+                    "socks5 queue full — dropping handshake for %s:%d "
+                    "(queue_put_timeout=%.1fs)",
+                    req.host,
+                    req.port,
+                    self._config.queue_put_timeout,
+                )
+                with contextlib.suppress(Exception):
+                    await req.send_reply_error(Reply.GENERAL_FAILURE)
+                return
+
+            metrics_inc("socks5.handshakes.ok", cmd=req.cmd.name)
+            metrics_observe("socks5.handshake_duration_sec", time.monotonic() - _t0)
             logger.debug(
-                "socks5 handshake rejected [%s]: %s (error_id=%s)",
-                exc.error_code,
-                exc.message,
-                exc.error_id,
-            )
-            await close_writer(writer)
-            return
-        except TransportError as exc:
-            logger.warning(
-                "socks5 handshake transport error [%s]: %s (error_id=%s)",
-                exc.error_code,
-                exc.message,
-                exc.error_id,
-            )
-            await close_writer(writer)
-            return
-        except ExecTunnelError as exc:
-            logger.warning(
-                "socks5 handshake library error [%s]: %s (error_id=%s)",
-                exc.error_code,
-                exc.message,
-                exc.error_id,
-            )
-            await close_writer(writer)
-            return
-        except OSError as exc:
-            logger.debug("socks5 handshake I/O error: %s", exc)
-            await close_writer(writer)
-            return
-
-        if req is None:
-            await close_writer(writer)
-            return
-
-        try:
-            await asyncio.wait_for(
-                self._queue.put(req),
-                timeout=self._config.queue_put_timeout,
-            )
-        except TimeoutError:
-            logger.warning(
-                "socks5 queue full — dropping handshake for %s:%d "
-                "(queue_put_timeout=%.1fs)",
+                "socks5 handshake ok: cmd=%s host=%s port=%d",
+                req.cmd.name,
                 req.host,
                 req.port,
-                self._config.queue_put_timeout,
             )
-            with contextlib.suppress(Exception):
-                await req.send_reply_error(Reply.GENERAL_FAILURE)
-            return
-
-        logger.debug(
-            "socks5 handshake ok: cmd=%s host=%s port=%d",
-            req.cmd.name,
-            req.host,
-            req.port,
-        )
 
     # ── SOCKS5 negotiation ───────────────────────────────────────────────────
 
@@ -383,6 +430,7 @@ class Socks5Server:
 
         match cmd:
             case Cmd.CONNECT:
+                metrics_inc("socks5.commands.connect")
                 return Socks5Request(
                     cmd=cmd,
                     host=host,
@@ -392,6 +440,7 @@ class Socks5Server:
                 )
 
             case Cmd.UDP_ASSOCIATE:
+                metrics_inc("socks5.commands.udp_associate")
                 relay = UdpRelay(
                     queue_capacity=self._config.udp_relay_queue_capacity,
                     drop_warn_interval=self._config.udp_drop_warn_interval,
@@ -413,6 +462,7 @@ class Socks5Server:
                 )
 
             case Cmd.BIND:
+                metrics_inc("socks5.commands.bind_rejected")
                 await write_and_drain_silent(
                     writer, build_socks5_reply(Reply.CMD_NOT_SUPPORTED)
                 )
