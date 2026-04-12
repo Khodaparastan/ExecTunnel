@@ -335,12 +335,15 @@ class ReconnectExhaustedError(TransportError):
 
 class ProtocolError(ExecTunnelError):
     """
-    Raised when an unexpected or malformed frame is received.
+    Raised when an encoder receives invalid arguments that would produce an
+    invalid or unsafe frame.  This always indicates a bug in the calling
+    layer (session, proxy, transport), not a wire-format violation from a
+    remote peer.
 
     Extra ``details`` keys (all optional)
     ──────────────────────────────────────
-    ``frame_type``  – the frame type identifier that was received.
-    ``expected``    – the frame type(s) that were expected.
+    ``frame_type``  – the frame type being encoded.
+    ``expected``    – description of the valid value(s) for the offending field.
     """
 
     default_error_code = "protocol.error"
@@ -363,12 +366,15 @@ class UnexpectedFrameError(ProtocolError):
 
 class FrameDecodingError(ProtocolError):
     """
-    A frame could not be decoded (bad msgpack / JSON / schema mismatch).
+    Raised when data arriving from the wire is structurally corrupt.  This
+    indicates a remote peer violation or channel corruption, not a local
+    programming error.
 
     Extra ``details`` keys (all optional)
     ──────────────────────────────────────
-    ``raw_bytes``   – hex-encoded raw payload (truncated for safety).
-    ``codec``       – codec in use (e.g. ``"msgpack"``, ``"json"``).
+    ``raw_bytes``   – hex-encoded raw payload excerpt (truncated for safety).
+    ``codec``       – codec in use (e.g. ``"frame"``, ``"base64url"``,
+                      ``"host:port"``, ``"utf-8"``).
     """
 
     default_error_code = "protocol.frame_decoding_error"
