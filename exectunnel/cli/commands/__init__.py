@@ -1,7 +1,9 @@
-# Import plain functions — not Typer sub-apps.
-from .config import app as config_app  # config keeps its sub-app (show/validate)
-from .connect import connect
-from .status import status
-from .ws import ws
+"""CLI sub-commands."""
 
-__all__ = ["connect", "config_app", "status", "ws"]
+from .config import app as config_app
+from .connect import connect
+from .manager import manager
+from .status import status
+from .tunnel import tunnel
+
+__all__ = ["config_app", "manager", "status", "tunnel", "connect"]

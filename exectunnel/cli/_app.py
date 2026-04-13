@@ -5,41 +5,51 @@ from __future__ import annotations
 import typer
 from rich.console import Console
 
-from ._theme import THEME
+from .ui import THEME
 
 __all__ = ["app"]
+
+# Shared console instance — avoids constructing a new Console on every
+# callback invocation (--version, implicit help, etc.).
+_console = Console(theme=THEME, highlight=False)
 
 app = typer.Typer(
     name="exectunnel",
     help=(
         "ExecTunnel — SOCKS5 proxy tunnel through Kubernetes exec WebSocket.\n\n"
         "[bold]Quick start:[/bold]\n\n"
-        "  [cyan]exectunnel connect myapp-pod-abc123[/cyan]\n\n"
-        "  [cyan]exectunnel connect --selector app=myapp[/cyan]\n\n"
-        "  [cyan]exectunnel ws wss://k8s.example.com/api/v1/namespaces/default"
-        "/pods/mypod/exec?command=/bin/sh[/cyan]\n\n"
+        "  [cyan]exectunnel tunnel[/cyan]\n\n"
+        "  [cyan]exectunnel tunnel --dns 10.96.0.10[/cyan]\n\n"
+        "  [cyan]exectunnel ws wss://k8s.example.com/…[/cyan]\n\n"
         "  [cyan]exectunnel config show[/cyan]\n\n"
         "  [cyan]exectunnel status[/cyan]\n"
     ),
     no_args_is_help=True,
     rich_markup_mode="rich",
-    pretty_exceptions_enable=True,
-    pretty_exceptions_show_locals=False,
 )
 
-# ── config is a group (has sub-commands: show, validate) ─────────────────────
-from .commands.config import app as _config_app  # noqa: E402
 
-app.add_typer(_config_app, name="config")
+def _register_commands() -> None:
+    """Deferred import and registration to avoid circular imports.
 
-# ── connect, ws, status are direct commands ───────────────────────────────────
-from .commands.connect import connect  # noqa: E402
-from .commands.status import status  # noqa: E402
-from .commands.ws import ws  # noqa: E402
+    Command modules are imported here (rather than at the top of the file)
+    because they in turn import from ``exectunnel.session``, which imports
+    from ``exectunnel.cli`` — registering lazily breaks the cycle.
+    """
+    from .commands.config import app as _config_app
+    from .commands.connect import connect
+    from .commands.manager import manager
+    from .commands.status import status
+    from .commands.tunnel import tunnel
 
-app.command("connect")(connect)
-app.command("ws")(ws)
-app.command("status")(status)
+    app.add_typer(_config_app, name="config")
+    app.command("tunnel")(tunnel)
+    app.command("ws")(connect)
+    app.command("status")(status)
+    app.command("manager")(manager)
+
+
+_register_commands()
 
 
 @app.callback(invoke_without_command=True)
@@ -55,11 +65,11 @@ def _root(
 ) -> None:
     if version:
         from exectunnel import __version__
-        console = Console(theme=THEME, highlight=False)
-        console.print(
+
+        _console.print(
             f"[et.brand]ExecTunnel[/et.brand] [et.value]{__version__}[/et.value]"
         )
-        raise typer.Exit(0)
+        raise typer.Exit()
+
     if ctx.invoked_subcommand is None:
-        console = Console(theme=THEME, highlight=False)
-        console.print(ctx.get_help())
+        _console.print(ctx.get_help())
