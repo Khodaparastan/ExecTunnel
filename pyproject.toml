@@ -6,25 +6,24 @@ authors = [{ name = "khodaparastan", email = "mohammad@khodaparastan.com" }]
 dependencies = [
     "colorama (>=0.4.6,<1.0.0)",
     "contextvars (>=2.4,<3.0)",
-    "structlog (>=25.5.0,<26.0.0)",
-    "websockets (>=16.0)",
-    "pyyaml (>=6.0.3,<7.0.0)",
     "httpx (>=0.28.1,<0.29.0)",
-    "typer[all] (>=0.24.1,<0.25.0)",
+    "pyyaml (>=6.0.3,<7.0.0)",
     "rich (>=15.0.0,<16.0.0)",
+    "structlog (>=25.5.0,<26.0.0)",
+    "typer[all] (>=0.24.1,<0.25.0)",
+    "websockets (>=16.0)",
 ]
-
 dynamic = ["version"]
 
 [project.scripts]
-exectunnel = "exectunnel.cli:main"
+exectunnel = "exectunnel.cli:app"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
-version = "1.2.0"
+version = "1.2.1"
 
 [tool.poetry.group.dev.dependencies]
 mypy = "^1.19.1"
