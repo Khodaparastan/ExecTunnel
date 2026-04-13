@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import Annotated
 
 import typer
@@ -12,7 +13,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from .._theme import THEME, Icons
+from ..ui import THEME, Icons
 
 __all__ = ["app"]
 
@@ -21,27 +22,70 @@ app = typer.Typer(
     help="Show and validate ExecTunnel configuration.",
 )
 
-console = Console(theme=THEME, highlight=False)
+# Shared console — one instance for all config sub-commands.
+_console = Console(theme=THEME, highlight=False)
 
-_ENV_VARS = [
-    ("EXECTUNNEL_SOCKS_HOST",              "SOCKS5 bind host",              "127.0.0.1"),
-    ("EXECTUNNEL_SOCKS_PORT",              "SOCKS5 bind port",              "1080"),
-    ("EXECTUNNEL_AGENT_TIMEOUT",           "Agent ready timeout (s)",       "30"),
-    ("EXECTUNNEL_SEND_TIMEOUT",            "WS send timeout (s)",           "10"),
-    ("EXECTUNNEL_RECONNECT_MAX_RETRIES",   "Max reconnect retries",         "5"),
-    ("EXECTUNNEL_RECONNECT_BASE_DELAY",    "Reconnect base delay (s)",      "1.0"),
-    ("EXECTUNNEL_RECONNECT_MAX_DELAY",     "Reconnect max delay (s)",       "60.0"),
-    ("EXECTUNNEL_SEND_QUEUE_CAP",          "Send queue capacity",           "512"),
-    ("EXECTUNNEL_CONNECT_MAX_PENDING",     "Max pending connects (global)", "64"),
-    ("EXECTUNNEL_CONNECT_MAX_PER_HOST",    "Max pending connects (per host)","8"),
-    ("EXECTUNNEL_PRE_ACK_BUFFER_CAP",      "Pre-ACK buffer cap (bytes)",    "65536"),
-    ("EXECTUNNEL_DNS_UPSTREAM",            "DNS upstream host",             "(disabled)"),
-    ("EXECTUNNEL_DNS_LOCAL_PORT",          "DNS local port",                "5353"),
-    ("EXECTUNNEL_DNS_MAX_INFLIGHT",        "DNS max inflight queries",      "64"),
-    ("EXECTUNNEL_PING_INTERVAL",           "Keepalive ping interval (s)",   "20"),
-    ("EXECTUNNEL_TOKEN",                   "Bearer token (raw WS mode)",    "(not set)"),
-    ("KUBECONFIG",                         "kubeconfig path",               "~/.kube/config"),
-]
+
+# ── Environment variable registry ─────────────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class _EnvEntry:
+    """Metadata for a single ExecTunnel environment variable."""
+
+    name: str
+    description: str
+    default: str = "(not set)"
+    sensitive: bool = False
+
+
+_ENV_VARS: tuple[_EnvEntry, ...] = (
+    _EnvEntry("EXECTUNNEL_WSS_URL", "WebSocket endpoint (or WSS_URL)"),
+    _EnvEntry("WSS_INSECURE", "Skip TLS verification", "false"),
+    _EnvEntry("EXECTUNNEL_PING_INTERVAL", "Keepalive ping interval (s)", "20"),
+    _EnvEntry("EXECTUNNEL_SEND_TIMEOUT", "WS send timeout (s)", "30"),
+    _EnvEntry("EXECTUNNEL_SEND_QUEUE_CAP", "Send queue capacity", "512"),
+    _EnvEntry("EXECTUNNEL_RECONNECT_MAX_RETRIES", "Max reconnect retries", "10"),
+    _EnvEntry("EXECTUNNEL_RECONNECT_BASE_DELAY", "Reconnect base delay (s)", "1.0"),
+    _EnvEntry("EXECTUNNEL_RECONNECT_MAX_DELAY", "Reconnect max delay (s)", "30.0"),
+    _EnvEntry("EXECTUNNEL_DNS_MAX_INFLIGHT", "DNS max inflight queries", "1024"),
+    _EnvEntry("EXECTUNNEL_CONNECT_MAX_PENDING", "Max pending connects (global)", "128"),
+    _EnvEntry(
+        "EXECTUNNEL_CONNECT_MAX_PENDING_PER_HOST",
+        "Max pending connects (per host)",
+        "16",
+    ),
+    _EnvEntry(
+        "EXECTUNNEL_PRE_ACK_BUFFER_CAP_BYTES", "Pre-ACK buffer cap (bytes)", "65536"
+    ),
+    _EnvEntry("EXECTUNNEL_BOOTSTRAP_DELIVERY", "Agent delivery mode", "upload"),
+    _EnvEntry("EXECTUNNEL_BOOTSTRAP_USE_GO_AGENT", "Use Go agent binary", "false"),
+    _EnvEntry(
+        "EXECTUNNEL_FETCH_AGENT_URL", "Fetch URL for fetch delivery", "(default)"
+    ),
+    _EnvEntry("EXECTUNNEL_TOKEN", "Bearer token (raw WS mode)", sensitive=True),
+)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _current_value_text(entry: _EnvEntry, *, redact: bool) -> Text:
+    """Read the env var for *entry* and return a styled Text renderable.
+
+    * Unset      → ``(default)`` (muted)
+    * Sensitive  → ``***`` (warn) when *redact* is True
+    * Set        → raw value (ok)
+    """
+    raw = os.environ.get(entry.name)
+    if raw is None:
+        return Text("(default)", style="et.muted")
+    if redact and entry.sensitive:
+        return Text("***", style="et.warn")
+    return Text(raw, style="et.ok")
+
+
+# ── Commands ──────────────────────────────────────────────────────────────────
 
 
 @app.command("show")
@@ -52,32 +96,26 @@ def show_config(
     ] = True,
 ) -> None:
     """Display all ExecTunnel environment variables and their current values."""
-    _SENSITIVE = {"EXECTUNNEL_TOKEN"}
-
     table = Table(
         box=box.SIMPLE_HEAD,
-        show_header=True,
         header_style="et.label",
         border_style="et.border",
         expand=True,
     )
-    table.add_column("Variable",    style="et.value",  ratio=3)
-    table.add_column("Description", style="et.muted",  ratio=3)
-    table.add_column("Default",     style="et.muted",  ratio=2)
-    table.add_column("Current",     ratio=2)
+    table.add_column("Variable", style="et.value", ratio=3)
+    table.add_column("Description", style="et.muted", ratio=3)
+    table.add_column("Default", style="et.muted", ratio=2)
+    table.add_column("Current", ratio=2)
 
-    for env_var, description, default in _ENV_VARS:
-        current = os.environ.get(env_var)
-        if current is None:
-            current_text = Text("(default)", style="et.muted")
-        elif redact and env_var in _SENSITIVE:
-            current_text = Text("***", style="et.warn")
-        else:
-            current_text = Text(current, style="et.ok")
+    for entry in _ENV_VARS:
+        table.add_row(
+            entry.name,
+            entry.description,
+            entry.default,
+            _current_value_text(entry, redact=redact),
+        )
 
-        table.add_row(env_var, description, default, current_text)
-
-    console.print(
+    _console.print(
         Panel(
             table,
             title=f"[et.brand]{Icons.BOLT} ExecTunnel Configuration[/et.brand]",
@@ -87,84 +125,56 @@ def show_config(
 
 
 @app.command("validate")
-def validate_config(
-    kubeconfig: Annotated[
-        str | None,
-        typer.Option("--kubeconfig", help="Path to kubeconfig to validate."),
-    ] = None,
-    context: Annotated[
-        str | None,
-        typer.Option("--context", help="kubeconfig context to validate."),
-    ] = None,
-) -> None:
-    """Validate kubeconfig and environment configuration."""
-    import asyncio
-
-    from exectunnel.exceptions import ConfigurationError
-
-    from .._kubectl import KubectlDiscovery
-
+def validate_config() -> None:
+    """Validate current ExecTunnel configuration and report any issues."""
     errors: list[str] = []
     warnings: list[str] = []
     ok_items: list[str] = []
 
-    # ── Port range checks ─────────────────────────────────────────────────────
-    socks_port_str = os.environ.get("EXECTUNNEL_SOCKS_PORT", "1080")
-    try:
-        socks_port = int(socks_port_str)
-        if not 1 <= socks_port <= 65535:
-            raise ValueError
-        ok_items.append(f"SOCKS5 port {socks_port} is valid")
-    except ValueError:
-        errors.append(f"EXECTUNNEL_SOCKS_PORT={socks_port_str!r} is not a valid port")
-
-    # ── kubeconfig check ──────────────────────────────────────────────────────
-    discovery = KubectlDiscovery(kubeconfig=kubeconfig, context=context)
-    try:
-        ctx = discovery.load_context()
-        ok_items.append(f"kubeconfig context {ctx.name!r} loaded successfully")
-        ok_items.append(f"Cluster server: {ctx.server}")
-        if ctx.insecure_skip:
-            warnings.append("insecure-skip-tls-verify is enabled — not recommended")
-        if not ctx.ca_data and not ctx.insecure_skip:
-            warnings.append("No CA certificate found — using system trust store")
-    except ConfigurationError as exc:
-        errors.append(f"kubeconfig: {exc.message}")
-
-    # ── Timeout sanity ────────────────────────────────────────────────────────
-    timeout_str = os.environ.get("EXECTUNNEL_AGENT_TIMEOUT", "30")
-    try:
-        timeout = float(timeout_str)
-        if timeout < 5:
-            warnings.append(
-                f"EXECTUNNEL_AGENT_TIMEOUT={timeout}s is very low — "
-                "bootstrap may time out on slow networks"
-            )
+    # ── WebSocket URL ─────────────────────────────────────────────────────
+    wss_url = os.environ.get("EXECTUNNEL_WSS_URL") or os.environ.get("WSS_URL")
+    if wss_url:
+        if wss_url.startswith(("ws://", "wss://")):
+            ok_items.append("WSS URL is set and has valid scheme")
         else:
-            ok_items.append(f"Agent timeout {timeout}s is reasonable")
-    except ValueError:
-        errors.append(
-            f"EXECTUNNEL_AGENT_TIMEOUT={timeout_str!r} is not a valid number"
-        )
+            errors.append(
+                f"WSS URL must start with ws:// or wss://, got: {wss_url[:40]}"
+            )
+    else:
+        warnings.append("No WSS URL set (EXECTUNNEL_WSS_URL / WSS_URL)")
 
-    # ── Render results ────────────────────────────────────────────────────────
-    console.print(
-        f"\n[et.brand]{Icons.CHECK} Configuration Validation[/et.brand]\n"
-    )
+    # ── Full SessionConfig round-trip ──────────────────────────────────────
+    try:
+        from .._config import build_session_config
+
+        build_session_config()
+        ok_items.append("Full SessionConfig validation passed")
+    except ImportError as exc:
+        # Structural problem — always an error regardless of URL presence.
+        errors.append(f"Cannot import settings module: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        # If the URL is configured, config should succeed → real error.
+        # If the URL is absent, the failure is expected (URL is required) →
+        # downgrade to a warning to avoid redundant noise alongside the
+        # already-flagged "No WSS URL set" warning above.
+        if wss_url:
+            errors.append(f"SessionConfig validation failed: {exc}")
+        else:
+            warnings.append(f"SessionConfig incomplete (URL not set): {exc}")
+
+    # ── Render results ────────────────────────────────────────────────────
+    _console.print(f"\n[et.brand]{Icons.BOLT} Configuration Validation[/et.brand]\n")
     for item in ok_items:
-        console.print(f"  [et.ok]{Icons.CHECK}[/et.ok] {item}")
+        _console.print(f"  [et.ok]{Icons.CHECK}[/et.ok] {item}")
     for item in warnings:
-        console.print(f"  [et.warn]{Icons.WARN}[/et.warn] {item}")
+        _console.print(f"  [et.warn]{Icons.WARN}[/et.warn] {item}")
     for item in errors:
-        console.print(f"  [et.error]{Icons.CROSS}[/et.error] {item}")
+        _console.print(f"  [et.error]{Icons.CROSS}[/et.error] {item}")
 
     if errors:
-        console.print(
+        _console.print(
             f"\n[et.error]{Icons.CROSS} Validation failed with "
             f"{len(errors)} error(s).[/et.error]"
         )
         raise typer.Exit(1)
-    else:
-        console.print(
-            f"\n[et.ok]{Icons.CHECK} All checks passed.[/et.ok]"
-        )
+    _console.print(f"\n[et.ok]{Icons.CHECK} All checks passed.[/et.ok]")
