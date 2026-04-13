@@ -65,9 +65,15 @@ _VALID_DELIVERY_MODES: Final[frozenset[str]] = frozenset({"upload", "fetch"})
 
 # Characters that are unsafe inside single-quoted POSIX shell strings or that
 # could trigger shell expansion / history substitution in any context.
-_SHELL_UNSAFE_CHARS: Final[frozenset[str]] = frozenset(
-    {"'", "`", "$", "\\", "\n", "\r", "!"}
-)
+_SHELL_UNSAFE_CHARS: Final[frozenset[str]] = frozenset({
+    "'",
+    "`",
+    "$",
+    "\\",
+    "\n",
+    "\r",
+    "!",
+})
 
 # Unique marker prefix for file-existence probes.
 _MARKER_PREFIX: Final[str] = "EXECTUNNEL_EXISTS"
@@ -386,8 +392,7 @@ class AgentBootstrapper:
                             self._diag.append(stripped)
         except TimeoutError:
             raise BootstrapError(
-                f"Timed out after {timeout}s waiting for command fence "
-                f"({cmd[:40]!r}).",
+                f"Timed out after {timeout}s waiting for command fence ({cmd[:40]!r}).",
                 details={
                     "command": cmd[:80],
                     "host": self._cfg.wss_url,
@@ -428,9 +433,7 @@ class AgentBootstrapper:
                             before the marker arrives.
         """
         await self._send_command(
-            f"[ -f '{path}' ] "
-            f"&& printf '{_MARKER_YES}\\n' "
-            f"|| printf '{_MARKER_NO}\\n'",
+            f"[ -f '{path}' ] && printf '{_MARKER_YES}\\n' || printf '{_MARKER_NO}\\n'",
         )
 
         buf = ""
@@ -532,8 +535,7 @@ class AgentBootstrapper:
 
         # 4. Decode: convert URL-safe base64 back to standard alphabet.
         await self._send_fenced_command(
-            f"sed 's/-/+/g; s/_/\\//g' '{b64_path}' "
-            f"| base64 -d > '{agent_path}'"
+            f"sed 's/-/+/g; s/_/\\//g' '{b64_path}' | base64 -d > '{agent_path}'"
         )
         metrics_inc(f"bootstrap.{label}.decode_done")
 

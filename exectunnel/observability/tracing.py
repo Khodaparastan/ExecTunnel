@@ -25,19 +25,23 @@ __all__ = [
 ]
 
 _trace_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "exectunnel_trace_id", default=None,
+    "exectunnel_trace_id",
+    default=None,
 )
 _span_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "exectunnel_span_id", default=None,
+    "exectunnel_span_id",
+    default=None,
 )
 _parent_span_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "exectunnel_parent_span_id", default=None,
+    "exectunnel_parent_span_id",
+    default=None,
 )
 
 
 # ------------------------------------------------------------------
 # Public accessors
 # ------------------------------------------------------------------
+
 
 def current_trace_id() -> str | None:
     return _trace_id_var.get()
@@ -55,6 +59,7 @@ def current_parent_span_id() -> str | None:
 # ID generators
 # ------------------------------------------------------------------
 
+
 def _new_trace_id() -> str:
     return secrets.token_hex(16)
 
@@ -66,6 +71,7 @@ def _new_span_id() -> str:
 # ------------------------------------------------------------------
 # Trace lifecycle
 # ------------------------------------------------------------------
+
 
 def start_trace(trace_id: str | None = None) -> str:
     """Start a new trace in the current context.
@@ -84,7 +90,12 @@ def start_trace(trace_id: str | None = None) -> str:
 # Span helpers (shared logic)
 # ------------------------------------------------------------------
 
-def _enter_span(name: str) -> tuple[str, str | None, contextvars.Token[str | None], contextvars.Token[str | None], float]:
+
+def _enter_span(
+    name: str,
+) -> tuple[
+    str, str | None, contextvars.Token[str | None], contextvars.Token[str | None], float
+]:
     """Push a new span onto the context-var stack and return bookkeeping state."""
     parent_span = _span_id_var.get()
     span_id = _new_span_id()
@@ -119,6 +130,7 @@ def _exit_span(
 # Synchronous span
 # ------------------------------------------------------------------
 
+
 @contextmanager
 def span(name: str, **tags: object) -> Iterator[str]:
     """Open a child span (synchronous context manager)."""
@@ -129,14 +141,19 @@ def span(name: str, **tags: object) -> Iterator[str]:
         ok = True
     finally:
         _exit_span(
-            name, ok=ok, span_token=span_tok, parent_token=parent_tok,
-            start=start, tags=tags,
+            name,
+            ok=ok,
+            span_token=span_tok,
+            parent_token=parent_tok,
+            start=start,
+            tags=tags,
         )
 
 
 # ------------------------------------------------------------------
 # Asynchronous span
 # ------------------------------------------------------------------
+
 
 @asynccontextmanager
 async def aspan(name: str, **tags: object) -> AsyncIterator[str]:
@@ -148,6 +165,10 @@ async def aspan(name: str, **tags: object) -> AsyncIterator[str]:
         ok = True
     finally:
         _exit_span(
-            name, ok=ok, span_token=span_tok, parent_token=parent_tok,
-            start=start, tags=tags,
+            name,
+            ok=ok,
+            span_token=span_tok,
+            parent_token=parent_tok,
+            start=start,
+            tags=tags,
         )

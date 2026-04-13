@@ -49,7 +49,8 @@ class _DnsDatagramProtocol(asyncio.DatagramProtocol):
                 type(transport).__name__,
             )
             metrics_inc(
-                "dns.forwarder.error", error="bad_transport_type",
+                "dns.forwarder.error",
+                error="bad_transport_type",
             )
             transport.close()
             return
@@ -356,7 +357,9 @@ class DnsForwarder:
                 await handler.send_datagram(query)
 
                 response = await self._recv_response(
-                    handler, client_addr, flow_id,
+                    handler,
+                    client_addr,
+                    flow_id,
                 )
                 if response is None:
                     # Timeout or agent-closed — already handled inside
@@ -365,24 +368,22 @@ class DnsForwarder:
                         agent_closed = True
                     return
 
-                if (
-                    self._transport is not None
-                    and not self._transport.is_closing()
-                ):
+                if self._transport is not None and not self._transport.is_closing():
                     self._transport.sendto(response, client_addr)
                     self._ok_count += 1
                     self._bytes_out += len(response)
                     metrics_inc("dns.query.ok")
                     metrics_inc(
-                        "dns.query.bytes.out.total", value=len(response),
+                        "dns.query.bytes.out.total",
+                        value=len(response),
                     )
                     metrics_observe(
-                        "dns.query.bytes.out", float(len(response)),
+                        "dns.query.bytes.out",
+                        float(len(response)),
                     )
                 else:
                     logger.debug(
-                        "dns query for %s:%d — transport closed before "
-                        "reply (flow=%s)",
+                        "dns query for %s:%d — transport closed before reply (flow=%s)",
                         client_addr[0],
                         client_addr[1],
                         flow_id,
@@ -440,8 +441,7 @@ class DnsForwarder:
         if response is None:
             metrics_inc("dns.query.error", error="agent_closed_no_response")
             logger.debug(
-                "dns query for %s:%d — agent closed flow before response "
-                "(flow=%s)",
+                "dns query for %s:%d — agent closed flow before response (flow=%s)",
                 client_addr[0],
                 client_addr[1],
                 flow_id,
@@ -468,7 +468,10 @@ class DnsForwarder:
                 "(flow=%s, error_id=%s)"
             )
             args: tuple[object, ...] = (
-                client_addr[0], client_addr[1], flow_id, exc.error_id,
+                client_addr[0],
+                client_addr[1],
+                flow_id,
+                exc.error_id,
             )
         elif isinstance(exc, ConnectionClosedError):
             error_tag = "connection_closed"
@@ -486,26 +489,29 @@ class DnsForwarder:
                 "(flow=%s, error_id=%s)"
             )
             args = (
-                client_addr[0], client_addr[1],
-                exc.error_code, exc.message, flow_id, exc.error_id,
+                client_addr[0],
+                client_addr[1],
+                exc.error_code,
+                exc.message,
+                flow_id,
+                exc.error_id,
             )
         elif isinstance(exc, ExecTunnelError):
             error_tag = exc.error_code.replace(".", "_")
             log_fn = logger.warning
-            msg = (
-                "dns query for %s:%d failed [%s]: %s "
-                "(flow=%s, error_id=%s)"
-            )
+            msg = "dns query for %s:%d failed [%s]: %s (flow=%s, error_id=%s)"
             args = (
-                client_addr[0], client_addr[1],
-                exc.error_code, exc.message, flow_id, exc.error_id,
+                client_addr[0],
+                client_addr[1],
+                exc.error_code,
+                exc.message,
+                flow_id,
+                exc.error_id,
             )
         else:
             error_tag = type(exc).__name__
             log_fn = logger.warning
-            msg = (
-                "dns query for %s:%d unexpected failure: %s (flow=%s)"
-            )
+            msg = "dns query for %s:%d unexpected failure: %s (flow=%s)"
             args = (client_addr[0], client_addr[1], exc, flow_id)
 
         metrics_inc("dns.query.error", error=error_tag)
@@ -592,9 +598,7 @@ class DnsForwarder:
 
     def __repr__(self) -> str:
         state = (
-            "running"
-            if self.is_running
-            else ("stopped" if self._stopped else "new")
+            "running" if self.is_running else ("stopped" if self._stopped else "new")
         )
         return (
             f"<DnsForwarder 127.0.0.1:{self._local_port} → "

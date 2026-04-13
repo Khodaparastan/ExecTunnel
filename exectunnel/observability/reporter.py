@@ -89,7 +89,8 @@ async def run_metrics_reporter(
         log_fn("metrics_summary=%s", json.dumps(summary, sort_keys=True))
         if verbose:
             logger.debug(
-                "metrics_snapshot=%s", json.dumps(snapshot, sort_keys=True),
+                "metrics_snapshot=%s",
+                json.dumps(snapshot, sort_keys=True),
             )
 
     # ------------------------------------------------------------------
@@ -113,7 +114,10 @@ async def run_metrics_reporter(
     async def _emit_snapshot(*, final: bool) -> None:
         snapshot = metrics_snapshot()
         payload = build_obs_payload(
-            snapshot, final=final, platform=obs_platform, service=obs_service,
+            snapshot,
+            final=final,
+            platform=obs_platform,
+            service=obs_service,
         )
         for exporter in exporters:
             try:
@@ -131,7 +135,10 @@ async def run_metrics_reporter(
                 _handle_exporter_failure(exporter, exc, expected=False)
 
     def _handle_exporter_failure(
-        exporter: Exporter, exc: Exception, *, expected: bool,
+        exporter: Exporter,
+        exc: Exception,
+        *,
+        expected: bool,
     ) -> None:
         exporter.failures += 1
         if exporter.failures == 1 or exporter.failures % 20 == 0:

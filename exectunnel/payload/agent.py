@@ -594,7 +594,6 @@ def _send_all_nonblocking(sock: socket.socket, data: bytes) -> bool:
 
 
 class TcpConnectionWorker:
-
     def __init__(
         self,
         conn_id: str,
@@ -940,7 +939,6 @@ class UdpFlowWorker:
 
 
 class _Dispatcher:
-
     def __init__(
         self,
         fixed_host: str | None,

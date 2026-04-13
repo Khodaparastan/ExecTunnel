@@ -1,7 +1,13 @@
 """exectunnel.observability — logging, metrics, tracing & reporting."""
 
 from .exporters import Exporter, build_exporters, build_obs_payload
-from .logging import LevelName, configure_logging
+from .logging import (
+    LevelName,
+    LogEntry,
+    LogRingBuffer,
+    configure_logging,
+    install_ring_buffer,
+)
 from .metrics import (
     METRICS,
     MetricsRegistry,
@@ -32,7 +38,10 @@ __all__ = [
     "build_obs_payload",
     # logging
     "LevelName",
+    "LogEntry",
+    "LogRingBuffer",
     "configure_logging",
+    "install_ring_buffer",
     # metrics
     "METRICS",
     "MetricsRegistry",

@@ -79,4 +79,4 @@ __all__ = [
 # but excluded from __all__ to keep the primary public surface minimal.
 # Prefer `dict[str, TcpConnection]` / `dict[str, UdpFlow]` at annotation sites
 # unless a named alias meaningfully improves readability at the call site.
-__all__ += ["TcpRegistry", "UdpRegistry"]  # noqa: PLE0604 — intentional re-export
+__all__ += ["TcpRegistry", "UdpRegistry"]

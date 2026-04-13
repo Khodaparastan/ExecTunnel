@@ -67,9 +67,11 @@ def parse_float_env(
         return _clamp_float(default, min_value, max_value)
     return result
 
+
 # ------------------------------------------------------------------
 # Internal helpers
 # ------------------------------------------------------------------
+
 
 def _clamp_int(value: int, lo: int | None, hi: int | None) -> int:
     if lo is not None and value < lo:

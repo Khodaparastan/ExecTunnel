@@ -91,14 +91,15 @@ _DOWNSTREAM_BATCH_SIZE: Final[int] = 16
 
 # Minimum sensible pre-ACK buffer cap — one full read chunk.
 _MIN_PRE_ACK_BUFFER_CAP: Final[int] = Defaults.PIPE_READ_CHUNK_BYTES
-
-# Maximum raw bytes per DATA chunk that fit within MAX_FRAME_LEN after
-# base64url encoding (no padding).  Derivation:
-#   overhead = len(FRAME_PREFIX) + len("DATA") + 1 + len(conn_id) + 1 + len(FRAME_SUFFIX)
-#            = 14 + 4 + 1 + 25 + 1 + 3 = 48
-#   b64_budget = MAX_FRAME_LEN - overhead = 8192 - 48 = 8144
-#   max_raw    = floor(8144 * 3 / 4) = 6108
-#   conn_id    = "c" + token_hex(12) = 1 + 24 = 25 chars
+"""
+Maximum raw bytes per DATA chunk that fit within MAX_FRAME_LEN after
+base64url encoding (no padding).  Derivation:
+  overhead = len(FRAME_PREFIX) + len("DATA") + 1 + len(conn_id) + 1 + len(FRAME_SUFFIX)
+           = 14 + 4 + 1 + 25 + 1 + 3 = 48
+  b64_budget = MAX_FRAME_LEN - overhead = 8192 - 48 = 8144
+  max_raw    = floor(8144 * 3 / 4) = 6108
+  conn_id    = "c" + token_hex(12) = 1 + 24 = 25 chars
+"""
 _MAX_DATA_CHUNK_BYTES: Final[int] = 6_108
 
 assert Defaults.PIPE_READ_CHUNK_BYTES <= _MAX_DATA_CHUNK_BYTES, (

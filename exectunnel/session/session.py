@@ -173,22 +173,22 @@ class TunnelSession:
 
                 except WebSocketSendTimeoutError as exc:
                     metrics_inc(
-                        "session.connect.error", error="ws_send_timeout",
+                        "session.connect.error",
+                        error="ws_send_timeout",
                     )
                     reconnect_reason = (
-                        f"ws_send_timeout: {exc.message} "
-                        f"(error_id={exc.error_id})"
+                        f"ws_send_timeout: {exc.message} (error_id={exc.error_id})"
                     )
                     logger.warning(
-                        "WebSocket send timed out [%s] (error_id=%s) "
-                        "— will reconnect",
+                        "WebSocket send timed out [%s] (error_id=%s) — will reconnect",
                         exc.error_code,
                         exc.error_id,
                     )
 
                 except ConnectionClosedError as exc:
                     metrics_inc(
-                        "session.connect.error", error="connection_closed",
+                        "session.connect.error",
+                        error="connection_closed",
                     )
                     reconnect_reason = (
                         f"connection_closed: "
@@ -209,12 +209,10 @@ class TunnelSession:
                         error=exc.error_code.replace(".", "_"),
                     )
                     reconnect_reason = (
-                        f"{exc.error_code}: {exc.message} "
-                        f"(error_id={exc.error_id})"
+                        f"{exc.error_code}: {exc.message} (error_id={exc.error_id})"
                     )
                     logger.warning(
-                        "Transport error [%s]: %s (error_id=%s) "
-                        "— will reconnect",
+                        "Transport error [%s]: %s (error_id=%s) — will reconnect",
                         exc.error_code,
                         exc.message,
                         exc.error_id,
@@ -229,7 +227,8 @@ class TunnelSession:
 
                 except TimeoutError as exc:
                     metrics_inc(
-                        "session.connect.error", error="timeout",
+                        "session.connect.error",
+                        error="timeout",
                     )
                     reconnect_reason = f"timeout: {exc}"
 
@@ -240,7 +239,8 @@ class TunnelSession:
                     self._ws = None
                     session_duration = time.monotonic() - session_start
                     metrics_observe(
-                        "session.duration_sec", session_duration,
+                        "session.duration_sec",
+                        session_duration,
                     )
                     # Zero out all session-level gauges on exit.
                     self._zero_gauges()
@@ -265,7 +265,7 @@ class TunnelSession:
                         ),
                     )
 
-                delay = min(base_delay * (2 ** attempt), max_delay)
+                delay = min(base_delay * (2**attempt), max_delay)
                 jitter = random.uniform(0, delay * _RECONNECT_JITTER)
                 # Do NOT cap after adding jitter — capping would collapse
                 # the jitter range to zero when delay is close to
@@ -341,7 +341,8 @@ class TunnelSession:
                 task.cancel()
         if self._request_tasks:
             await asyncio.gather(
-                *self._request_tasks, return_exceptions=True,
+                *self._request_tasks,
+                return_exceptions=True,
             )
         self._request_tasks.clear()
 
@@ -356,8 +357,7 @@ class TunnelSession:
                 tcp_cleaned += 1
             except Exception:  # noqa: BLE001
                 logger.debug(
-                    "error aborting stale tcp connection during session "
-                    "reset",
+                    "error aborting stale tcp connection during session reset",
                     exc_info=True,
                 )
         self._tcp_registry.clear()
@@ -384,13 +384,16 @@ class TunnelSession:
 
         if tcp_cleaned or pending_cleaned or udp_cleaned:
             metrics_inc(
-                "session.cleanup.tcp", value=tcp_cleaned,
+                "session.cleanup.tcp",
+                value=tcp_cleaned,
             )
             metrics_inc(
-                "session.cleanup.pending", value=pending_cleaned,
+                "session.cleanup.pending",
+                value=pending_cleaned,
             )
             metrics_inc(
-                "session.cleanup.udp", value=udp_cleaned,
+                "session.cleanup.udp",
+                value=udp_cleaned,
             )
             logger.info(
                 "session reset: cleaned %d TCP, %d pending, %d UDP",
@@ -497,7 +500,7 @@ class TunnelSession:
 
         try:
             async with Socks5Server(socks_cfg) as socks:
-                dns_fwd: "DnsForwarder | None" = None
+                dns_fwd: DnsForwarder | None = None
                 if self._tun.dns_upstream:
                     from ._dns import DnsForwarder  # noqa: PLC0415
 
@@ -511,16 +514,15 @@ class TunnelSession:
                         query_timeout=self._tun.dns_query_timeout,
                     )
 
-                async with (dns_fwd if dns_fwd is not None else contextlib.nullcontext()):
-
+                async with dns_fwd if dns_fwd is not None else contextlib.nullcontext():
                     recv_task = asyncio.create_task(
-                        receiver.run(), name="tun-recv-loop",
+                        receiver.run(),
+                        name="tun-recv-loop",
                     )
                     send_task = self._sender.task
                     if send_task is None:
                         raise RuntimeError(
-                            "WsSender.task is None after start() — "
-                            "this is a bug.",
+                            "WsSender.task is None after start() — this is a bug.",
                         )
                     socks_task = asyncio.create_task(
                         self._accept_loop(socks),
@@ -532,11 +534,15 @@ class TunnelSession:
                         interval=float(self._cfg.ping_interval),
                     )
                     keepalive_task = asyncio.create_task(
-                        keepalive.run(), name="tun-keepalive",
+                        keepalive.run(),
+                        name="tun-keepalive",
                     )
 
                     all_tasks = {
-                        recv_task, send_task, socks_task, keepalive_task,
+                        recv_task,
+                        send_task,
+                        socks_task,
+                        keepalive_task,
                     }
 
                     try:
@@ -558,8 +564,7 @@ class TunnelSession:
                                 )
                                 if isinstance(exc, ExecTunnelError):
                                     logger.error(
-                                        "task %s failed [%s]: %s "
-                                        "(error_id=%s)",
+                                        "task %s failed [%s]: %s (error_id=%s)",
                                         task.get_name(),
                                         exc.error_code,
                                         exc.message,
@@ -576,7 +581,9 @@ class TunnelSession:
                                     "task %s traceback",
                                     task.get_name(),
                                     exc_info=(
-                                        type(exc), exc, exc.__traceback__,
+                                        type(exc),
+                                        exc,
+                                        exc.__traceback__,
                                     ),
                                 )
                                 if first_exc is None:
@@ -590,7 +597,8 @@ class TunnelSession:
                         await self._sender.stop()
 
                         await asyncio.gather(
-                            *all_tasks, return_exceptions=True,
+                            *all_tasks,
+                            return_exceptions=True,
                         )
 
                         for task in list(self._request_tasks):
@@ -652,7 +660,8 @@ class TunnelSession:
             return
 
         metrics_inc(
-            "session.request.error", error=type(exc).__name__,
+            "session.request.error",
+            error=type(exc).__name__,
         )
         if isinstance(exc, ExecTunnelError):
             logger.error(
@@ -665,11 +674,15 @@ class TunnelSession:
             )
         elif isinstance(exc, OSError):
             logger.warning(
-                "request task %s failed: %s", task.get_name(), exc,
+                "request task %s failed: %s",
+                task.get_name(),
+                exc,
             )
         else:
             logger.error(
-                "request task %s failed: %s", task.get_name(), exc,
+                "request task %s failed: %s",
+                task.get_name(),
+                exc,
             )
         logger.debug(
             "request task %s traceback",
@@ -681,7 +694,6 @@ class TunnelSession:
         """Dispatch a single SOCKS5 request to the appropriate handler."""
         if self._dispatcher is None:
             raise RuntimeError(
-                "_handle_request called before _dispatcher was "
-                "initialised.",
+                "_handle_request called before _dispatcher was initialised.",
             )
         await self._dispatcher.dispatch(req)

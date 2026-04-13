@@ -30,6 +30,7 @@ __all__ = [
 # Tag helpers
 # ------------------------------------------------------------------
 
+
 def _normalize_tags(tags: dict[str, object] | None) -> tuple[tuple[str, str], ...]:
     """Sort and stringify tag values.
 
@@ -58,8 +59,10 @@ def _render_metric_key(name: str, tags: tuple[tuple[str, str], ...]) -> str:
 # Metric types
 # ------------------------------------------------------------------
 
+
 class HistogramSnapshot(NamedTuple):
     """Immutable copy of a histogram's state at a point in time."""
+
     count: int
     total: float
     min: float | None
@@ -127,7 +130,10 @@ class MetricsRegistry:
     # -- Counter ---------------------------------------------------
 
     def inc(
-        self, name: str, value: int = 1, tags: dict[str, object] | None = None,
+        self,
+        name: str,
+        value: int = 1,
+        tags: dict[str, object] | None = None,
     ) -> None:
         key: _TagKey = (name, _normalize_tags(tags))
         with self._lock:
@@ -136,7 +142,10 @@ class MetricsRegistry:
     # -- Histogram -------------------------------------------------
 
     def observe(
-        self, name: str, value: float, tags: dict[str, object] | None = None,
+        self,
+        name: str,
+        value: float,
+        tags: dict[str, object] | None = None,
     ) -> None:
         key: _TagKey = (name, _normalize_tags(tags))
         with self._lock:
@@ -149,7 +158,10 @@ class MetricsRegistry:
     # -- Gauge -----------------------------------------------------
 
     def gauge_set(
-        self, name: str, value: float, tags: dict[str, object] | None = None,
+        self,
+        name: str,
+        value: float,
+        tags: dict[str, object] | None = None,
     ) -> None:
         key: _TagKey = (name, _normalize_tags(tags))
         with self._lock:
@@ -157,7 +169,10 @@ class MetricsRegistry:
             g.set(value)
 
     def gauge_inc(
-        self, name: str, delta: float = 1.0, tags: dict[str, object] | None = None,
+        self,
+        name: str,
+        delta: float = 1.0,
+        tags: dict[str, object] | None = None,
     ) -> None:
         key: _TagKey = (name, _normalize_tags(tags))
         with self._lock:
@@ -165,7 +180,10 @@ class MetricsRegistry:
             g.inc(delta)
 
     def gauge_dec(
-        self, name: str, delta: float = 1.0, tags: dict[str, object] | None = None,
+        self,
+        name: str,
+        delta: float = 1.0,
+        tags: dict[str, object] | None = None,
     ) -> None:
         key: _TagKey = (name, _normalize_tags(tags))
         with self._lock:
@@ -247,6 +265,7 @@ def unregister_all_listeners() -> None:
 # ------------------------------------------------------------------
 # Convenience module-level helpers
 # ------------------------------------------------------------------
+
 
 def metrics_inc(metric: str, value: int = 1, **tags: object) -> None:
     METRICS.inc(metric, value=value, tags=tags or None)

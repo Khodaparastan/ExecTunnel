@@ -16,6 +16,9 @@ import json
 import logging
 import os
 import sys
+import threading
+from collections import deque
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
 
@@ -23,6 +26,8 @@ from .tracing import current_span_id, current_trace_id
 
 __all__ = [
     "LevelName",
+    "LogEntry",
+    "LogRingBuffer",
     "configure_logging",
 ]
 
@@ -54,6 +59,71 @@ except ImportError:
 
 
 # ------------------------------------------------------------------
+# Log ring buffer
+# ------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class LogEntry:
+    """A single captured log record for dashboard display."""
+
+    ts: str
+    level: str
+    logger: str
+    message: str
+
+
+class LogRingBuffer(logging.Handler):
+    """A logging handler that stores the last *maxlen* formatted entries.
+
+    Thread-safe.  Attach to the ``exectunnel`` logger hierarchy via
+    :func:`install_ring_buffer` or manually::
+
+        buf = LogRingBuffer(maxlen=200)
+        logging.getLogger("exectunnel").addHandler(buf)
+    """
+
+    def __init__(self, maxlen: int = 200, level: int = logging.DEBUG) -> None:
+        super().__init__(level)
+        self._entries: deque[LogEntry] = deque(maxlen=maxlen)
+        self._lock = threading.Lock()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        entry = LogEntry(
+            ts=datetime.now(UTC).strftime("%H:%M:%S"),
+            level=record.levelname,
+            logger=record.name.removeprefix("exectunnel.")
+            if record.name.startswith("exectunnel.")
+            else record.name,
+            message=record.getMessage(),
+        )
+        with self._lock:
+            self._entries.append(entry)
+
+    def entries(self) -> list[LogEntry]:
+        """Return a snapshot of buffered entries (oldest first)."""
+        with self._lock:
+            return list(self._entries)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+
+def install_ring_buffer(
+    maxlen: int = 200,
+    level: int = logging.DEBUG,
+) -> LogRingBuffer:
+    """Create a :class:`LogRingBuffer` and attach it to the ``exectunnel`` logger.
+
+    Returns the buffer so the caller can read :meth:`LogRingBuffer.entries`.
+    """
+    buf = LogRingBuffer(maxlen=maxlen, level=level)
+    logging.getLogger("exectunnel").addHandler(buf)
+    return buf
+
+
+# ------------------------------------------------------------------
 # Trace context filter
 # ------------------------------------------------------------------
 
@@ -76,6 +146,7 @@ class _TraceContextFilter(logging.Filter):
 # ------------------------------------------------------------------
 # Formatters
 # ------------------------------------------------------------------
+
 
 class _JsonLogFormatter(logging.Formatter):
     """Emit each log record as a single JSON object."""
@@ -150,6 +221,7 @@ class _ConsoleFormatter(logging.Formatter):
 # Helpers
 # ------------------------------------------------------------------
 
+
 def _color_enabled() -> bool:
     mode = os.getenv("EXECTUNNEL_LOG_COLOR", "auto").strip().lower()
     if mode in {"0", "false", "no", "off", "never"}:
@@ -160,7 +232,9 @@ def _color_enabled() -> bool:
 
 
 def _add_observability_context(
-    _logger: Any, _method_name: str, event_dict: dict[str, Any],
+    _logger: Any,
+    _method_name: str,
+    event_dict: dict[str, Any],
 ) -> dict[str, Any]:
     event_dict.setdefault("trace_id", current_trace_id() or "-")
     event_dict.setdefault("span_id", current_span_id() or "-")

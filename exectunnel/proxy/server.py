@@ -312,7 +312,9 @@ class Socks5Server:
                 return
 
             metrics_inc("socks5.handshakes.ok", cmd=req.cmd.name)
-            metrics_observe("socks5.handshake_duration_sec", time.monotonic() - handshake_start)
+            metrics_observe(
+                "socks5.handshake_duration_sec", time.monotonic() - handshake_start
+            )
             logger.debug(
                 "socks5 handshake ok: cmd=%s host=%s port=%d",
                 req.cmd.name,

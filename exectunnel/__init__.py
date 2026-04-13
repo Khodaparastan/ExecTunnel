@@ -1,5 +1,4 @@
 from exectunnel._version import __version__
-from exectunnel.config import AppConfig, BridgeConfig, TunnelConfig
 from exectunnel.exceptions import (
     AgentReadyTimeoutError,
     AgentSyntaxError,
@@ -10,16 +9,16 @@ from exectunnel.exceptions import (
     TransportError,
     WebSocketSendTimeoutError,
 )
+from exectunnel.session import SessionConfig, TunnelConfig
 
 __all__ = [
     "AgentReadyTimeoutError",
     "AgentSyntaxError",
-    "AppConfig",
     "BootstrapError",
-    "BridgeConfig",
     "ConfigurationError",
     "ExecTunnelError",
     "ProtocolError",
+    "SessionConfig",
     "TransportError",
     "TunnelConfig",
     "WebSocketSendTimeoutError",

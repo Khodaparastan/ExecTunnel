@@ -46,6 +46,7 @@ _HTTP_RETRY_BACKOFF_BASE = 0.5  # seconds
 # Header parsing
 # ------------------------------------------------------------------
 
+
 def parse_headers(raw: str) -> dict[str, str]:
     """Parse semicolon-separated ``key=value`` pairs into a header dict.
 
@@ -67,6 +68,7 @@ def parse_headers(raw: str) -> dict[str, str]:
 # Timestamp helper
 # ------------------------------------------------------------------
 
+
 def utc_now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -74,6 +76,7 @@ def utc_now_iso() -> str:
 # ------------------------------------------------------------------
 # Payload builders
 # ------------------------------------------------------------------
+
 
 def build_obs_payload(
     snapshot: dict[str, object],
@@ -121,9 +124,11 @@ def build_obs_payload(
 # Exporter data class
 # ------------------------------------------------------------------
 
+
 @dataclass
 class Exporter:
     """A named async callable that ships an observability payload somewhere."""
+
     name: str
     emit: Callable[[dict[str, object]], Awaitable[None]]
     failures: int = field(default=0, repr=False)
@@ -144,6 +149,7 @@ EXPORTER_ERRORS: tuple[type[Exception], ...] = (
 # Factory
 # ------------------------------------------------------------------
 
+
 def build_exporters(
     logger: logging.Logger,
     *,
@@ -160,10 +166,13 @@ def build_exporters(
 
     # -- shared config --
     file_path = os.getenv(
-        "EXECTUNNEL_OBS_FILE_PATH", "exectunnel-observability.jsonl",
+        "EXECTUNNEL_OBS_FILE_PATH",
+        "exectunnel-observability.jsonl",
     )
     file_max_bytes = parse_int_env(
-        "EXECTUNNEL_OBS_FILE_MAX_BYTES", _FILE_MAX_BYTES_DEFAULT, min_value=1024,
+        "EXECTUNNEL_OBS_FILE_MAX_BYTES",
+        _FILE_MAX_BYTES_DEFAULT,
+        min_value=1024,
     )
     http_url = os.getenv("EXECTUNNEL_OBS_HTTP_URL", "").strip()
     try:
@@ -221,7 +230,10 @@ def build_exporters(
         attempts = max(1, http_max_retries + 1)
         for attempt in range(attempts):
             req = urllib_request.Request(
-                http_url, data=body, headers=headers, method="POST",
+                http_url,
+                data=body,
+                headers=headers,
+                method="POST",
             )
             try:
                 with urllib_request.urlopen(req, timeout=http_timeout) as resp:
@@ -233,7 +245,7 @@ def build_exporters(
             except (urllib_error.URLError, OSError, RuntimeError) as exc:
                 last_exc = exc
                 if attempt < http_max_retries:
-                    time.sleep(_HTTP_RETRY_BACKOFF_BASE * (2 ** attempt))
+                    time.sleep(_HTTP_RETRY_BACKOFF_BASE * (2**attempt))
         raise last_exc  # type: ignore[misc]
 
     async def _emit_http(payload: dict[str, object]) -> None:

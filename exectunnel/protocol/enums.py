@@ -73,9 +73,10 @@ class AuthMethod(_StrictIntEnum):
         return self not in _AUTH_METHOD_UNSUPPORTED
 
 
-_AUTH_METHOD_UNSUPPORTED: Final[frozenset[AuthMethod]] = frozenset(
-    {AuthMethod.GSSAPI, AuthMethod.USERNAME_PASSWORD}
-)
+_AUTH_METHOD_UNSUPPORTED: Final[frozenset[AuthMethod]] = frozenset({
+    AuthMethod.GSSAPI,
+    AuthMethod.USERNAME_PASSWORD,
+})
 
 
 class Cmd(_StrictIntEnum):
