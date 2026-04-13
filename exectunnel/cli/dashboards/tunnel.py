@@ -3,237 +3,296 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from datetime import timedelta
-from typing import TYPE_CHECKING
 
 from rich import box
 from rich.align import Align
-from rich.columns import Columns
-from rich.console import Console
+from rich.console import Console, Group
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
-from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
-from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
-from ._health import HealthMonitor, TunnelHealth
-from ._theme import THEME, Icons
+from ..metrics import HealthMonitor, TunnelHealth
+from ..ui import Icons
 
-if TYPE_CHECKING:
-    pass
+__all__ = ["TunnelDashboard"]
 
-__all__ = ["Dashboard"]
+try:
+    from exectunnel.observability.logging import LogRingBuffer
+except ImportError:  # pragma: no cover
+    LogRingBuffer = None  # type: ignore[assignment,misc]
 
-_REFRESH_HZ = 4  # renders per second
+_REFRESH_HZ: int = 4
+_FRAME_INTERVAL: float = 1.0 / _REFRESH_HZ
+_MAX_VISIBLE_CONNS: int = 18
+_URL_MAX_DISPLAY: int = 72
+
+_ACTIVE_CONN_STATES: frozenset[str] = frozenset({"open", "pending"})
+
+_CONN_STATE_STYLES: dict[str, str] = {
+    "open": "et.conn.open",
+    "pending": "et.conn.pend",
+    "closing": "et.warn",
+    "closed": "et.conn.closed",
+}
+
+_POD_PHASE_STYLES: dict[str, str] = {
+    "Running": "et.stat.good",
+    "Pending": "et.stat.warn",
+    "Failed": "et.stat.bad",
+}
+
+
+# ── Pure formatting helpers ───────────────────────────────────────────────────
 
 
 def _fmt_bytes(n: int) -> str:
+    value = float(n)
     for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024:
-            return f"{n:.1f} {unit}"
-        n //= 1024
-    return f"{n} PB"
+        if value < 1024.0:
+            return f"{value:.1f} {unit}"
+        value /= 1024.0
+    return f"{value:.1f} PB"
 
 
 def _fmt_uptime(secs: float) -> str:
     td = timedelta(seconds=int(secs))
     h, rem = divmod(td.seconds, 3600)
-    m, s   = divmod(rem, 60)
-    days   = td.days
-    if days:
-        return f"{days}d {h:02d}:{m:02d}:{s:02d}"
+    m, s = divmod(rem, 60)
+    if td.days:
+        return f"{td.days}d {h:02d}:{m:02d}:{s:02d}"
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 def _status_dot(ok: bool) -> Text:
-    if ok:
-        return Text("● ", style="et.ok") + Text("Connected", style="et.ok")
-    return Text("● ", style="et.error") + Text("Disconnected", style="et.error")
+    style = "et.ok" if ok else "et.error"
+    label = "Connected" if ok else "Disconnected"
+    return Text.assemble(Text("● ", style=style), Text(label, style=style))
 
 
 def _ack_rate(h: TunnelHealth) -> str:
     total = h.ack_ok + h.ack_failed
     if total == 0:
         return "—"
-    rate = h.ack_ok / total * 100
-    return f"{rate:.1f}%"
+    return f"{h.ack_ok / total * 100:.1f}%"
 
 
-class Dashboard:
+def _truncate_url(url: str, max_len: int = _URL_MAX_DISPLAY) -> str:
+    if len(url) > max_len + 3:
+        return url[:max_len] + "…"
+    return url
+
+
+def _label_col() -> Table:
+    """Return a two-column grid configured for key/value rows."""
+    t = Table.grid(padding=(0, 1))
+    t.add_column(style="et.label", min_width=14)
+    t.add_column(style="et.value")
+    return t
+
+
+def _err_style(count: int) -> str:
+    """Return a style based on whether the error count is non-zero."""
+    return "et.stat.bad" if count else "et.muted"
+
+
+# ── TunnelDashboard ───────────────────────────────────────────────────────────
+
+
+class TunnelDashboard:
     """Full-screen live dashboard for an active tunnel session.
 
-    Args:
-        monitor:    ``HealthMonitor`` instance to poll.
-        console:    Rich console (shared with CLI).
-        ws_url:     WebSocket URL displayed in the header.
-        kubectl_ctx: kubectl context name, or ``None`` for raw WS mode.
+    Lifecycle
+    ---------
+    ``run_until_cancelled()`` enters a ``Rich.Live`` context and refreshes
+    the layout at *_REFRESH_HZ* Hz until the task is cancelled.  The caller
+    cancels the task when the tunnel session ends or a stop signal is received.
+
+    The drift-corrected sleep loop ensures the effective refresh rate stays
+    close to the requested Hz even when rendering takes non-trivial time.
     """
 
-    __slots__ = (
-        "_monitor",
-        "_console",
-        "_ws_url",
-        "_kubectl_ctx",
-        "_live",
-        "_running",
-    )
+    __slots__ = ("_monitor", "_console", "_ws_url", "_stop_event", "_log_buffer")
 
     def __init__(
         self,
         monitor: HealthMonitor,
         console: Console,
         ws_url: str,
-        kubectl_ctx: str | None = None,
+        log_buffer: LogRingBuffer | None = None,
     ) -> None:
-        self._monitor    = monitor
-        self._console    = console
-        self._ws_url     = ws_url
-        self._kubectl_ctx = kubectl_ctx
-        self._live: Live | None = None
-        self._running    = False
-
-    # ── Lifecycle ─────────────────────────────────────────────────────────────
+        self._monitor = monitor
+        self._console = console
+        self._ws_url = ws_url
+        self._stop_event = asyncio.Event()
+        self._log_buffer = log_buffer
 
     async def run_until_cancelled(self) -> None:
-        """Render the dashboard until the task is cancelled."""
-        self._running = True
+        """Drive the live display until cancelled or :meth:`stop` is called."""
+        loop = asyncio.get_running_loop()
         with Live(
             self._render(),
             console=self._console,
             refresh_per_second=_REFRESH_HZ,
             screen=True,
         ) as live:
-            self._live = live
             try:
-                while self._running:
+                deadline = loop.time() + _FRAME_INTERVAL
+                while not self._stop_event.is_set():
                     live.update(self._render())
-                    await asyncio.sleep(1.0 / _REFRESH_HZ)
+                    sleep_for = max(0.0, deadline - loop.time())
+                    await asyncio.sleep(sleep_for)
+                    deadline += _FRAME_INTERVAL
             except asyncio.CancelledError:
                 pass
-            finally:
-                self._running = False
 
     def stop(self) -> None:
-        self._running = False
+        """Request a clean exit from :meth:`run_until_cancelled`."""
+        self._stop_event.set()
 
-    # ── Rendering ─────────────────────────────────────────────────────────────
+    # ── Layout ────────────────────────────────────────────────────────────
 
     def _render(self) -> Layout:
         h = self._monitor.snapshot()
         layout = Layout()
 
-        layout.split_column(
-            Layout(name="header",  size=4),
-            Layout(name="body",    ratio=1),
-            Layout(name="footer",  size=3),
-        )
-        layout["body"].split_row(
-            Layout(name="left",   ratio=2),
-            Layout(name="right",  ratio=3),
-        )
-        layout["left"].split_column(
-            Layout(name="tunnel",  ratio=2),
-            Layout(name="pod",     ratio=2),
-            Layout(name="dns",     ratio=1),
-        )
-        layout["right"].split_column(
-            Layout(name="traffic", ratio=2),
-            Layout(name="conns",   ratio=3),
+        has_logs = self._log_buffer is not None
+
+        if has_logs:
+            layout.split_column(
+                Layout(name="header", size=3),
+                Layout(name="stats", size=16),
+                Layout(name="lower"),
+                Layout(name="footer", size=3),
+            )
+            layout["lower"].split_row(
+                Layout(name="conns"),
+                Layout(name="logs"),
+            )
+            layout["logs"].update(self._render_logs())
+        else:
+            layout.split_column(
+                Layout(name="header", size=3),
+                Layout(name="stats", size=16),
+                Layout(name="conns"),
+                Layout(name="footer", size=3),
+            )
+
+        layout["stats"].split_row(
+            Layout(name="tunnel"),
+            Layout(name="traffic"),
+            Layout(name="dns_pod"),
         )
 
         layout["header"].update(self._render_header(h))
         layout["tunnel"].update(self._render_tunnel(h))
-        layout["pod"].update(self._render_pod(h))
-        layout["dns"].update(self._render_dns(h))
         layout["traffic"].update(self._render_traffic(h))
+        layout["dns_pod"].update(self._render_dns_pod(h))
         layout["conns"].update(self._render_connections(h))
         layout["footer"].update(self._render_footer(h))
 
         return layout
 
-    # ── Header ────────────────────────────────────────────────────────────────
+    # ── Panels ────────────────────────────────────────────────────────────
 
     def _render_header(self, h: TunnelHealth) -> Panel:
-        mode = (
-            f"[et.muted]kubectl ctx:[/et.muted] [et.value]{self._kubectl_ctx}[/et.value]  "
-            if self._kubectl_ctx
-            else "[et.muted]mode:[/et.muted] [et.value]raw WebSocket[/et.value]  "
-        )
-        url_short = (
-            self._ws_url[:72] + "…"
-            if len(self._ws_url) > 75
-            else self._ws_url
-        )
-        status = _status_dot(h.connected)
-        uptime = Text(
-            f"  {Icons.CLOCK} {_fmt_uptime(h.uptime_secs)}",
-            style="et.muted",
-        )
-        reconnects = (
-            Text(
-                f"  {Icons.RECONNECT} {h.reconnect_count}",
-                style="et.warn" if h.reconnect_count else "et.muted",
-            )
-        )
-
-        title_row = Text.assemble(
+        url_short = _truncate_url(self._ws_url)
+        parts: list[Text] = [
             Text(f" {Icons.TUNNEL} ExecTunnel  ", style="et.brand"),
-            status,
-            uptime,
-            reconnects,
-            Text(f"  {mode}", style=""),
-            Text(f"[et.muted]{Icons.GLOBE} {url_short}[/et.muted]"),
-        )
+            _status_dot(h.connected),
+            Text(f"  {Icons.CLOCK} {_fmt_uptime(h.uptime_secs)}", style="et.muted"),
+        ]
+        if h.reconnect_count:
+            parts.append(
+                Text(f"  {Icons.RECONNECT} {h.reconnect_count}", style="et.warn")
+            )
+        parts.append(Text(f"  {Icons.GLOBE} {url_short}", style="et.muted"))
+
         return Panel(
-            Align.left(title_row),
+            Align.left(Text.assemble(*parts)),
             style="et.border",
             padding=(0, 1),
         )
 
-    # ── Tunnel panel ──────────────────────────────────────────────────────────
+    @staticmethod
+    def _render_tunnel(h: TunnelHealth) -> Panel:
+        t = _label_col()
 
-    def _render_tunnel(self, h: TunnelHealth) -> Panel:
-        t = Table.grid(padding=(0, 2))
-        t.add_column(style="et.label",  min_width=18)
-        t.add_column(style="et.value",  min_width=16)
-        t.add_column(style="et.label",  min_width=18)
-        t.add_column(style="et.value")
-
-        socks_val = Text(
-            f"{h.socks_host}:{h.socks_port}",
-            style="et.stat.good" if h.socks_ok else "et.stat.bad",
-        )
-        ack_style = (
-            "et.stat.good" if h.ack_failed == 0
-            else "et.stat.warn" if h.ack_failed < 5
-            else "et.stat.bad"
-        )
-
+        socks_style = "et.stat.good" if h.socks_ok else "et.stat.bad"
         t.add_row(
-            f"{Icons.SOCKS} SOCKS5",       socks_val,
+            f"{Icons.SOCKS} SOCKS5",
+            Text(f"{h.socks_host}:{h.socks_port}", style=socks_style),
+        )
+        t.add_row(
             f"{Icons.LOCK} Bootstrap",
-            Text("OK", style="et.stat.good") if h.bootstrap_ok
-            else Text("—", style="et.stat.idle"),
+            Text("OK", style="et.stat.good")
+            if h.bootstrap_ok
+            else Text("pending…", style="et.stat.warn"),
         )
-        t.add_row(
-            f"{Icons.BOLT} Frames sent",   str(h.frames_sent),
-            f"{Icons.BOLT} Frames recv",   str(h.frames_recv),
-        )
+        if h.bootstrap_duration is not None:
+            t.add_row(
+                "  boot time",
+                Text(f"{h.bootstrap_duration:.1f}s", style="et.muted"),
+            )
+        t.add_row(f"{Icons.BOLT} Sent", str(h.frames_sent))
+        t.add_row(f"{Icons.BOLT} Recv", str(h.frames_recv))
         t.add_row(
             f"{Icons.WARN} Dropped",
-            Text(str(h.frames_dropped), style="et.stat.bad" if h.frames_dropped else "et.muted"),
-            f"{Icons.HEART} ACK rate",
-            Text(_ack_rate(h), style=ack_style),
+            Text(str(h.frames_dropped), style=_err_style(h.frames_dropped)),
+        )
+
+        frame_errs = (
+            h.frames_decode_errors
+            + h.frames_orphaned
+            + h.frames_noise
+            + h.frames_outbound_timeout
+            + h.frames_outbound_ws_closed
+        )
+        if frame_errs:
+            t.add_row(
+                f"{Icons.WARN} Frame errs",
+                Text(str(frame_errs), style="et.stat.bad"),
+            )
+
+        queue_str = (
+            f"{h.send_queue_depth}/{h.send_queue_cap}" if h.send_queue_cap else "—"
+        )
+        t.add_row(f"{Icons.ARROW_UP} Queue", queue_str)
+        if h.request_tasks:
+            t.add_row("  tasks", str(h.request_tasks))
+
+        t.add_row("", "")
+
+        hs_err = h.socks5_handshakes_error + h.socks5_handshakes_timeout
+        hs_err_style = _err_style(hs_err)
+
+        t.add_row(
+            f"{Icons.SOCKS} S5 accept",
+            Text(str(h.socks5_accepted), style="et.value"),
+        )
+        if h.socks5_active:
+            t.add_row(
+                f"{Icons.SOCKS} S5 active",
+                Text(str(h.socks5_active), style="et.conn.open"),
+            )
+        t.add_row(
+            f"{Icons.SOCKS} S5 hs ok",
+            Text(
+                str(h.socks5_handshakes_ok),
+                style="et.stat.good" if h.socks5_handshakes_ok else "et.muted",
+            ),
         )
         t.add_row(
-            f"{Icons.ARROW_UP} Queue",
-            f"{h.send_queue_depth}/{h.send_queue_cap}" if h.send_queue_cap else "—",
-            f"{Icons.RECONNECT} Reconnects",
-            Text(str(h.reconnect_count), style="et.warn" if h.reconnect_count else "et.muted"),
+            f"{Icons.WARN} S5 hs err",
+            Text(str(hs_err), style=hs_err_style),
         )
+        if h.socks5_cmd_udp:
+            t.add_row(
+                f"{Icons.GLOBE} UDP relays",
+                f"{h.socks5_udp_relays_active} active / {h.socks5_cmd_udp} total",
+            )
 
         return Panel(
             t,
@@ -242,127 +301,69 @@ class Dashboard:
             padding=(0, 1),
         )
 
-    # ── Pod panel ─────────────────────────────────────────────────────────────
-
-    def _render_pod(self, h: TunnelHealth) -> Panel:
-        if not h.pod_name:
-            return Panel(
-                Align.center(
-                    Text("No pod metadata (raw WS mode)", style="et.muted")
-                ),
-                title=f"[et.brand]{Icons.POD} Pod[/et.brand]",
-                border_style="et.border",
-                padding=(0, 1),
-            )
-
-        phase_style = {
-            "Running":   "et.stat.good",
-            "Pending":   "et.stat.warn",
-            "Failed":    "et.stat.bad",
-            "Succeeded": "et.muted",
-            "Unknown":   "et.stat.warn",
-        }.get(h.pod_phase, "et.muted")
-
-        t = Table.grid(padding=(0, 2))
-        t.add_column(style="et.label", min_width=14)
-        t.add_column(style="et.value", min_width=20)
-        t.add_column(style="et.label", min_width=14)
-        t.add_column(style="et.value")
+    @staticmethod
+    def _render_traffic(h: TunnelHealth) -> Panel:
+        t = _label_col()
 
         t.add_row(
-            "Name",      h.pod_name,
-            "Namespace", h.pod_namespace,
+            f"{Icons.BYTES_UP} TCP open", Text(str(h.tcp_open), style="et.conn.open")
         )
         t.add_row(
-            "Node",      h.pod_node or "—",
-            "IP",        h.pod_ip or "—",
-        )
-        t.add_row(
-            "Phase",
-            Text(h.pod_phase or "—", style=phase_style),
-            "Conditions", "",
-        )
-
-        # Conditions row
-        cond_parts = []
-        for cond in h.pod_conditions:
-            ctype  = cond.get("type", "")
-            status = cond.get("status", "")
-            style  = "et.stat.good" if status == "True" else "et.stat.bad"
-            cond_parts.append(Text(f"{ctype}:{status} ", style=style))
-
-        if cond_parts:
-            cond_text = Text.assemble(*cond_parts)
-            t.add_row("", "", "", cond_text)
-
-        return Panel(
-            t,
-            title=f"[et.brand]{Icons.POD} Pod[/et.brand]",
-            border_style="et.border",
-            padding=(0, 1),
-        )
-
-    # ── DNS panel ─────────────────────────────────────────────────────────────
-
-    def _render_dns(self, h: TunnelHealth) -> Panel:
-        if not h.dns_enabled:
-            body = Text("DNS forwarding disabled", style="et.muted")
-        else:
-            ok_rate = (
-                f"{h.dns_ok / h.dns_queries * 100:.1f}%"
-                if h.dns_queries
-                else "—"
-            )
-            body = Text.assemble(
-                Text(f"{Icons.DNS} Queries: ", style="et.label"),
-                Text(str(h.dns_queries), style="et.value"),
-                Text("  OK: ", style="et.label"),
-                Text(ok_rate, style="et.stat.good"),
-                Text("  Dropped: ", style="et.label"),
-                Text(
-                    str(h.dns_dropped),
-                    style="et.stat.bad" if h.dns_dropped else "et.muted",
-                ),
-            )
-
-        return Panel(
-            body,
-            title=f"[et.brand]{Icons.DNS} DNS[/et.brand]",
-            border_style="et.border",
-            padding=(0, 1),
-        )
-
-    # ── Traffic panel ─────────────────────────────────────────────────────────
-
-    def _render_traffic(self, h: TunnelHealth) -> Panel:
-        t = Table.grid(padding=(0, 2))
-        t.add_column(style="et.label", min_width=16)
-        t.add_column(style="et.value", min_width=12)
-        t.add_column(style="et.label", min_width=16)
-        t.add_column(style="et.value")
-
-        t.add_row(
-            f"{Icons.BYTES_UP} TCP open",
-            Text(str(h.tcp_open), style="et.conn.open"),
             f"{Icons.BYTES_DOWN} TCP pending",
             Text(str(h.tcp_pending), style="et.conn.pend"),
         )
+        t.add_row("TCP total", str(h.tcp_total))
+        t.add_row("TCP failed", Text(str(h.tcp_failed), style=_err_style(h.tcp_failed)))
+        if h.tcp_completed:
+            t.add_row("TCP completed", str(h.tcp_completed))
+        if h.tcp_errors:
+            t.add_row("TCP errors", Text(str(h.tcp_errors), style="et.stat.bad"))
         t.add_row(
-            "TCP total",    str(h.tcp_total),
-            "TCP failed",
-            Text(str(h.tcp_failed), style="et.stat.bad" if h.tcp_failed else "et.muted"),
+            f"{Icons.BYTES_UP} Bytes up",
+            Text(_fmt_bytes(h.bytes_up_total), style="et.value"),
         )
         t.add_row(
-            f"{Icons.GLOBE} UDP open",
-            Text(str(h.udp_open), style="et.conn.open"),
-            "UDP total",    str(h.udp_total),
+            f"{Icons.BYTES_DOWN} Bytes down",
+            Text(_fmt_bytes(h.bytes_down_total), style="et.value"),
         )
-        t.add_row(
-            f"{Icons.BYTES_UP} ACK ok",
-            Text(str(h.ack_ok), style="et.stat.good"),
-            f"{Icons.WARN} ACK timeout",
-            Text(str(h.ack_timeout), style="et.stat.bad" if h.ack_timeout else "et.muted"),
-        )
+
+        ack_style: str
+        if h.ack_failed == 0:
+            ack_style = "et.stat.good"
+        elif h.ack_failed < 5:
+            ack_style = "et.stat.warn"
+        else:
+            ack_style = "et.stat.bad"
+
+        t.add_row(f"{Icons.HEART} ACK rate", Text(_ack_rate(h), style=ack_style))
+        if h.ack_timeout:
+            t.add_row(
+                "  ACK timeout",
+                Text(str(h.ack_timeout), style="et.stat.warn"),
+            )
+
+        t.add_row("", "")
+        t.add_row("Connects", f"{h.session_connect_ok}/{h.session_connect_attempts}")
+        if h.session_reconnects:
+            t.add_row(
+                f"{Icons.RECONNECT} Reconnects",
+                Text(str(h.session_reconnects), style="et.warn"),
+            )
+            if h.reconnect_delay_avg is not None:
+                t.add_row(
+                    "  avg delay",
+                    Text(f"{h.reconnect_delay_avg:.1f}s", style="et.muted"),
+                )
+
+        total_cleanup = h.cleanup_tcp + h.cleanup_pending + h.cleanup_udp
+        if total_cleanup:
+            t.add_row(
+                "Cleanup",
+                Text(
+                    f"tcp={h.cleanup_tcp} pend={h.cleanup_pending} udp={h.cleanup_udp}",
+                    style="et.stat.warn",
+                ),
+            )
 
         return Panel(
             t,
@@ -371,48 +372,95 @@ class Dashboard:
             padding=(0, 1),
         )
 
-    # ── Connections panel ─────────────────────────────────────────────────────
+    @staticmethod
+    def _render_dns_pod(h: TunnelHealth) -> Panel:
+        t = _label_col()
 
-    def _render_connections(self, h: TunnelHealth) -> Panel:
+        if h.dns_enabled:
+            ok_rate = f"{h.dns_ok / h.dns_queries * 100:.1f}%" if h.dns_queries else "—"
+            t.add_row(f"{Icons.DNS} Queries", str(h.dns_queries))
+            t.add_row("DNS OK", Text(ok_rate, style="et.stat.good"))
+            t.add_row(
+                "DNS drops", Text(str(h.dns_dropped), style=_err_style(h.dns_dropped))
+            )
+        else:
+            t.add_row(f"{Icons.DNS} DNS", Text("disabled", style="et.muted"))
+
+        t.add_row("", "")
+
+        if h.pod_name:
+            t.add_row(f"{Icons.POD} Pod", h.pod_name)
+            t.add_row("Namespace", h.pod_namespace)
+            phase_style = _POD_PHASE_STYLES.get(h.pod_phase, "et.muted")
+            t.add_row("Phase", Text(h.pod_phase or "—", style=phase_style))
+            if h.pod_node:
+                t.add_row("Node", Text(h.pod_node, style="et.muted"))
+        else:
+            t.add_row(f"{Icons.POD} Pod", Text("raw WS mode", style="et.muted"))
+
+        t.add_row("", "")
+
+        t.add_row(f"{Icons.GLOBE} UDP", f"{h.udp_open} open / {h.udp_total} total")
+        if h.udp_flows_opened:
+            t.add_row("  opened", str(h.udp_flows_opened))
+            t.add_row("  closed", str(h.udp_flows_closed))
+        if h.udp_datagrams_sent or h.udp_datagrams_accepted:
+            t.add_row(
+                "  dgrams",
+                f"{Icons.ARROW_UP}{h.udp_datagrams_sent} "
+                f"{Icons.ARROW_DOWN}{h.udp_datagrams_accepted}",
+            )
+        if h.udp_datagrams_dropped:
+            t.add_row(
+                "  drops",
+                Text(str(h.udp_datagrams_dropped), style="et.stat.bad"),
+            )
+
+        return Panel(
+            t,
+            title=f"[et.brand]{Icons.DNS} DNS & {Icons.POD} Pod[/et.brand]",
+            border_style="et.border",
+            padding=(0, 1),
+        )
+
+    @staticmethod
+    def _render_connections(h: TunnelHealth) -> Panel:
         table = Table(
             box=box.SIMPLE_HEAD,
-            show_header=True,
             header_style="et.label",
             border_style="et.border",
             expand=True,
             padding=(0, 1),
         )
-        table.add_column("ID",       style="et.muted",  width=10)
-        table.add_column("Host",     style="et.value",  ratio=3)
-        table.add_column("Port",     style="et.value",  width=6)
-        table.add_column("State",    width=9)
-        table.add_column(f"{Icons.BYTES_UP}",  style="et.value", width=9, justify="right")
-        table.add_column(f"{Icons.BYTES_DOWN}", style="et.value", width=9, justify="right")
-        table.add_column("Drops",    style="et.stat.bad", width=6, justify="right")
+        table.add_column("ID", style="et.muted", width=10, no_wrap=True)
+        table.add_column("Host", style="et.value", ratio=3, no_wrap=True)
+        table.add_column("Port", style="et.value", width=6)
+        table.add_column("State", width=9)
+        table.add_column(Icons.BYTES_UP, style="et.value", width=9, justify="right")
+        table.add_column(Icons.BYTES_DOWN, style="et.value", width=9, justify="right")
+        table.add_column("Drops", style="et.stat.bad", width=6, justify="right")
 
-        state_styles = {
-            "open":    "et.conn.open",
-            "pending": "et.conn.pend",
-            "closing": "et.warn",
-            "closed":  "et.conn.closed",
-        }
+        active = [c for c in h.recent_conns if c.state in _ACTIVE_CONN_STATES]
+        closed = [c for c in h.recent_conns if c.state not in _ACTIVE_CONN_STATES]
+        remaining = max(0, _MAX_VISIBLE_CONNS - len(active))
+        visible = (
+            (active + closed[-remaining:]) if remaining else active[:_MAX_VISIBLE_CONNS]
+        )
 
-        for conn in h.recent_conns[-18:]:
-            style = state_styles.get(conn.state, "et.muted")
+        for conn in visible:
+            state_style = _CONN_STATE_STYLES.get(conn.state, "et.muted")
             table.add_row(
                 conn.conn_id[:8],
                 conn.host,
                 str(conn.port),
-                Text(conn.state, style=style),
+                Text(conn.state, style=state_style),
                 _fmt_bytes(conn.bytes_up),
                 _fmt_bytes(conn.bytes_down),
                 str(conn.drop_count) if conn.drop_count else "—",
             )
 
-        if not h.recent_conns:
-            table.add_row(
-                "—", "No connections yet", "—", "—", "—", "—", "—"
-            )
+        if not visible:
+            table.add_row("—", "No connections yet", "—", "—", "—", "—", "—")
 
         return Panel(
             table,
@@ -421,25 +469,46 @@ class Dashboard:
             padding=(0, 0),
         )
 
-    # ── Footer ────────────────────────────────────────────────────────────────
+    def _render_logs(self) -> Panel:
+        """Render a scrolling log tail panel."""
+        _LOG_LEVEL_STYLES: dict[str, str] = {
+            "DEBUG": "dim cyan",
+            "INFO": "green",
+            "WARNING": "yellow",
+            "ERROR": "bold red",
+            "CRITICAL": "bold red reverse",
+        }
+        assert self._log_buffer is not None
+        entries = self._log_buffer.entries()
+        tail = entries[-50:] if len(entries) > 50 else entries
 
-    def _render_footer(self, h: TunnelHealth) -> Panel:
-        keys = Text.assemble(
-            Text(" [q] ", style="et.highlight"),
-            Text("quit  ", style="et.muted"),
-            Text("[r] ", style="et.highlight"),
-            Text("reconnect  ", style="et.muted"),
-            Text("[c] ", style="et.highlight"),
-            Text("copy proxy env  ", style="et.muted"),
-            Text("[?] ", style="et.highlight"),
-            Text("help  ", style="et.muted"),
-        )
-        proxy_hint = Text(
-            f"  export https_proxy=socks5://{h.socks_host}:{h.socks_port}",
-            style="et.muted",
-        )
+        lines: list[Text] = []
+        for e in tail:
+            lvl_style = _LOG_LEVEL_STYLES.get(e.level, "et.muted")
+            line = Text.assemble(
+                Text(f"{e.ts} ", style="et.muted"),
+                Text(f"{e.level:<7} ", style=lvl_style),
+                Text(f"{e.logger} ", style="dim"),
+                Text(e.message),
+            )
+            lines.append(line)
+
+        if not lines:
+            lines.append(Text("No log entries yet.", style="et.muted"))
+
         return Panel(
-            Text.assemble(keys, proxy_hint),
-            style="et.border",
+            Group(*lines),
+            title=f"[et.brand]{Icons.CLOCK} Log Tail[/et.brand]",
+            border_style="et.border",
             padding=(0, 1),
         )
+
+    @staticmethod
+    def _render_footer(h: TunnelHealth) -> Panel:
+        proxy_env = f"socks5://{h.socks_host}:{h.socks_port}"
+        footer = Text.assemble(
+            Text("  export https_proxy=", style="et.muted"),
+            Text(proxy_env, style="et.value"),
+            Text("  │  Ctrl+C to stop", style="et.muted"),
+        )
+        return Panel(footer, style="et.border", padding=(0, 1))
