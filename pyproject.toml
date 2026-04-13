@@ -4,11 +4,16 @@ description = "SOCKS5 proxy tunnel over WebSocket into Kubernetes pods"
 requires-python = ">=3.13"
 authors = [{ name = "khodaparastan", email = "mohammad@khodaparastan.com" }]
 dependencies = [
-  "colorama (>=0.4.6,<1.0.0)",
-  "contextvars (>=2.4,<3.0)",
-  "structlog (>=25.5.0,<26.0.0)",
-  "websockets (>=16.0)",
+    "colorama (>=0.4.6,<1.0.0)",
+    "contextvars (>=2.4,<3.0)",
+    "structlog (>=25.5.0,<26.0.0)",
+    "websockets (>=16.0)",
+    "pyyaml (>=6.0.3,<7.0.0)",
+    "httpx (>=0.28.1,<0.29.0)",
+    "typer[all] (>=0.24.1,<0.25.0)",
+    "rich (>=15.0.0,<16.0.0)",
 ]
+
 dynamic = ["version"]
 
 [project.scripts]
@@ -19,7 +24,7 @@ requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
-version = "1.1.0a0"
+version = "1.2.0"
 
 [tool.poetry.group.dev.dependencies]
 mypy = "^1.19.1"
@@ -27,6 +32,7 @@ pyrefly = "^0.58.0"
 pytest = "^9.0.2"
 pytest-asyncio = ">=0.24"
 ruff = "^0.15.6"
+ty = "^0.0.29"
 
 [tool.poetry.scripts]
 exectunnel = "exectunnel.cli:main"
@@ -42,83 +48,66 @@ preview = true
 fix = true
 show-fixes = true
 src = ["exectunnel"]
-exclude = [".venv", "tests","venv"]
+exclude = [".venv", "tests", "venv"]
 target-version = "py313"
 line-length = 88
 
 [tool.ruff.lint]
 select = [
-  "A",
-  "C4",
-  "COM",
-  "DTZ",
-  "E",
-  "ERA",
-  "EXE",
-  "FLY",
-  "FURB",
-  "I",
-  "ICN",
-  "ISC",
-  "LOG",
-  "PERF",
-  "PIE",
-  "PL",
-  "PT",
-  "RET",
-  "RSE",
-  "S",
-  "SIM",
-  "SLOT",
-  "T100",
-  "T10",
-  "T20",
-  "UP",
-  "W",
-  "PYI006",
-  "PYI062",
-  "PYI063",
-  "PYI066",
-  "YTT",
+    "A",
+    "C4",
+    "COM",
+    "DTZ",
+    "E",
+    "ERA",
+    "EXE",
+    "FLY",
+    "FURB",
+    "I",
+    "ICN",
+    "ISC",
+    "LOG",
+    "PERF",
+    "PIE",
+    "PL",
+    "PT",
+    "RET",
+    "RSE",
+    "S",
+    "SIM",
+    "SLOT",
+    "T100",
+    "T10",
+    "T20",
+    "UP",
+    "W",
+    "PYI006",
+    "PYI062",
+    "PYI063",
+    "PYI066",
+    "YTT",
 ]
 ignore = [
-  "A005",  # Allow shadowing of stdlib and builtin module names
-  "COM812",  # Trailing comma conflicts with `ruff format`
-  "E501",
-  # Documentation rules we're ignoring:
-  "D100",  # Missing docstring in public module
-  "D101",  # Missing docstring in public class
-  "D102",  # Missing docstring in public method
-  "D103",  # Missing docstring in public function
-  "D104",  # Missing docstring in public package
-  "D105",  # Missing docstring in magic method
-  "D106",  # Missing docstring in public nested class
-  "D107",  # Missing docstring in __init__
-  "D205",  # 1 blank line required between summary line and description
-  "D401",  # First line of docstring should be in imperative mood
-  "D404",  # First word of the docstring should not be "This"
-  "D405",  # Section name should be properly capitalized
-  "S101",  # Use of assert detected
-  "G004",  # Logging statement uses f-string
-  "ERA001",
-  "ISC001",  # Implicit string concatenation conflicts with `ruff format`
-  "ISC003",  # Explicit string concatenation preferred over implicit
-  "A002",
-  "N802",
-  "PLR09",  # Too many statements/branches/etc. (we have our own complexity rules)
-  "PLR2004",  # Magic numbers in code
-  "PLR6301",  # Method could be a function (no self used)
-  "TRY301",
-  "G201",
-  "S108",
-  "S104",
-  "PLW0603",
-  "TRY400",
-  "TRY401",
-  "N811",
-  "N801",
-  "TRY003",  # Long exception messages
-  "TRY300",  # Consider moving this statement to an `else` block
+    "COM812", # Trailing comma conflicts with `ruff format`
+    "E501",
+    # Documentation rules we're ignoring:
+    "D107", # Missing docstring in __init__
+    "S101", # Use of assert detected
+    "G004", # Logging statement uses f-string
+    "ISC001", # Implicit string concatenation conflicts with `ruff format`
+    "ISC003", # Explicit string concatenation preferred over implicit
+    "A002",
+    "N802",
+    "PLR09", # Too many statements/branches/etc. (we have our own complexity rules)
+    "TRY301",
+    "G201",
+    "PLW0603",
+    "TRY400",
+    "TRY401",
+    "N811",
+    "N801",
+    "TRY003", # Long exception messages
+    "TRY300", # Consider moving this statement to an `else` block
 ]
 explicit-preview-rules = true
 extend-fixable = ["ALL"]
