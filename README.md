@@ -45,6 +45,45 @@ Route traffic:
 export ALL_PROXY='socks5://127.0.0.1:1080'
 ```
 
+### Docker
+
+```bash
+# Pull from Docker Hub
+docker pull khodaparastan/exectunnel:latest
+
+# — or pull from GitHub Container Registry —
+docker pull ghcr.io/khodaparastan/exectunnel:latest
+
+# — or build locally —
+docker build -t exectunnel:latest .
+
+# Single tunnel
+WSS_URL='wss://your-endpoint.example/ws' docker compose up
+
+# Multi-tunnel manager (configure .env first)
+cp .env.manager .env   # edit with your WSS_URL_* entries
+docker compose -f docker-compose.manager.yml up
+```
+
+### Kubernetes
+
+```bash
+# Edit the Secret with your WSS_URL
+vim deploy/kubernetes/secret.yaml
+
+# Apply all resources via Kustomize
+kubectl apply -k deploy/kubernetes/
+
+# Verify
+kubectl -n exectunnel get pods
+
+# Port-forward the SOCKS5 proxy to localhost
+kubectl -n exectunnel port-forward svc/exectunnel 1080:1080
+
+# Tear down
+kubectl delete -k deploy/kubernetes/
+```
+
 > **Note:** Because this is an alpha release, pip will not install it by default.
 > Use `pip install --pre exectunnel` to install pre-release versions.
 

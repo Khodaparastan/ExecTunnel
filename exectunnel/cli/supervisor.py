@@ -47,6 +47,7 @@ class TunnelSpec:
     index: int
     wss_url: str
     socks_port: int
+    socks_host: str = "127.0.0.1"
     insecure: bool = False
     log_level: str = "info"
     label: str = ""
@@ -253,6 +254,7 @@ def _load_manager_config(
         if not wss_url:
             continue
         socks_port = _geti(f"SOCKS_PORT_{idx}", _DEFAULT_SOCKS_BASE_PORT + i)
+        socks_host = _get(f"SOCKS_HOST_{idx}") or _get("SOCKS_HOST", "127.0.0.1")
         insecure_str = _get(f"WSS_INSECURE_{idx}") or _get("WSS_INSECURE", "false")
         insecure = insecure_str.lower() in ("1", "true", "yes")
         tun_log_level = _get(f"LOG_LEVEL_{idx}") or _get("LOG_LEVEL", log_level)
@@ -262,6 +264,7 @@ def _load_manager_config(
                 index=idx,
                 wss_url=wss_url,
                 socks_port=socks_port,
+                socks_host=socks_host,
                 insecure=insecure,
                 log_level=tun_log_level,
                 label=label,
@@ -334,6 +337,8 @@ class TunnelWorker:
             "-m",
             "exectunnel.cli",
             "tunnel",
+            "--socks-host",
+            self._spec.socks_host,
             "--socks-port",
             str(self._spec.socks_port),
             "--no-dashboard",
@@ -488,7 +493,7 @@ class TunnelWorker:
             return
 
         while not stop_event.is_set():
-            ok = await _check_socks_port("127.0.0.1", self._spec.socks_port)
+            ok = await _check_socks_port(self._spec.socks_host, self._spec.socks_port)
             self._state.socks_ok = ok
             if ok:
                 self._state.status = "healthy"

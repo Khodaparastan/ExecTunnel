@@ -732,7 +732,7 @@ class ManagerDashboard:
     @staticmethod
     def _render_footer(states: list[TunnelRuntimeState]) -> Panel:
         ports = "  ".join(
-            f"socks5://127.0.0.1:{s.spec.socks_port}"
+            f"socks5://{s.spec.socks_host}:{s.spec.socks_port}"
             for s in states
             if s.status in _RUNNING_STATES
         )

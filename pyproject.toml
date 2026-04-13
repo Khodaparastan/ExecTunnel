@@ -3,6 +3,22 @@ name = "exectunnel"
 description = "SOCKS5 proxy tunnel over WebSocket into Kubernetes pods"
 requires-python = ">=3.13"
 authors = [{ name = "khodaparastan", email = "mohammad@khodaparastan.com" }]
+license = { text = "MIT" }
+readme = "README.md"
+keywords = ["socks5", "proxy", "tunnel", "kubernetes", "websocket", "exec"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: Proxy Servers",
+    "Topic :: System :: Networking",
+    "Typing :: Typed",
+]
 dependencies = [
     "colorama (>=0.4.6,<1.0.0)",
     "contextvars (>=2.4,<3.0)",
@@ -15,6 +31,13 @@ dependencies = [
 ]
 dynamic = ["version"]
 
+[project.urls]
+Homepage = "https://github.com/khodaparastan/exectunnel"
+Documentation = "https://github.com/khodaparastan/exectunnel#readme"
+Repository = "https://github.com/khodaparastan/exectunnel"
+Changelog = "https://github.com/khodaparastan/exectunnel/blob/main/CHANGELOG.md"
+Issues = "https://github.com/khodaparastan/exectunnel/issues"
+
 [project.scripts]
 exectunnel = "exectunnel.cli:app"
 
@@ -24,6 +47,9 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 version = "1.2.1"
+
+[tool.poetry.requires-plugins]
+poetry-plugin-export = ">=1.8"
 
 [tool.poetry.group.dev.dependencies]
 mypy = "^1.19.1"
