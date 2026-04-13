@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: exectunnel-config
+  namespace: exectunnel
+  labels:
+    app.kubernetes.io/name: exectunnel
+    app.kubernetes.io/component: tunnel
+data:
+  # Global defaults
+  WSS_INSECURE: "false"
+  LOG_LEVEL: "info"
+
+  # Manager behaviour
+  RESTART_DELAY: "5"
+  MAX_RESTART_DELAY: "60"
+  BACKOFF_MULTIPLIER: "1.5"
+  HEALTH_CHECK_INTERVAL: "15"
+  HEALTH_CHECK_TIMEOUT: "3"
+  MAX_HEALTH_FAILURES: "3"
+  STARTUP_GRACE_PERIOD: "20"

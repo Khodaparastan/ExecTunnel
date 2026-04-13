@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: exectunnel
+  labels:
+    app.kubernetes.io/name: exectunnel
+    app.kubernetes.io/part-of: exectunnel
