@@ -23,6 +23,7 @@ __all__ = [
     "metrics_reset",
     "metrics_snapshot",
     "register_metric_listener",
+    "unregister_metric_listener",
     "unregister_all_listeners",
 ]
 
@@ -221,6 +222,18 @@ def register_metric_listener(fn: Callable[..., None]) -> None:
     """Register a callback invoked on every ``metrics_inc()`` call."""
     with _listener_lock:
         _listeners.append(fn)
+
+
+def unregister_metric_listener(fn: Callable[..., None]) -> None:
+    """Remove one previously-registered metric listener.
+
+    Safe to call even if *fn* is not currently registered.
+    """
+    with _listener_lock:
+        try:
+            _listeners.remove(fn)
+        except ValueError:
+            pass
 
 
 def unregister_all_listeners() -> None:

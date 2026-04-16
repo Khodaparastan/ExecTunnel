@@ -20,6 +20,7 @@ from .metrics import (
     metrics_snapshot,
     register_metric_listener,
     unregister_all_listeners,
+    unregister_metric_listener,
 )
 from .reporter import run_metrics_reporter
 from .tracing import (
@@ -53,6 +54,7 @@ __all__ = [
     "metrics_reset",
     "metrics_snapshot",
     "register_metric_listener",
+    "unregister_metric_listener",
     "unregister_all_listeners",
     # reporter
     "run_metrics_reporter",

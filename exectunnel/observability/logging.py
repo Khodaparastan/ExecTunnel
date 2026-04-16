@@ -111,6 +111,9 @@ class LogRingBuffer(logging.Handler):
             self._entries.clear()
 
 
+_RING_BUFFER_ATTR = "_exectunnel_ring_buffer"
+
+
 def install_ring_buffer(
     maxlen: int = 200,
     level: int = logging.DEBUG,
@@ -119,8 +122,15 @@ def install_ring_buffer(
 
     Returns the buffer so the caller can read :meth:`LogRingBuffer.entries`.
     """
+    logger = logging.getLogger("exectunnel")
+    for handler in logger.handlers:
+        if getattr(handler, _RING_BUFFER_ATTR, False):
+            assert isinstance(handler, LogRingBuffer)
+            return handler
+
     buf = LogRingBuffer(maxlen=maxlen, level=level)
-    logging.getLogger("exectunnel").addHandler(buf)
+    setattr(buf, _RING_BUFFER_ATTR, True)
+    logger.addHandler(buf)
     return buf
 
 
