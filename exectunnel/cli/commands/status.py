@@ -1,8 +1,8 @@
 """exectunnel status — inspect a running session via its IPC socket.
 
-NOTE: The IPC server is not yet implemented in the session layer.
-This command will return an error until the session exposes a Unix
-domain socket at the configured path.
+Experimental: the IPC server is not implemented in the current session layer.
+This command is therefore informational only and will fail until IPC support
+is added.
 """
 
 from __future__ import annotations

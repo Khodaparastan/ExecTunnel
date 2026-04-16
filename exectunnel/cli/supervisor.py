@@ -35,6 +35,7 @@ _DEFAULT_BACKOFF_MULTIPLIER = 1.5
 _DEFAULT_HEALTH_CHECK_INTERVAL = 15.0
 _DEFAULT_MAX_HEALTH_FAILURES = 3
 _DEFAULT_STARTUP_GRACE_PERIOD = 20.0
+_VALID_LOG_LEVELS: frozenset[str] = frozenset({"debug", "info", "warning", "error"})
 
 
 # ── Data models ───────────────────────────────────────────────────────────────
@@ -135,8 +136,96 @@ class TunnelMetrics:
     @classmethod
     def from_dict(cls, d: dict[str, object]) -> TunnelMetrics:
         """Build from a JSON-decoded dict, ignoring unknown keys."""
-        valid = set(cls.__dataclass_fields__)
-        return cls(**{k: v for k, v in d.items() if k in valid})
+        valid = cls.__dataclass_fields__
+        cleaned: dict[str, object] = {}
+        for key in valid:
+            if key not in d:
+                continue
+            value = d[key]
+            try:
+                if key in _BOOL_METRIC_FIELDS:
+                    cleaned[key] = bool(value)
+                elif key in _INT_METRIC_FIELDS:
+                    cleaned[key] = int(value)
+                elif key in _FLOAT_METRIC_FIELDS:
+                    cleaned[key] = float(value)
+                else:
+                    cleaned[key] = value
+            except (TypeError, ValueError):
+                continue
+        return cls(**cleaned)
+
+
+_BOOL_METRIC_FIELDS: frozenset[str] = frozenset(
+    {
+        "connected",
+        "bootstrap_ok",
+        "socks_ok",
+        "dns_enabled",
+    }
+)
+
+_INT_METRIC_FIELDS: frozenset[str] = frozenset(
+    {
+        "frames_sent",
+        "frames_recv",
+        "frames_dropped",
+        "bytes_up",
+        "bytes_down",
+        "frames_decode_errors",
+        "frames_orphaned",
+        "frames_noise",
+        "tcp_open",
+        "tcp_pending",
+        "tcp_total",
+        "tcp_failed",
+        "tcp_completed",
+        "tcp_errors",
+        "udp_open",
+        "udp_total",
+        "udp_flows_opened",
+        "udp_flows_closed",
+        "udp_datagrams_sent",
+        "udp_datagrams_accepted",
+        "udp_datagrams_dropped",
+        "ack_ok",
+        "ack_timeout",
+        "ack_failed",
+        "dns_queries",
+        "dns_ok",
+        "dns_dropped",
+        "socks5_accepted",
+        "socks5_rejected",
+        "socks5_active",
+        "socks5_handshakes_ok",
+        "socks5_handshakes_error",
+        "socks5_cmd_connect",
+        "socks5_cmd_udp",
+        "socks5_udp_relays_active",
+        "socks5_udp_datagrams",
+        "socks5_udp_dropped",
+        "session_connect_attempts",
+        "session_connect_ok",
+        "session_reconnects",
+        "session_serve_started",
+        "session_serve_stopped",
+        "cleanup_tcp",
+        "cleanup_pending",
+        "cleanup_udp",
+        "send_queue_depth",
+        "send_queue_cap",
+        "request_tasks",
+    }
+)
+
+_FLOAT_METRIC_FIELDS: frozenset[str] = frozenset(
+    {
+        "uptime_secs",
+        "reconnect_delay_avg",
+        "reconnect_delay_max",
+        "bootstrap_duration",
+    }
+)
 
 
 _DEFAULT_LOG_LINES_CAP = 200
@@ -342,6 +431,8 @@ class TunnelWorker:
             "--socks-port",
             str(self._spec.socks_port),
             "--no-dashboard",
+            "--log-level",
+            self._spec.log_level if self._spec.log_level in _VALID_LOG_LEVELS else "info",
         ]
         if self._spec.insecure:
             cmd.append("--insecure")
@@ -352,6 +443,7 @@ class TunnelWorker:
         env["EXECTUNNEL_WSS_URL"] = self._spec.wss_url
         env["WSS_INSECURE"] = "1" if self._spec.insecure else "0"
         env["EXECTUNNEL_METRICS_REPORT"] = "1"
+        env.pop("EXECTUNNEL_LOG_LEVEL", None)
         return env
 
     async def run_forever(self, stop_event: asyncio.Event) -> None:

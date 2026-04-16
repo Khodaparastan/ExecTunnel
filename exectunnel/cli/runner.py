@@ -40,12 +40,14 @@ try:
     from exectunnel.observability import (
         register_metric_listener as _register_metric_listener,
     )
-    from exectunnel.observability.metrics import _listeners as _metric_listeners
+    from exectunnel.observability import (
+        unregister_metric_listener as _unregister_metric_listener,
+    )
 
     _HAS_LISTENER_API: bool = True
 except (ImportError, AttributeError):
     _register_metric_listener = None
-    _metric_listeners = None
+    _unregister_metric_listener = None
     _HAS_LISTENER_API = False
 
 # ── Spinner ↔ metric mapping ──────────────────────────────────────────────────
@@ -133,6 +135,7 @@ async def run_session(
         socks_host=tun_cfg.socks_host,
         socks_port=tun_cfg.socks_port,
     )
+    monitor.set_connected(True)
 
     # ── Listener management ───────────────────────────────────────────────
 
@@ -195,12 +198,14 @@ async def run_session(
         )
 
         if stop_task in done:
+            monitor.set_connected(False)
             _cancel_tasks(session_task, bootstrap_task)
             await _drain(session_task)
             _record_exit("cli.session.exit.signal")
             return 0
 
         if session_task in done:
+            monitor.set_connected(False)
             bootstrap_task.cancel()
             result = _extract_result(session_task, console, spinner)
             _record_exit(
@@ -249,17 +254,20 @@ async def run_session(
         )
 
         if stop_task in done:
+            monitor.set_connected(False)
             session_task.cancel()
             with console.status("[et.warn]Shutting down tunnel…[/et.warn]"):
                 await _drain(session_task)
             _record_exit("cli.session.exit.signal")
             return 0
 
+        monitor.set_connected(False)
         result = _extract_result(session_task, console, spinner)
         _record_exit("cli.session.exit.error" if result else "cli.session.exit.clean")
         return result
 
     except KeyboardInterrupt:
+        monitor.set_connected(False)
         session_task.cancel()
         _record_exit("cli.session.exit.signal")
         return 0
@@ -310,14 +318,9 @@ def _try_register_listener(callback: Callable[..., None]) -> bool:
 
 
 def _try_unregister_listener(callback: Callable[..., None]) -> None:
-    if not _HAS_LISTENER_API or _metric_listeners is None:
+    if not _HAS_LISTENER_API or _unregister_metric_listener is None:
         return
-    try:
-        _metric_listeners.remove(callback)
-    except (ValueError, AttributeError):
-        # ValueError  : already removed or never added
-        # AttributeError: container type changed in the observability layer
-        pass
+    _unregister_metric_listener(callback)  # type: ignore[arg-type]
 
 
 def _make_spinner_listener(spinner: BootstrapSpinner) -> Callable[..., None]:

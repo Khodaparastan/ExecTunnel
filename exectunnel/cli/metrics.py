@@ -375,6 +375,7 @@ class HealthMonitor:
         "_socks_port",
         "_send_queue_cap",
         "_start",
+        "_connected",
         "_reconnect_count",
         "_last_reconnect_at",
         "_bootstrap_ok",
@@ -397,6 +398,7 @@ class HealthMonitor:
         self._socks_port = socks_port
         self._send_queue_cap = send_queue_cap
         self._start = time.monotonic()
+        self._connected: bool = True
         self._reconnect_count: int = 0
         self._last_reconnect_at: float = 0.0
         self._bootstrap_ok: bool = False
@@ -409,6 +411,9 @@ class HealthMonitor:
     def record_reconnect(self) -> None:
         self._reconnect_count += 1
         self._last_reconnect_at = time.monotonic()
+
+    def set_connected(self, connected: bool) -> None:
+        self._connected = connected
 
     def record_bootstrap_ok(self) -> None:
         self._bootstrap_ok = True
@@ -573,7 +578,7 @@ class HealthMonitor:
         dns_drops = self._counter("dns.query.drop") + self._counter("dns.query.timeout")
 
         h = TunnelHealth(
-            connected=True,
+            connected=self._connected,
             ws_url=self._ws_url,
             reconnect_count=self._reconnect_count,
             last_reconnect_at=self._last_reconnect_at,
