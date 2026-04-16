@@ -75,8 +75,6 @@ __all__ = [
     "UdpFlow",
 ]
 
-# Registry aliases — importable via `from exectunnel.transport import TcpRegistry`
-# but excluded from __all__ to keep the primary public surface minimal.
-# Prefer `dict[str, TcpConnection]` / `dict[str, UdpFlow]` at annotation sites
-# unless a named alias meaningfully improves readability at the call site.
+# Registry aliases — part of the public surface for callers that prefer named
+# aliases over explicit `dict[str, TcpConnection]` / `dict[str, UdpFlow]`.
 __all__ += ["TcpRegistry", "UdpRegistry"]

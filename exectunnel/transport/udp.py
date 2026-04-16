@@ -124,32 +124,18 @@ class UdpFlow:
         self._ws_send = ws_send
         self._registry = registry
 
-        # Inbound queue: agent → local relay.
         self._inbound: asyncio.Queue[bytes] = asyncio.Queue(
             maxsize=Defaults.UDP_INBOUND_QUEUE_CAP
         )
-
-        # Unified close event — set by both close() (local) and
-        # on_remote_closed() (agent-initiated).  recv_datagram() races this
-        # against the inbound queue so it always unblocks promptly on closure.
-        self._closed_event: asyncio.Event = asyncio.Event()
-
-        # Reusable close_task for recv_datagram() — created once on the first
-        # blocking recv and reused across all subsequent calls to avoid
-        # spawning a new Event.wait() coroutine per recv_datagram() call.
-        # None until the first blocking recv_datagram() call.
+        self._closed_event = asyncio.Event()
         self._close_task: asyncio.Task[None] | None = None
 
-        # Lifecycle flags.
-        self._opened: bool = False
-        self._closed: bool = False
+        self._opened = False
+        self._closed = False
 
-        # Telemetry.
-        self._drop_count: int = 0
-        self._bytes_sent: int = 0
-        self._bytes_recv: int = 0
-
-    # ── Lifecycle ─────────────────────────────────────────────────────────────
+        self._drop_count = 0
+        self._bytes_sent = 0
+        self._bytes_recv = 0
 
     async def open(self) -> None:
         """Send the ``UDP_OPEN`` control frame to the remote agent.
@@ -219,12 +205,7 @@ class UdpFlow:
 
         self._opened = True
         metrics_inc("udp.flow.opened")
-        logger.debug(
-            "udp flow %s opened → %s:%d",
-            self._id,
-            self._host,
-            self._port,
-        )
+        logger.debug("udp flow %s opened → %s:%d", self._id, self._host, self._port)
 
     async def close(self) -> None:
         """Evict this flow from the registry and send the ``UDP_CLOSE`` frame.
@@ -255,14 +236,11 @@ class UdpFlow:
             return
         self._closed = True
 
-        # Wake recv_datagram() before touching the network so the caller's
-        # receive loop exits cleanly even if ws_send raises.
         self._closed_event.set()
         self._evict()
         metrics_inc("udp.flow.closed")
         logger.debug("udp flow %s closing (local)", self._id)
 
-        # Only send UDP_CLOSE if the agent knows about this flow.
         if not self._opened:
             logger.debug(
                 "udp flow %s: skipping UDP_CLOSE — open() never completed",
@@ -273,11 +251,9 @@ class UdpFlow:
         try:
             await self._ws_send(encode_udp_close_frame(self._id), control=True)
         except ConnectionClosedError:
-            # Remote is already gone; the flow is effectively closed.
             metrics_inc("udp.flow.close.connection_already_closed")
             logger.debug(
-                "udp flow %s: connection already closed while sending UDP_CLOSE "
-                "(remote will time-out the flow independently)",
+                "udp flow %s: connection already closed while sending UDP_CLOSE",
                 self._id,
             )
         except WebSocketSendTimeoutError:
@@ -287,7 +263,7 @@ class UdpFlow:
                 f"UDP flow {self._id!r}: failed to send UDP_CLOSE frame.",
                 error_code="transport.udp_close_failed",
                 details={"flow_id": self._id},
-                hint="The remote agent will time-out the flow independently.",
+                hint="The remote agent will time out the flow independently.",
             ) from exc
 
     def on_remote_closed(self) -> None:
@@ -354,31 +330,12 @@ class UdpFlow:
                 )
 
     async def recv_datagram(self) -> bytes | None:
-        """Return the next inbound datagram, or ``None`` when the flow is closed.
-
-        Drains any already-queued datagrams before honouring the close flag so
-        that no data is lost when :meth:`on_remote_closed` races with a queued
-        item.
-
-        The internal ``_close_task`` is created once on the first blocking call
-        and reused across all subsequent calls — this avoids spawning a new
-        ``asyncio.Event.wait()`` coroutine on every blocking recv, which would
-        generate significant task churn on high-throughput flows.
-
-        Returns:
-            Raw datagram bytes, or ``None`` when the flow is closed and the
-            inbound queue is empty.
-
-        Raises:
-            asyncio.CancelledError: Propagated as-is — never suppressed.
-        """
-        # Fast path: drain any immediately available datagrams first.
+        """Return next inbound datagram or None when closed."""
         try:
             return self._inbound.get_nowait()
         except asyncio.QueueEmpty:
             pass
 
-        # If already closed and queue is empty, signal EOF.
         if self._closed_event.is_set():
             return None
 
@@ -393,7 +350,7 @@ class UdpFlow:
                 name=f"udp-flow-close-{self._id}",
             )
 
-        get_task: asyncio.Task[bytes] = asyncio.create_task(
+        get_task = asyncio.create_task(
             self._inbound.get(),
             name=f"udp-flow-get-{self._id}",
         )
@@ -405,29 +362,22 @@ class UdpFlow:
             )
         except asyncio.CancelledError:
             get_task.cancel()
-            # Do NOT cancel _close_task — it is reused across calls.
             with contextlib.suppress(asyncio.CancelledError):
                 await get_task
             raise
 
-        # Cancel the get_task loser only — _close_task is reused and must
-        # not be cancelled here.
         if get_task in pending:
             get_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await get_task
 
-        # get_task won — data arrived.
         if get_task in done and not get_task.cancelled():
             return get_task.result()
 
-        # close_task won — drain remaining items before returning None.
         try:
             return self._inbound.get_nowait()
         except asyncio.QueueEmpty:
-            pass
-
-        return None
+            return None
 
     # ── Outbound (local → remote) ─────────────────────────────────────────────
 
@@ -485,10 +435,8 @@ class UdpFlow:
                 ),
             )
 
-        frame = encode_udp_data_frame(self._id, data)
-
         try:
-            await self._ws_send(frame)
+            await self._ws_send(encode_udp_data_frame(self._id, data))
             self._bytes_sent += len(data)
             metrics_inc("udp.flow.datagram.sent")
         except (WebSocketSendTimeoutError, ConnectionClosedError):
@@ -509,9 +457,7 @@ class UdpFlow:
     def _evict(self) -> None:
         """Remove this flow from the shared registry and decrement the active-flow gauge."""
         self._registry.pop(self._id, None)
-        metrics_gauge_dec("session_active_udp_flows")
-
-    # ── Properties ────────────────────────────────────────────────────────────
+        metrics_gauge_dec("session.active.udp_flows")
 
     @property
     def flow_id(self) -> str:
