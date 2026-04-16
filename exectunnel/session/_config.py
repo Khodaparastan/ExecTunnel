@@ -39,11 +39,7 @@ class SessionConfig:
 
     def ssl_context(self) -> ssl.SSLContext | None:
         """Return explicit SSL context override, or None for library defaults."""
-        if self.ssl_context_override is not None:
-            return self.ssl_context_override
-        if self.wss_url.startswith("ws://"):
-            return None
-        return None
+        return self.ssl_context_override
 
 
 @dataclass(slots=True, frozen=True)
