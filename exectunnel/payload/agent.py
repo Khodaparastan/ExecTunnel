@@ -1,4 +1,4 @@
-#!/usr/bin/env python3.12
+#!/usr/bin/env python3
 """
 exectunnel agent — runs inside the pod via ``exec``.
 
@@ -172,6 +172,7 @@ _EMIT_DATA_PUT_TIMEOUT_SECS: float = 1.0
 
 # Grace period for worker threads to emit final frames during shutdown.
 _WORKER_SHUTDOWN_GRACE_SECS: float = 3.0
+_TERMINATE = False
 
 
 class _DnsCache:
@@ -248,10 +249,18 @@ def _create_connection_cached(
 
 
 def _install_sigpipe_handler() -> None:
-    try:
+    with contextlib.suppress(OSError, ValueError):
         signal.signal(signal.SIGPIPE, signal.SIG_IGN)
-    except (OSError, ValueError):
-        pass
+
+
+def _install_termination_handlers() -> None:
+    def _handle(_signum: int, _frame: object | None) -> None:
+        global _TERMINATE  # noqa: PLW0603
+        _TERMINATE = True
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(OSError, ValueError):
+            signal.signal(sig, _handle)
 
 
 class _FaultTolerantStdout:
@@ -1157,6 +1166,8 @@ class _Dispatcher:
     def run(self) -> None:
         """Read stdin line-by-line and dispatch each frame until EOF."""
         for raw_line in sys.stdin:
+            if _TERMINATE:
+                break
             self.dispatch(raw_line.rstrip("\n\r"))
         _log("info", "stdin EOF — dispatcher exiting")
 
@@ -1164,6 +1175,7 @@ class _Dispatcher:
 def main() -> None:
     """Parse arguments, initialise the writer, and run the dispatcher."""
     _install_sigpipe_handler()
+    _install_termination_handlers()
 
     if len(sys.argv) == 1:
         fixed_host = None
@@ -1182,7 +1194,7 @@ def main() -> None:
         sys.stderr.write("usage: agent.py [<host> <port>]\n")
         sys.exit(1)
 
-    for path in ("/tmp/exectunnel_agent.py", "/tmp/exectunnel_agent.b64"):
+    for path in ("/tmp/exectunnel_agent.py", "/tmp/exectunnel_agent.b64"):  # noqa: S108
         with contextlib.suppress(OSError):
             os.unlink(path)
 

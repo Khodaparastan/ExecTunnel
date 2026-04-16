@@ -114,7 +114,7 @@ SESSION_CONN_ID: Final[str] = _SESSION_CONN_ID
 # exhaustion from malformed or adversarial input.
 #
 # Maximum safe DATA payload derivation:
-#   available = 8192 - len(FRAME_PREFIX) - len("DATA") - 2*len(":") - 25 - len(FRAME_SUFFIX)
+#   available = 8192 - len(FRAME_PREFIX) - len("DATA") - 2*len(":") - 25 - len(FRAME_SUFFIX)  # noqa: ERA001
 #             = 8192 - 14 - 4 - 2 - 25 - 3
 #             = 8144 base64url chars
 #   max raw bytes = floor(8144 * 3 / 4) = 6108 bytes
