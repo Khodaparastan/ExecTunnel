@@ -114,9 +114,20 @@ class FrameReceiver:
 
             try:
                 async for msg in self._ws:
-                    chunk = (
-                        msg if isinstance(msg, str) else msg.decode(errors="replace")
-                    )
+                    if isinstance(msg, str):
+                        chunk = msg
+                    else:
+                        try:
+                            chunk = msg.decode("utf-8")
+                        except UnicodeDecodeError as exc:
+                            metrics_inc("session.frames.decode_error")
+                            raise ConnectionClosedError(
+                                "Agent sent non-UTF-8 frame bytes.",
+                                details={
+                                    "close_code": 1002,
+                                    "close_reason": "non_utf8_frame_bytes",
+                                },
+                            ) from exc
                     buf += chunk
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
@@ -130,6 +141,7 @@ class FrameReceiver:
                         len(buf),
                         buf[:120],
                     )
+                    metrics_inc("session.recv.trailing_partial_frame")
                     metrics_observe("session.recv.residual_bytes", float(len(buf)))
 
                 self._ws_closed.set()
@@ -155,8 +167,10 @@ class FrameReceiver:
             udp_count += 1
 
         if tcp_count:
+            metrics_inc("session.cleanup.tcp", value=tcp_count)
             metrics_inc("session.recv.cleanup.tcp", value=tcp_count)
         if udp_count:
+            metrics_inc("session.cleanup.udp", value=udp_count)
             metrics_inc("session.recv.cleanup.udp", value=udp_count)
 
         if tcp_count or udp_count:

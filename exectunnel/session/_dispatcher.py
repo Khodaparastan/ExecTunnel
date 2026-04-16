@@ -14,6 +14,7 @@ import contextlib
 import ipaddress
 import logging
 import random
+from collections.abc import Awaitable, Callable
 from typing import Final
 
 from exectunnel.defaults import Defaults
@@ -96,6 +97,7 @@ class RequestDispatcher:
         "_ack_agent_error_window_start",
         "_ack_agent_error_window_count",
         "_ack_reconnect_requested",
+        "_request_reconnect",
         "_ws_closed_task",
     )
 
@@ -108,6 +110,7 @@ class RequestDispatcher:
         pending_connects: dict[str, PendingConnect],
         udp_registry: dict[str, UdpFlow],
         pre_ack_buffer_cap_bytes: int,
+        request_reconnect: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self._tun = tun_cfg
         self._ws_send = ws_send
@@ -139,6 +142,7 @@ class RequestDispatcher:
         self._ack_agent_error_window_start: float | None = None
         self._ack_agent_error_window_count: int = 0
         self._ack_reconnect_requested: bool = False
+        self._request_reconnect = request_reconnect
 
         # Shared task that resolves when the WebSocket closes.  Created once
         # and reused by all concurrent _await_conn_ack calls.
@@ -784,6 +788,11 @@ class RequestDispatcher:
             label,
             self._tun.ack_timeout_window_secs,
         )
+        if self._request_reconnect is not None:
+            asyncio.create_task(
+                self._request_reconnect(f"ack_health:{reason.value}"),
+                name="request-reconnect",
+            )
 
     def reset_ack_state(self) -> None:
         """Reset all ACK failure tracking state after a successful bootstrap."""

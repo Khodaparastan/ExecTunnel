@@ -26,6 +26,7 @@ creation, cancellation, and the fragile item-rescue logic.
 import asyncio
 import contextlib
 import logging
+import re
 from typing import Final
 
 from websockets.asyncio.client import ClientConnection
@@ -51,6 +52,8 @@ logger = logging.getLogger(__name__)
 
 # Length of the frame prefix — used to extract msg_type for metrics.
 _FRAME_PREFIX_LEN: Final[int] = len(FRAME_PREFIX)
+_STOP_GRACE_TIMEOUT_SECS: Final[float] = 5.0
+_MSG_TYPE_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Z_]+$")
 
 
 class _StopSentinel:
@@ -86,7 +89,8 @@ def _extract_msg_type(frame: str) -> str:
         end = colon_pos
     else:
         end = min(colon_pos, suffix_pos)
-    return rest[:end] if end > 0 else "unknown"
+    token = rest[:end] if end > 0 else "unknown"
+    return token if _MSG_TYPE_RE.match(token) else "unknown"
 
 
 class WsSender:
@@ -168,8 +172,8 @@ class WsSender:
 
         Inserts the stop sentinel into the control queue (always succeeds —
         unbounded) and sets the notification event so the loop wakes
-        immediately.  Cancels the task as a safety net in case the loop is
-        blocked on a slow send.  Does NOT set ``ws_closed`` — that is
+        immediately.  Waits for graceful drain/exit first, then force-cancels
+        after a timeout if needed.  Does NOT set ``ws_closed`` — that is
         ``FrameReceiver``'s responsibility.
         """
         if self._stopped:
@@ -180,9 +184,13 @@ class WsSender:
         self._frame_ready.set()
 
         if self._loop_task is not None and not self._loop_task.done():
-            self._loop_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._loop_task
+            try:
+                async with asyncio.timeout(_STOP_GRACE_TIMEOUT_SECS):
+                    await self._loop_task
+            except (TimeoutError, asyncio.CancelledError):
+                self._loop_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._loop_task
 
     @property
     def task(self) -> asyncio.Task[None] | None:
