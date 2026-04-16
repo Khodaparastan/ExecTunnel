@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class Defaults:
     # ── WebSocket / Bridge ────────────────────────────────────────────────────────
 
@@ -31,7 +31,7 @@ class Defaults:
     # Over a kubectl exec channel, a stalled send indicates a dead tunnel.
     # 30 s is generous enough to survive transient API server hiccups while
     # still detecting truly stalled connections before the OS TCP timeout (2 min).
-    WS_SEND_TIMEOUT_SECS: float = 30.0
+    WS_SEND_TIMEOUT_SECS: float = 15.0
 
     # Bounded outbound data queue.  Control frames use a separate unbounded queue.
     # 512 items × ~4 KiB/frame ≈ 2 MiB peak in-flight before backpressure.
@@ -44,7 +44,7 @@ class Defaults:
     # Enough to survive a rolling API server restart without giving up.
     WS_RECONNECT_MAX_RETRIES: int = 10
     WS_RECONNECT_BASE_DELAY_SECS: float = 1.0
-    WS_RECONNECT_MAX_DELAY_SECS: float = 30.0
+    WS_RECONNECT_MAX_DELAY_SECS: float = 15.0
 
     # RFC 6455 close code 1011 — "server encountered an unexpected condition".
     # Used when the agent appears unhealthy (ACK timeout surge) to force a clean
@@ -62,7 +62,7 @@ class Defaults:
     # With CONN_ACK_TIMEOUT_SECS = 10 s and threshold = 5, the trigger fires
     # when 5 connections time out within 60 s — roughly one per 12 s average.
     # This indicates sustained tunnel degradation, not a transient blip.
-    ACK_TIMEOUT_WINDOW_SECS: float = 60.0
+    ACK_TIMEOUT_WINDOW_SECS: float = 30.0
 
     # Number of ACK timeouts within ACK_TIMEOUT_WINDOW_SECS that triggers a
     # forced reconnect.  5 is enough to distinguish a degraded tunnel from

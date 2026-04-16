@@ -147,6 +147,9 @@ class ExecTunnelError(Exception):
         logging, Sentry ``extra``, or an OpenTelemetry span attribute.
         """
         cause = self.__cause__ or self.__context__
+        active_traceback = traceback.format_exc()
+        if active_traceback.strip() == "NoneType: None":
+            active_traceback = None
         return {
             "error_id": self.error_id,
             "timestamp": self.timestamp,
@@ -157,7 +160,7 @@ class ExecTunnelError(Exception):
             "hint": self.hint,
             "details": self.details,
             "cause": repr(cause) if cause else None,
-            "traceback": traceback.format_exc() or None,
+            "traceback": active_traceback,
         }
 
     @classmethod
