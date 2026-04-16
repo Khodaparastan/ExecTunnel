@@ -456,8 +456,8 @@ class UdpFlow:
 
     def _evict(self) -> None:
         """Remove this flow from the shared registry and decrement the active-flow gauge."""
-        self._registry.pop(self._id, None)
-        metrics_gauge_dec("session.active.udp_flows")
+        if self._registry.pop(self._id, None) is not None:
+            metrics_gauge_dec("session.active.udp_flows")
 
     @property
     def flow_id(self) -> str:

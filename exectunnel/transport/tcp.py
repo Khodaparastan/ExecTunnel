@@ -1061,8 +1061,8 @@ class TcpConnection:
 
         await self._send_close_frame_once()
 
-        self._registry.pop(self._id, None)
-        metrics_gauge_dec("session.active.tcp_connections")
+        if self._registry.pop(self._id, None) is not None:
+            metrics_gauge_dec("session.active.tcp_connections")
 
         with contextlib.suppress(OSError, RuntimeError):
             self._writer.close()
