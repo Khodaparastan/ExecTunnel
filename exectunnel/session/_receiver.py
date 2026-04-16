@@ -19,7 +19,6 @@ from websockets.exceptions import ConnectionClosed
 from exectunnel.exceptions import (
     ConnectionClosedError,
     FrameDecodingError,
-    TransportError,
     UnexpectedFrameError,
 )
 from exectunnel.observability import (
@@ -115,7 +114,9 @@ class FrameReceiver:
 
             try:
                 async for msg in self._ws:
-                    chunk = msg if isinstance(msg, str) else msg.decode()
+                    chunk = (
+                        msg if isinstance(msg, str) else msg.decode(errors="replace")
+                    )
                     buf += chunk
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
@@ -125,15 +126,11 @@ class FrameReceiver:
             finally:
                 if buf.strip():
                     logger.debug(
-                        "recv: WebSocket closed with %d chars of residual "
-                        "buffered data (no trailing newline — dropped): %r",
+                        "recv: WebSocket closed with %d chars of residual buffered data dropped: %r",
                         len(buf),
                         buf[:120],
                     )
-                    metrics_observe(
-                        "session.recv.residual_bytes",
-                        float(len(buf)),
-                    )
+                    metrics_observe("session.recv.residual_bytes", float(len(buf)))
 
                 self._ws_closed.set()
                 self._force_cleanup()
@@ -164,8 +161,7 @@ class FrameReceiver:
 
         if tcp_count or udp_count:
             logger.info(
-                "recv: force-cleaned %d TCP handler(s) and %d UDP flow(s) "
-                "on WebSocket close",
+                "recv: force-cleaned %d TCP handler(s) and %d UDP flow(s) on WebSocket close",
                 tcp_count,
                 udp_count,
             )
@@ -219,16 +215,14 @@ class FrameReceiver:
                 return
 
             async with aspan(
-                "session.handle_frame",
-                msg_type=msg_type,
-                conn_id=conn_id,
+                "session.handle_frame", msg_type=msg_type, conn_id=conn_id
             ):
                 match msg_type:
                     case "CONN_ACK":
                         self._on_conn_ack(conn_id)
 
                     case "DATA":
-                        self._on_data(conn_id, frame.payload)
+                        await self._on_data(conn_id, frame.payload)
 
                     case "CONN_CLOSE":
                         self._on_conn_close(conn_id)
@@ -245,36 +239,25 @@ class FrameReceiver:
                     case "AGENT_READY":
                         raise UnexpectedFrameError(
                             "AGENT_READY received after session was established.",
-                            details={
-                                "state": "running",
-                                "frame_type": "AGENT_READY",
-                            },
+                            details={"state": "running", "frame_type": "AGENT_READY"},
                         )
 
                     case "CONN_OPEN" | "UDP_OPEN" | "KEEPALIVE":
                         raise UnexpectedFrameError(
                             f"{msg_type} received from agent — unexpected direction.",
-                            details={
-                                "state": "running",
-                                "frame_type": msg_type,
-                            },
+                            details={"state": "running", "frame_type": msg_type},
                         )
 
                     case _:
                         raise UnexpectedFrameError(
-                            f"Unhandled frame type {msg_type!r} — "
-                            "update session dispatcher.",
-                            details={
-                                "state": "running",
-                                "frame_type": msg_type,
-                            },
+                            f"Unhandled frame type {msg_type!r}.",
+                            details={"state": "running", "frame_type": msg_type},
                         )
 
         except FrameDecodingError as exc:
             metrics_inc("session.frames.payload_decode_error")
             raise ConnectionClosedError(
-                f"Agent sent a frame with a corrupt payload "
-                f"(msg_type={msg_type!r}, conn_id={conn_id!r}).",
+                f"Agent sent a frame with a corrupt payload (msg_type={msg_type!r}, conn_id={conn_id!r}).",
                 details={
                     "close_code": 1002,
                     "close_reason": exc.message,
@@ -299,25 +282,9 @@ class FrameReceiver:
                 "recv: CONN_ACK for unknown or already-resolved conn_id %r — ignoring",
                 conn_id,
             )
-            metrics_inc(
-                "session.frames.orphaned",
-                frame_type="CONN_ACK",
-            )
+            metrics_inc("session.frames.orphaned", frame_type="CONN_ACK")
 
-    def _on_data(self, conn_id: str, payload: str) -> None:
-        """Feed decoded bytes to the TcpConnection handler.
-
-        Both pre-ACK and post-ACK paths use synchronous ``feed()`` to
-        enqueue data into the handler's internal buffer.
-
-        Pre-ACK:  overflow triggers ``PRE_ACK_OVERFLOW`` on the ACK future,
-                  aborting the connection before it is established.
-        Post-ACK: ``TransportError`` is logged and the chunk is dropped.
-
-        ``decode_binary_payload`` raises ``FrameDecodingError`` on corrupt
-        base64 — propagated to ``_dispatch_frame`` which wraps it in
-        ``ConnectionClosedError``.
-        """
+    async def _on_data(self, conn_id: str, payload: str) -> None:
         handler = self._tcp_registry.get(conn_id)
         if handler is None:
             metrics_inc("session.frames.orphaned", frame_type="DATA")
@@ -333,56 +300,51 @@ class FrameReceiver:
                 return
             try:
                 handler.feed(data)
-            except TransportError as exc:
-                if exc.error_code == "transport.pre_ack_buffer_overflow":
+            except Exception as exc:
+                if (
+                    hasattr(exc, "error_code")
+                    and getattr(exc, "error_code")
+                    == "transport.pre_ack_buffer_overflow"
+                ):
                     if not pending.ack_future.done():
-                        pending.ack_future.set_result(
-                            AckStatus.PRE_ACK_OVERFLOW,
-                        )
+                        pending.ack_future.set_result(AckStatus.PRE_ACK_OVERFLOW)
                     metrics_inc("tunnel.pre_ack_buffer.overflow")
                 else:
                     metrics_inc(
                         "tunnel.inbound_queue.drop",
-                        error=exc.error_code.replace(".", "_"),
+                        error=getattr(exc, "error_code", type(exc).__name__).replace(
+                            ".", "_"
+                        ),
                     )
                     logger.debug(
-                        "conn %s: feed() dropped chunk [%s]: %s",
+                        "conn %s: feed() dropped chunk: %s",
                         conn_id,
-                        exc.error_code,
-                        exc.message,
-                        extra={
-                            "conn_id": conn_id,
-                            "error_code": exc.error_code,
-                        },
+                        exc,
+                        extra={"conn_id": conn_id},
                     )
-        else:
-            # Post-ACK: synchronous feed — no backpressure to agent yet.
-            try:
-                handler.feed(data)
-            except TransportError as exc:
-                metrics_inc(
-                    "tunnel.inbound_queue.drop",
-                    error=exc.error_code.replace(".", "_"),
-                )
-                logger.debug(
-                    "conn %s: post-ACK feed() dropped chunk [%s]: %s",
-                    conn_id,
-                    exc.error_code,
-                    exc.message,
-                    extra={
-                        "conn_id": conn_id,
-                        "error_code": exc.error_code,
-                    },
-                )
+            return
+
+        try:
+            await handler.feed_async(data)
+        except ConnectionClosedError:
+            metrics_inc("session.frames.orphaned", frame_type="DATA")
+        except Exception as exc:
+            metrics_inc(
+                "tunnel.inbound_queue.drop",
+                error=getattr(exc, "error_code", type(exc).__name__).replace(".", "_"),
+            )
+            logger.debug(
+                "conn %s: post-ACK feed_async() dropped chunk: %s",
+                conn_id,
+                exc,
+                extra={"conn_id": conn_id},
+            )
 
     def _on_conn_close(self, conn_id: str) -> None:
         """React to CONN_CLOSE from agent."""
         handler = self._tcp_registry.get(conn_id)
         if handler is None:
-            metrics_inc(
-                "session.frames.orphaned",
-                frame_type="CONN_CLOSE",
-            )
+            metrics_inc("session.frames.orphaned", frame_type="CONN_CLOSE")
             return
         pending = self._pending_connects.get(conn_id)
         if pending is not None and not pending.ack_future.done():
@@ -398,10 +360,7 @@ class FrameReceiver:
         """
         flow = self._udp_registry.get(flow_id)
         if flow is None:
-            metrics_inc(
-                "session.frames.orphaned",
-                frame_type="UDP_DATA",
-            )
+            metrics_inc("session.frames.orphaned", frame_type="UDP_DATA")
             return
         data = decode_binary_payload(payload)
         metrics_inc("session.frames.bytes.in", value=len(data))
@@ -413,10 +372,7 @@ class FrameReceiver:
         if flow is not None:
             flow.on_remote_closed()
         else:
-            metrics_inc(
-                "session.frames.orphaned",
-                frame_type="UDP_CLOSE",
-            )
+            metrics_inc("session.frames.orphaned", frame_type="UDP_CLOSE")
 
     async def _on_error(self, conn_id: str, payload: str) -> None:
         """React to ERROR frame from agent.
@@ -444,12 +400,7 @@ class FrameReceiver:
         handler = self._tcp_registry.get(conn_id)
         if handler is not None:
             metrics_inc("session.frames.error.conn")
-            logger.warning(
-                "conn %s agent error: %s",
-                conn_id,
-                message,
-                extra={"conn_id": conn_id, "error_reason": message},
-            )
+            logger.warning("conn %s agent error: %s", conn_id, message)
             pending = self._pending_connects.get(conn_id)
             if pending is not None and not pending.ack_future.done():
                 pending.ack_future.set_result(AckStatus.AGENT_ERROR)
@@ -460,29 +411,20 @@ class FrameReceiver:
         flow = self._udp_registry.get(conn_id)
         if flow is not None:
             metrics_inc("session.frames.error.flow")
-            logger.debug(
-                "flow %s agent error: %s",
-                conn_id,
-                message,
-                extra={"flow_id": conn_id, "error_reason": message},
-            )
+            logger.debug("flow %s agent error: %s", conn_id, message)
             flow.on_remote_closed()
             return
 
         logger.debug(
-            "recv: ERROR frame for unknown conn_id %r — handler already "
-            "cleaned up (message: %s)",
+            "recv: ERROR frame for unknown conn_id %r — handler already cleaned up (message: %s)",
             conn_id,
             message[:120],
         )
         metrics_inc("session.frames.orphaned", frame_type="ERROR")
 
-    # ── Debug ─────────────────────────────────────────────────────────────────
-
     def __repr__(self) -> str:
         return (
-            f"<FrameReceiver "
-            f"tcp={len(self._tcp_registry)} "
+            f"<FrameReceiver tcp={len(self._tcp_registry)} "
             f"udp={len(self._udp_registry)} "
             f"pending={len(self._pending_connects)} "
             f"ws_closed={self._ws_closed.is_set()}>"

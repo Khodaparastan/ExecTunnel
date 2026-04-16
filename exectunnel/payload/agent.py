@@ -386,6 +386,7 @@ def _parse_host_port(
         return None
     return host, port
 
+
 class _FrameWriter:
     _STOP: object = object()
 

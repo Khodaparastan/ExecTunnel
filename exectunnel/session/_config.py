@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True, frozen=True)
 class SessionConfig:
-    """All tunables the tunnel session needs — flat, no nesting."""
+    """All tunables the tunnel session needs."""
 
     # ── WebSocket connection ──────────────────────────────────────────
     wss_url: str
@@ -38,17 +38,17 @@ class SessionConfig:
     send_queue_cap: int = Defaults.WS_SEND_QUEUE_CAP
 
     def ssl_context(self) -> ssl.SSLContext | None:
-        """Return the SSL context override, or ``None`` for plain ws://."""
+        """Return explicit SSL context override, or None for library defaults."""
         if self.ssl_context_override is not None:
             return self.ssl_context_override
         if self.wss_url.startswith("ws://"):
             return None
-        return self.ssl_context_override
+        return None
 
 
 @dataclass(slots=True, frozen=True)
 class TunnelConfig:
-    """Tunnel-specific tunables (SOCKS, bootstrap, UDP, DNS, connect)."""
+    """Tunnel-specific tunables."""
 
     socks_host: str = Defaults.SOCKS_DEFAULT_HOST
     socks_port: int = Defaults.SOCKS_DEFAULT_PORT
