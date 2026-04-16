@@ -45,7 +45,7 @@ def create_ssl_context(insecure: bool) -> ssl.SSLContext:
     ctx = ssl.create_default_context()
     ctx.set_alpn_protocols(["http/1.1"])
     if insecure:
-        logger.warning("TLS verification disabled (WSS_INSECURE=1)")
+        logger.warning("TLS verification disabled")
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
     return ctx
@@ -93,7 +93,9 @@ def build_session_config(
         reconnect_max_retries: Override for max reconnect attempts.
     """
     url = wss_url or get_wss_url()
-    resolved_insecure = insecure or parse_bool_env("WSS_INSECURE")
+    resolved_insecure = insecure or parse_bool_env(
+        "EXECTUNNEL_WSS_INSECURE", parse_bool_env("WSS_INSECURE")
+    )
 
     ssl_ctx = ssl_context
     if ssl_ctx is None and url.startswith("wss://"):

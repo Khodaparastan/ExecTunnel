@@ -13,6 +13,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from .._config import build_session_config
 from ..ui import THEME, Icons
 
 __all__ = ["app"]
@@ -41,13 +42,14 @@ class _EnvEntry:
 
 _ENV_VARS: tuple[_EnvEntry, ...] = (
     _EnvEntry("EXECTUNNEL_WSS_URL", "WebSocket endpoint (or WSS_URL)"),
+    _EnvEntry("EXECTUNNEL_WSS_INSECURE", "Skip TLS verification (preferred)", "false"),
     _EnvEntry("WSS_INSECURE", "Skip TLS verification", "false"),
     _EnvEntry("EXECTUNNEL_PING_INTERVAL", "Keepalive ping interval (s)", "20"),
-    _EnvEntry("EXECTUNNEL_SEND_TIMEOUT", "WS send timeout (s)", "30"),
+    _EnvEntry("EXECTUNNEL_SEND_TIMEOUT", "WS send timeout (s)", "15"),
     _EnvEntry("EXECTUNNEL_SEND_QUEUE_CAP", "Send queue capacity", "512"),
     _EnvEntry("EXECTUNNEL_RECONNECT_MAX_RETRIES", "Max reconnect retries", "10"),
     _EnvEntry("EXECTUNNEL_RECONNECT_BASE_DELAY", "Reconnect base delay (s)", "1.0"),
-    _EnvEntry("EXECTUNNEL_RECONNECT_MAX_DELAY", "Reconnect max delay (s)", "30.0"),
+    _EnvEntry("EXECTUNNEL_RECONNECT_MAX_DELAY", "Reconnect max delay (s)", "15.0"),
     _EnvEntry("EXECTUNNEL_DNS_MAX_INFLIGHT", "DNS max inflight queries", "1024"),
     _EnvEntry("EXECTUNNEL_CONNECT_MAX_PENDING", "Max pending connects (global)", "128"),
     _EnvEntry(
@@ -143,9 +145,48 @@ def validate_config() -> None:
     else:
         warnings.append("No WSS URL set (EXECTUNNEL_WSS_URL / WSS_URL)")
 
+    # ── Selected env sanity checks ───────────────────────────────────────
+    bootstrap_delivery = os.environ.get(
+        "EXECTUNNEL_BOOTSTRAP_DELIVERY", "upload"
+    ).strip()
+    if bootstrap_delivery not in {"upload", "fetch"}:
+        errors.append("EXECTUNNEL_BOOTSTRAP_DELIVERY must be one of: upload, fetch")
+    else:
+        ok_items.append(f"Bootstrap delivery mode is valid: {bootstrap_delivery}")
+
+    def _parse_float(name: str) -> float | None:
+        raw = os.environ.get(name)
+        if raw is None:
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            errors.append(f"{name} must be a float, got: {raw!r}")
+            return None
+
+    def _parse_int(name: str) -> int | None:
+        raw = os.environ.get(name)
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            errors.append(f"{name} must be an integer, got: {raw!r}")
+            return None
+
+    base_delay = _parse_float("EXECTUNNEL_RECONNECT_BASE_DELAY")
+    max_delay = _parse_float("EXECTUNNEL_RECONNECT_MAX_DELAY")
+    if base_delay is not None and max_delay is not None and max_delay < base_delay:
+        errors.append(
+            "EXECTUNNEL_RECONNECT_MAX_DELAY must be >= EXECTUNNEL_RECONNECT_BASE_DELAY"
+        )
+
+    send_queue_cap = _parse_int("EXECTUNNEL_SEND_QUEUE_CAP")
+    if send_queue_cap is not None and send_queue_cap < 1:
+        errors.append("EXECTUNNEL_SEND_QUEUE_CAP must be >= 1")
+
     # ── Full SessionConfig round-trip ──────────────────────────────────────
     try:
-        from .._config import build_session_config
 
         build_session_config()
         ok_items.append("Full SessionConfig validation passed")

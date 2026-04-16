@@ -16,6 +16,7 @@ from typing import Annotated, Any
 import typer
 from rich import box
 from rich.console import Console
+from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 
@@ -29,7 +30,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_DEFAULT_SOCKET = "/tmp/exectunnel.sock"  # TODO: move to XDG_RUNTIME_DIR
+_DEFAULT_SOCKET = "/tmp/exectunnel.sock"  # TODO: move to XDG_RUNTIME_DIR  # noqa: S108
 _QUERY_TIMEOUT_SECS = 5.0
 _CONNECT_TIMEOUT_SECS = 3.0
 _WATCH_INTERVAL_SECS = 1.0
@@ -126,7 +127,11 @@ def status(
         typer.Option("--json", help="Output raw JSON."),
     ] = False,
 ) -> None:
-    """Display health and statistics for a running tunnel session."""
+    """Display health and statistics for a running tunnel session.
+
+    Note: session IPC support is not implemented yet; this command is
+    currently experimental and will usually return an error.
+    """
     try:
         exit_code = asyncio.run(
             _status_async(
@@ -184,7 +189,6 @@ async def _status_async(
         return 0
 
     # -- Live watch loop --
-    from rich.live import Live
 
     with Live(
         _build_status_panel(data),

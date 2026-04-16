@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Annotated
+from typing import Annotated, Literal
 
 import typer
 from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
+from exectunnel import __version__
+from exectunnel.observability.logging import configure_logging
 from exectunnel.session import TunnelConfig
 
+from .._config import build_session_config
 from ..runner import run_session
 from ..ui import BANNER, THEME, BootstrapSpinner, Icons
 
@@ -23,6 +26,7 @@ __all__ = ["connect"]
 
 _URL_DISPLAY_MAX = 90
 _VALID_SCHEMES = ("ws://", "wss://")
+_VALID_LOG_LEVELS = frozenset({"debug", "info", "warning", "error"})
 
 
 # ---------------------------------------------------------------------------
@@ -35,9 +39,15 @@ def _get_console() -> Console:
 
 
 def _print_banner(con: Console) -> None:
-    from exectunnel import __version__
 
     con.print(BANNER.format(version=__version__))
+
+
+def _normalize_log_level(value: str) -> Literal["debug", "info", "warning", "error"]:
+    level = value.lower().strip()
+    if level == "warn":
+        level = "warning"
+    return level
 
 
 def _parse_headers(
@@ -174,17 +184,15 @@ def connect(
     ] = False,
 ) -> None:
     """Connect via a raw WebSocket exec URL."""
-    _VALID_LOG_LEVELS = frozenset({"debug", "info", "warning", "error"})
-    if log_level not in _VALID_LOG_LEVELS:
+    normalized_log_level = _normalize_log_level(log_level)
+    if normalized_log_level not in _VALID_LOG_LEVELS:
         raise typer.BadParameter(
             f"Invalid log level {log_level!r}. "
             f"Choose from: {', '.join(sorted(_VALID_LOG_LEVELS))}",
             param_hint="'--log-level'",
         )
 
-    from exectunnel.observability.logging import configure_logging
-
-    configure_logging(log_level)  # type: ignore[arg-type]
+    configure_logging(normalized_log_level)
 
     con = _get_console()
     _print_banner(con)
@@ -253,7 +261,6 @@ async def _ws_async(
     _print_ws_summary(con, url, ws_headers, socks_host, socks_port)
 
     # Build configs
-    from .._config import build_session_config
 
     session_cfg = build_session_config(
         wss_url=url,
