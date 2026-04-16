@@ -1,7 +1,7 @@
 # ExecTunnel — Protocol Package API Reference
 
 ```
-exectunnel/protocol/  |  api-doc v1.1  |  Python 3.13+
+exectunnel/protocol/  |  api-doc v1.2  |  Python 3.13+
 audience: developers building transport / proxy / session / agent layers
 ```
 
@@ -21,20 +21,22 @@ Import everything from the package root:
 ```python
 from exectunnel.protocol import (
     # constants
-    FRAME_PREFIX, FRAME_SUFFIX, READY_FRAME, SESSION_CONN_ID, MAX_FRAME_LEN,
+    FRAME_PREFIX, FRAME_SUFFIX, READY_FRAME, SESSION_CONN_ID,
+    MAX_FRAME_LEN, PORT_UNSPECIFIED,
     # frame result type
     ParsedFrame,
     # encoders
-    encode_conn_open_frame, encode_conn_close_frame,
-    encode_data_frame, encode_error_frame,
+    encode_conn_open_frame, encode_conn_ack_frame, encode_conn_close_frame,
+    encode_data_frame, encode_error_frame, encode_keepalive_frame,
     encode_udp_open_frame, encode_udp_data_frame, encode_udp_close_frame,
     # decoder
     parse_frame, is_ready_frame,
     # payload helpers
     decode_binary_payload, decode_error_payload,
     encode_host_port, parse_host_port,
-    # id generators
-    new_conn_id, new_flow_id, ID_RE,
+    # id generators & validators
+    new_conn_id, new_flow_id, new_session_id,
+    CONN_FLOW_ID_RE, ID_RE, SESSION_ID_RE,
     # socks5 enums
     AddrType, AuthMethod, Cmd, Reply, UserPassStatus,
 )
@@ -51,16 +53,21 @@ implementation detail and may change.
 GENERATE IDs ──────────────────────────────────────────────────────────────────
   new_conn_id()                     →  "c<24 hex>"   TCP connection ID
   new_flow_id()                     →  "u<24 hex>"   UDP flow ID
-  ID_RE                             →  compiled re   validate an ID string
+  new_session_id()                  →  "s<24 hex>"   session correlation ID
+  CONN_FLOW_ID_RE                   →  compiled re   validate c/u ID strings
+  ID_RE                             →  compiled re   alias for CONN_FLOW_ID_RE
+  SESSION_ID_RE                     →  compiled re   validate s session IDs
 
 ENCODE FRAMES ─────────────────────────────────────────────────────────────────
   encode_conn_open_frame(id, h, p)  →  frame str     open TCP connection
+  encode_conn_ack_frame(id)         →  frame str     acknowledge CONN_OPEN
   encode_conn_close_frame(id)       →  frame str     close TCP connection
   encode_data_frame(id, bytes)      →  frame str     TCP data chunk
   encode_udp_open_frame(id, h, p)   →  frame str     open UDP flow
   encode_udp_data_frame(id, bytes)  →  frame str     UDP datagram
   encode_udp_close_frame(id)        →  frame str     close UDP flow
   encode_error_frame(id, msg)       →  frame str     error report
+  encode_keepalive_frame()          →  frame str     session heartbeat (never raises)
 
 DECODE FRAMES ─────────────────────────────────────────────────────────────────
   parse_frame(line)                 →  ParsedFrame | None
@@ -127,18 +134,45 @@ udp_flows[flow_id] = remote_addr
 
 ---
 
+### `new_session_id() → str`
+
+Generates a cryptographically random session correlation ID.
+
+**Returns:** `"s"` followed by 24 lowercase hex characters.
+Example: `"s3f7a1c9e2b4d6f8a0c2e4b6d8"`
+
+**Raises:** Nothing.
+
+**Important:** Session IDs use the `s` prefix and are validated by
+`SESSION_ID_RE`. They are **never embedded in tunnel frames** — they exist
+solely for log and trace correlation at the session layer.
+
+```python
+session_id = new_session_id()
+log.info("tunnel session opened", extra={"session_id": session_id})
+# Pass to observability / tracing — never pass to encode_*_frame()
+```
+
+---
+
 ### ID Format Contract
 
-Both functions share the same format guarantee:
+All three generators share the same structural guarantee:
 
 ```
-[cu][0-9a-f]{24}
+[cu][0-9a-f]{24}    ← TCP conn IDs and UDP flow IDs  (CONN_FLOW_ID_RE / ID_RE)
+s[0-9a-f]{24}       ← session correlation IDs         (SESSION_ID_RE)
 │    └─────────── 24 lowercase hex chars (96-bit CSPRNG token)
-└─────────────── "c" for TCP, "u" for UDP
+└─────────────── "c" TCP  |  "u" UDP  |  "s" session
 ```
 
 **Never construct IDs manually.** The format is validated by every encoder — a
-hand-crafted string that fails `ID_RE` will raise `ProtocolError` immediately.
+hand-crafted string that fails `CONN_FLOW_ID_RE` will raise `ProtocolError`
+immediately.
+
+**`CONN_FLOW_ID_RE` is the canonical name.** `ID_RE` is a backward-compatible
+alias pointing to the same compiled pattern object. New code should prefer
+`CONN_FLOW_ID_RE` for clarity.
 
 **`SESSION_CONN_ID` is not a real ID.** It is a reserved sentinel
 (`"c" + "0" * 24`) used exclusively in `encode_error_frame` for session-level
@@ -148,8 +182,12 @@ errors. Do not store it in your connection table.
 # ✓ correct — session-level error
 frame = encode_error_frame(SESSION_CONN_ID, "WebSocket closed unexpectedly")
 
-# ✗ wrong — SESSION_CONN_ID is not a connection
+# ✗ wrong — SESSION_CONN_ID is not a real connection
 connections[SESSION_CONN_ID] = writer
+
+# ✗ wrong — session IDs must never be passed to frame encoders
+frame = encode_conn_open_frame(new_session_id(), "redis", 6379)
+# → ProtocolError: Invalid tunnel CONN_OPEN ID 's...': must match [cu][0-9a-f]{24}
 ```
 
 ---
@@ -193,6 +231,36 @@ frame = encode_conn_open_frame(new_conn_id(), "postgres.default.svc", 5432)
 # IPv6 — bracket-quoting and compression are handled automatically
 frame = encode_conn_open_frame(new_conn_id(), "2001:db8::1", 443)
 # wire: <<<EXECTUNNEL:CONN_OPEN:c...:[2001:db8::1]:443>>>
+```
+
+---
+
+### `encode_conn_ack_frame(conn_id: str) → str`
+
+Encodes a `CONN_ACK` frame acknowledging a `CONN_OPEN` request.
+
+Sent by the **agent** once the target TCP connection is established. The client
+uses the echoed `conn_id` to resolve the pending-connect future and begin
+sending `DATA` frames.
+
+**Arguments:**
+
+| Argument  | Type  | Constraints                                                          |
+|-----------|-------|----------------------------------------------------------------------|
+| `conn_id` | `str` | Must match `[cu][0-9a-f]{24}` — echoed from the original `CONN_OPEN` |
+
+**Raises:** `ProtocolError` — bad `conn_id`.
+
+**Important:** The client must not send `DATA` frames for a connection until
+`CONN_ACK` is received. Sending data before `CONN_ACK` may arrive at the agent
+before the socket is ready.
+
+```python
+# Agent side — after successfully connecting to the target host
+sock = socket.create_connection((host, port))
+frame = encode_conn_ack_frame(conn_id)
+sys.stdout.write(frame)
+sys.stdout.flush()
 ```
 
 ---
@@ -333,12 +401,38 @@ await ws.send(frame)
 
 ---
 
+### `encode_keepalive_frame() → str`
+
+Encodes a `KEEPALIVE` frame — a session-level heartbeat sent client → agent.
+
+The frame carries no `conn_id` and no payload. The agent silently discards it
+to confirm the WebSocket channel is still alive.
+
+**Arguments:** None.
+
+**Raises:** Nothing. This encoder accepts no arguments and always produces a
+structurally valid, length-safe frame.
+
+```python
+# Periodic heartbeat loop (session layer)
+async def _keepalive_loop(ws, interval_s: float) -> None:
+    while True:
+        await asyncio.sleep(interval_s)
+        await ws.send(encode_keepalive_frame())
+```
+
+---
+
 ### Common Encoder Mistakes
 
 ```python
 # ✗ wrong — hand-crafted ID bypasses validation until the encoder catches it
 frame = encode_data_frame("myconn", data)
 # → ProtocolError: Invalid tunnel DATA ID 'myconn': must match [cu][0-9a-f]{24}
+
+# ✗ wrong — session ID passed as conn_id — s-prefix rejected by CONN_FLOW_ID_RE
+frame = encode_conn_open_frame(new_session_id(), "redis", 6379)
+# → ProtocolError: Invalid tunnel CONN_OPEN ID 's...': must match [cu][0-9a-f]{24}
 
 # ✗ wrong — port 0 is rejected (not a valid destination port for OPEN frames)
 frame = encode_conn_open_frame(conn_id, "redis", 0)
@@ -356,9 +450,12 @@ frame = encode_conn_open_frame(conn_id, "redis..default", 6379)
 frame = encode_conn_open_frame(conn_id, "::1", 8080)
 # wire payload: [::1]:8080
 
-# ✗ wrong — AGENT_READY is a constant, never encoded via _encode_frame
+# ✗ wrong — AGENT_READY is a constant emitted by the agent, never by the client
 # There is no encode_agent_ready_frame() function — use READY_FRAME directly
 sys.stdout.write(READY_FRAME + "\n")
+
+# ✓ correct — keepalive takes no arguments
+frame = encode_keepalive_frame()  # always succeeds
 ```
 
 ---
@@ -371,6 +468,7 @@ Parses one line of text from the tunnel channel into a structured frame.
 
 **Argument:** `line` — a single line from the WebSocket channel, with or without
 a trailing newline. Leading/trailing whitespace is stripped before parsing.
+Proxy-injected suffixes after `>>>` are silently stripped before validation.
 
 **Returns:**
 
@@ -386,13 +484,16 @@ propagate upward.
 
 **Check order (load-bearing):**
 
-1. Strip whitespace
+1. Strip whitespace; strip proxy-injected suffix if present
 2. Check for `FRAME_PREFIX` + `FRAME_SUFFIX` — if absent, return `None`
    regardless of line length
 3. Check length against `MAX_FRAME_LEN` — oversized tunnel frames raise
    `FrameDecodingError`; oversized non-frame lines are logged at DEBUG and
    return `None`
-4. Parse `msg_type`, `conn_id`, `payload`
+4. Parse `msg_type`, `conn_id`, `payload` via `split(":", 2)`
+5. Validate `msg_type` against `_VALID_MSG_TYPES`
+6. Enforce `_NO_CONN_ID_TYPES` frames carry no extra fields
+7. Validate `conn_id` format against `CONN_FLOW_ID_RE`
 
 **Transport contract:** expects a single complete line. The transport layer is
 responsible for buffering the byte stream and splitting on `\n`. Passing a raw
@@ -419,10 +520,14 @@ async for message in websocket:
             case "DATA":
                 data = decode_binary_payload(frame.payload)
                 await connections[frame.conn_id].write(data)
+            case "CONN_ACK":
+                pending_connects[frame.conn_id].set_result(None)
             case "CONN_CLOSE":
                 await _close_connection(frame.conn_id)
             case "AGENT_READY":
                 session.mark_ready()
+            case "KEEPALIVE":
+                pass  # client→agent only; agent discards silently
             case "ERROR":
                 msg = decode_error_payload(frame.payload)
                 await _handle_agent_error(frame.conn_id, msg)
@@ -452,7 +557,7 @@ Returns `True` if `line` is the `AGENT_READY` bootstrap sentinel.
 **Argument:** `line` — a single line from the WebSocket channel.
 
 **Returns:** `True` only for `<<<EXECTUNNEL:AGENT_READY>>>` (after whitespace
-stripping). `False` for everything else.
+stripping and proxy-suffix truncation). `False` for everything else.
 
 **Raises:** Nothing. This is a **pure string predicate** — it never raises.
 
@@ -497,16 +602,17 @@ The structured result of `parse_frame`.
 ```python
 @dataclass(frozen=True, slots=True)
 class ParsedFrame:
-    msg_type: str        # one of the 8 valid frame types
-    conn_id:  str | None # "[cu][0-9a-f]{24}", or None for AGENT_READY
+    msg_type: str  # one of the 10 valid frame types
+    conn_id: str | None  # "[cu][0-9a-f]{24}", or None for AGENT_READY / KEEPALIVE
     payload:  str        # raw payload string or "" when absent
 ```
 
 **Immutable** — `frozen=True` prevents accidental mutation after parsing.
 
-**`conn_id` is `str | None`** — it is `None` if and only if
-`msg_type == "AGENT_READY"`. Type checkers correctly flag missing `None`-checks
-and will not produce false positives on `if frame.conn_id is None` guards.
+**`conn_id` is `str | None`** — it is `None` if and only if `msg_type` is in
+`_NO_CONN_ID_TYPES` (`"AGENT_READY"` or `"KEEPALIVE"`). Type checkers correctly
+flag missing `None`-checks and will not produce false positives on
+`if frame.conn_id is None` guards.
 
 **`payload` is always raw** — it is never decoded by `parse_frame`. Call the
 appropriate payload helper based on `msg_type`:
@@ -514,7 +620,9 @@ appropriate payload helper based on `msg_type`:
 | `msg_type`    | `conn_id` | Payload helper                         |
 |---------------|-----------|----------------------------------------|
 | `AGENT_READY` | `None`    | — (no payload)                         |
+| `KEEPALIVE`   | `None`    | — (no payload)                         |
 | `CONN_OPEN`   | `str`     | `parse_host_port(frame.payload)`       |
+| `CONN_ACK`    | `str`     | — (no payload)                         |
 | `CONN_CLOSE`  | `str`     | — (no payload)                         |
 | `DATA`        | `str`     | `decode_binary_payload(frame.payload)` |
 | `UDP_OPEN`    | `str`     | `parse_host_port(frame.payload)`       |
@@ -607,9 +715,9 @@ OPEN payload outside the standard encoders.
 * Domain: `"redis.default.svc:6379"`
 
 **Port range:** `[1, 65535]`. Port `0` is rejected — it is not a valid
-destination port for `OPEN` frames. See `build_socks5_reply` in the proxy layer
-for the separate use-case where port `0` is the RFC 1928 §6 "unspecified"
-sentinel.
+destination port for `OPEN` frames. The `PORT_UNSPECIFIED` constant (`0`) is
+provided for the separate use-case where port `0` is the RFC 1928 §6
+"unspecified" sentinel in `build_socks5_reply` (proxy layer only).
 
 **Raises:** `ProtocolError` — empty host, port out of range, frame-unsafe
 characters (`:`/`<`/`>`) in host, consecutive dots in hostname, or invalid
@@ -705,28 +813,30 @@ UserPassStatus(0x00)  # → UserPassStatus.SUCCESS
 
 RFC 1928 §3 — authentication method negotiation.
 
-| Member | Value | Supported |
-|---|---|---|
-| `NO_AUTH` | `0x00` | ✓ |
-| `GSSAPI` | `0x01` | ✗ wire-only |
-| `USERNAME_PASSWORD` | `0x02` | ✓ |
-| `NO_ACCEPT` | `0xFF` | ✓ (sent to reject) |
+This tunnel accepts **only `NO_AUTH`**. Both `GSSAPI` and `USERNAME_PASSWORD`
+are defined for wire-format completeness and their `is_supported()` returns
+`False`. A peer that offers only unsupported methods receives `NO_ACCEPT`.
+
+| Member              | Value  | `is_supported()` | Notes                                        |
+|---------------------|--------|------------------|----------------------------------------------|
+| `NO_AUTH`           | `0x00` | `True`           | Only accepted tunnel auth method             |
+| `GSSAPI`            | `0x01` | `False`          | Wire-only — never negotiated                 |
+| `USERNAME_PASSWORD` | `0x02` | `False`          | Wire-only — never negotiated                 |
+| `NO_ACCEPT`         | `0xFF` | `True`           | Sent by server to reject all offered methods |
 
 Use `is_supported()` to programmatically check whether a method is implemented
 before attempting negotiation:
 
 ```python
-# Proxy layer — method selection
-client_methods = set()
+# Proxy layer — method selection (tunnel only negotiates NO_AUTH)
+offered: set[AuthMethod] = set()
 for b in offered_bytes:
     try:
-        client_methods.add(AuthMethod(b))
+        offered.add(AuthMethod(b))
     except ValueError:
         pass  # unknown method bytes are ignored per RFC 1928 §3
 
-if AuthMethod.USERNAME_PASSWORD in client_methods:
-    chosen = AuthMethod.USERNAME_PASSWORD
-elif AuthMethod.NO_AUTH in client_methods:
+if AuthMethod.NO_AUTH in offered:
     chosen = AuthMethod.NO_AUTH
 else:
     chosen = AuthMethod.NO_ACCEPT
@@ -740,11 +850,11 @@ writer.write(bytes([0x05, int(chosen)]))
 
 RFC 1928 §4 — client command codes.
 
-| Member | Value | Supported |
-|---|---|---|
-| `CONNECT` | `0x01` | ✓ |
-| `BIND` | `0x02` | ✗ wire-only |
-| `UDP_ASSOCIATE` | `0x03` | ✓ |
+| Member          | Value  | `is_supported()` | Notes                       |
+|-----------------|--------|------------------|-----------------------------|
+| `CONNECT`       | `0x01` | `True`           | TCP tunnel connection       |
+| `BIND`          | `0x02` | `False`          | Wire-only — not implemented |
+| `UDP_ASSOCIATE` | `0x03` | `True`           | UDP tunnel flow             |
 
 Use `is_supported()` to guard dispatch before the `match` statement:
 
@@ -827,7 +937,7 @@ RFC 1928 §6 — reply codes sent back to the SOCKS5 client.
 def _reply_bytes(
     reply: Reply,
     bind_addr: str = "0.0.0.0",
-    bind_port: int = 0,       # port 0 is valid here — RFC 1928 §6 "unspecified"
+        bind_port: int = PORT_UNSPECIFIED,  # 0 valid here — RFC 1928 §6 "unspecified"
 ) -> bytes:
     addr_bytes = ipaddress.IPv4Address(bind_addr).packed
     return bytes([
@@ -902,11 +1012,12 @@ except ValueError:
 | `READY_FRAME`   | `"<<<EXECTUNNEL:AGENT_READY>>>"` | Use `is_ready_frame()` — do not string-compare manually |
 | `MAX_FRAME_LEN` | `8_192`                          | Maximum frame content length in chars, excluding `\n`   |
 
-### Sentinel IDs
+### Sentinel Values
 
-| Constant | Value | Use |
-|---|---|---|
-| `SESSION_CONN_ID` | `"c" + "0" × 24` | Pass to `encode_error_frame` for session-level errors; check with `frame.conn_id == SESSION_CONN_ID` |
+| Constant           | Value            | Use                                                                                                                            |
+|--------------------|------------------|--------------------------------------------------------------------------------------------------------------------------------|
+| `SESSION_CONN_ID`  | `"c" + "0" × 24` | Pass to `encode_error_frame` for session-level errors; check with `frame.conn_id == SESSION_CONN_ID`                           |
+| `PORT_UNSPECIFIED` | `0`              | RFC 1928 §6 "unspecified" bind port in `_reply_bytes` (proxy layer); **never** pass to `encode_host_port` or `parse_host_port` |
 
 ```python
 # Dispatching on session vs per-connection errors
@@ -1063,21 +1174,31 @@ try:
     parse_frame(line)
 except FrameDecodingError as exc:
     ...
+
+# ✗ wrong — passing a session ID as conn_id
+frame = encode_conn_open_frame(new_session_id(), "redis", 6379)
+# → ProtocolError: s-prefix rejected by CONN_FLOW_ID_RE
+
+# ✗ wrong — passing PORT_UNSPECIFIED to encode_host_port
+encode_host_port("redis", PORT_UNSPECIFIED)
+# → ProtocolError: Port 0 is out of range [1, 65535]
+# Use PORT_UNSPECIFIED only in _reply_bytes at the proxy layer
 ```
 
 ---
 
 ## Section 8 — Integration Checklist
 
-Use this checklist when integrating the protocol package into a new layer:
-
 ```
 IDs
   □  Call new_conn_id() once per TCP connection — never reuse IDs
   □  Call new_flow_id() once per UDP flow — never reuse IDs
-  □  Store IDs as dict keys — they are hashable strings
+  □  Call new_session_id() once per tunnel session — for logging/tracing only
+  □  Store conn/flow IDs as dict keys — they are hashable strings
   □  Use SESSION_CONN_ID only for session-level encode_error_frame calls
   □  Never store SESSION_CONN_ID in the connection or flow table
+  □  Never pass a session ID (s-prefix) to any frame encoder
+  □  Use CONN_FLOW_ID_RE for new code; ID_RE is a backward-compat alias
 
 ENCODING
   □  Never construct frame strings manually — always use encode_*_frame()
@@ -1085,6 +1206,9 @@ ENCODING
   □  Always emit CONN_CLOSE / UDP_CLOSE on teardown — never rely on timeout alone
   □  Split data > 6,108 bytes before calling encode_data_frame()
   □  Never split UDP datagrams — enforce MTU limits before encode_udp_data_frame()
+  □  Do not send DATA frames for a conn_id until CONN_ACK is received
+  □  Emit encode_keepalive_frame() periodically to keep the channel alive
+  □  Never pass PORT_UNSPECIFIED to encode_conn_open_frame or encode_udp_open_frame
 
 DECODING
   □  Call parse_frame() on every inbound line
@@ -1093,6 +1217,7 @@ DECODING
   □  Always call the correct payload helper for each msg_type
   □  Always check frame.conn_id == SESSION_CONN_ID in ERROR handler
   □  Never pass a multi-line string to parse_frame() — split on \n first
+  □  frame.conn_id is None for AGENT_READY and KEEPALIVE — guard before use
 
 BOOTSTRAP
   □  Use is_ready_frame() in the pre-ready scan — it never raises
@@ -1110,22 +1235,15 @@ SOCKS5 ENUMS
   □  Map ValueError from _missing_ to the appropriate Reply code
   □  Never use raw integer literals where an enum member exists
   □  Note: UserPassStatus never raises ValueError for valid byte values
+  □  Note: only NO_AUTH is negotiated by this tunnel — USERNAME_PASSWORD
+     and GSSAPI are wire-only and their is_supported() returns False
 ```
 
 ---
 
 ## Section 9 — Complete Layer Integration Examples
 
-These are full, copy-paste-ready patterns showing exactly how the protocol
-package is consumed at each layer boundary.
-
----
-
 ### 9.1 Transport Layer — Inbound Frame Pump
-
-The transport layer's sole job with respect to the protocol package is to split
-the raw WebSocket text stream into lines and hand each line to `parse_frame`. It
-must not decode payloads — that is the session layer's responsibility.
 
 ```python
 """
@@ -1150,12 +1268,11 @@ from exectunnel.protocol import ParsedFrame, parse_frame
 
 log = logging.getLogger(__name__)
 
-# Type alias for the session-layer callback
 FrameCallback = Callable[[ParsedFrame], Awaitable[None]]
 
 
 async def run_frame_pump(
-    websocket,                        # websockets.ClientConnection
+        websocket,
     on_frame: FrameCallback,
     *,
     ws_url: str,
@@ -1170,8 +1287,6 @@ async def run_frame_pump(
         ConnectionClosedError: On WebSocket close or corrupt tunnel frame.
     """
     async for raw_message in websocket:
-        # A single WebSocket message may contain multiple newline-delimited
-        # frames if the sender batched them (uncommon but valid).
         for line in raw_message.splitlines():
             try:
                 frame = parse_frame(line)
@@ -1192,7 +1307,6 @@ async def run_frame_pump(
                 ) from exc
 
             if frame is None:
-                # Shell noise, blank lines, bootstrap stdout — normal.
                 log.debug("transport: non-frame line: %r", line[:80])
                 continue
 
@@ -1231,7 +1345,7 @@ log = logging.getLogger(__name__)
 
 
 async def send_frame(
-    websocket,          # websockets.ClientConnection
+        websocket,
     frame: str,
     *,
     timeout_s: float,
@@ -1240,11 +1354,6 @@ async def send_frame(
     ws_url: str,
 ) -> None:
     """Send a pre-encoded *frame* string over *websocket*.
-
-    Args:
-        websocket:  Open WebSocket connection.
-        frame:      Newline-terminated frame string from any encode_*_frame().
-        timeout_s:  Maximum seconds to wait for the send to complete.
 
     Raises:
         WebSocketSendTimeoutError: If the send does not complete within
@@ -1276,9 +1385,6 @@ async def send_frame(
 ---
 
 ### 9.3 Session Layer — Full Inbound Dispatcher
-
-The session layer receives `ParsedFrame` objects from the transport layer and is
-responsible for all payload decoding and connection-table dispatch.
 
 ```python
 """
@@ -1314,33 +1420,21 @@ log = logging.getLogger(__name__)
 
 
 class InboundDispatcher:
-    """Dispatches inbound :class:`ParsedFrame` objects to the correct handler.
-
-    Args:
-        connections: Live TCP connection table ``{conn_id: asyncio.StreamWriter}``.
-        udp_flows:   Live UDP flow table ``{flow_id: UdpFlow}``.
-        state:       Current session state string (for UnexpectedFrameError).
-    """
+    """Dispatches inbound :class:`ParsedFrame` objects to the correct handler."""
 
     def __init__(
         self,
         connections: dict,
         udp_flows: dict,
+            pending_connects: dict,
         state: str,
     ) -> None:
         self._connections = connections
-        self._udp_flows   = udp_flows
-        self._state       = state
+        self._udp_flows = udp_flows
+        self._pending_connects = pending_connects
+        self._state = state
 
     async def dispatch(self, frame: ParsedFrame) -> None:
-        """Dispatch *frame* to the appropriate handler.
-
-        Raises:
-            ConnectionClosedError:  On session-level ERROR frame.
-            FrameDecodingError:     On corrupt payload (propagated).
-            UnexpectedFrameError:   On frames that cannot be handled in the
-                                    current session state.
-        """
         match frame.msg_type:
 
             case "DATA":
@@ -1348,6 +1442,18 @@ class InboundDispatcher:
 
             case "UDP_DATA":
                 await self._handle_udp_data(frame)
+
+            case "CONN_ACK":
+                # Resolve the pending-connect future so the client can
+                # begin sending DATA frames.
+                fut = self._pending_connects.pop(frame.conn_id, None)
+                if fut is not None and not fut.done():
+                    fut.set_result(None)
+                else:
+                    log.debug(
+                        "CONN_ACK for unknown/already-resolved conn %.8s… — ignoring",
+                        frame.conn_id,
+                    )
 
             case "CONN_CLOSE":
                 await self._handle_conn_close(frame)
@@ -1358,8 +1464,12 @@ class InboundDispatcher:
             case "ERROR":
                 await self._handle_error(frame)
 
+            case "KEEPALIVE":
+                # KEEPALIVE is client→agent only; the agent silently discards it.
+                # Receiving it from the agent is unexpected but harmless — log only.
+                log.debug("received unexpected inbound KEEPALIVE — ignoring")
+
             case "AGENT_READY":
-                # AGENT_READY is only valid during bootstrap — not here.
                 raise UnexpectedFrameError(
                     "Received AGENT_READY after session was already established.",
                     details={
@@ -1369,8 +1479,6 @@ class InboundDispatcher:
                 )
 
             case "CONN_OPEN" | "UDP_OPEN":
-                # These are client→agent only; receiving them from the agent
-                # is a protocol violation.
                 raise UnexpectedFrameError(
                     f"Agent sent a client-only frame type: {frame.msg_type!r}.",
                     details={
@@ -1380,8 +1488,6 @@ class InboundDispatcher:
                 )
 
             case _:
-                # parse_frame already validated msg_type — this branch should
-                # never be reached. Raise rather than silently drop.
                 raise UnexpectedFrameError(
                     f"Unhandled msg_type {frame.msg_type!r} in dispatcher.",
                     details={
@@ -1397,7 +1503,6 @@ class InboundDispatcher:
         if writer is None:
             log.warning("DATA for unknown conn_id %.8s… — dropping", frame.conn_id)
             return
-
         try:
             data = decode_binary_payload(frame.payload)
         except FrameDecodingError as exc:
@@ -1408,19 +1513,16 @@ class InboundDispatcher:
             )
             await self._close_connection(frame.conn_id)
             return
-
         writer.write(data)
         await writer.drain()
 
     async def _handle_udp_data(self, frame: ParsedFrame) -> None:
         flow = self._udp_flows.get(frame.conn_id)
         if flow is None:
-            # UDP_DATA after UDP_CLOSE is expected due to in-flight ordering —
-            # drop silently rather than logging at WARNING.
-            log.debug("UDP_DATA for unknown/closed flow_id %.8s… — dropping",
-                      frame.conn_id)
+            log.debug(
+                "UDP_DATA for unknown/closed flow_id %.8s… — dropping", frame.conn_id
+            )
             return
-
         try:
             data = decode_binary_payload(frame.payload)
         except FrameDecodingError as exc:
@@ -1431,7 +1533,6 @@ class InboundDispatcher:
             )
             await self._close_udp_flow(frame.conn_id)
             return
-
         await flow.send(data)
 
     async def _handle_conn_close(self, frame: ParsedFrame) -> None:
@@ -1474,9 +1575,7 @@ class InboundDispatcher:
             )
 
         log.warning(
-            "agent reported error for conn %.8s…: %s",
-            frame.conn_id,
-            message,
+            "agent reported error for conn %.8s…: %s", frame.conn_id, message
         )
         await self._close_connection(frame.conn_id)
 
@@ -1504,13 +1603,6 @@ class InboundDispatcher:
 ```python
 """
 session/outbound.py — outbound frame builder
-
-Responsibilities
-────────────────
-  - Translate session-layer intent into encoded frame strings
-  - Call encode_*_frame() with validated arguments
-  - Hand the resulting frame string to the transport sender
-  - Never write to the WebSocket directly
 """
 
 from __future__ import annotations
@@ -1520,10 +1612,12 @@ from collections.abc import Awaitable, Callable
 
 from exectunnel.protocol import (
     SESSION_CONN_ID,
+    encode_conn_ack_frame,
     encode_conn_close_frame,
     encode_conn_open_frame,
     encode_data_frame,
     encode_error_frame,
+    encode_keepalive_frame,
     encode_udp_close_frame,
     encode_udp_data_frame,
     encode_udp_open_frame,
@@ -1540,12 +1634,7 @@ _MAX_DATA_BYTES: int = 6_108
 
 
 class OutboundFrameBuilder:
-    """Builds and sends outbound frames on behalf of the session layer.
-
-    Args:
-        send: Coroutine that accepts a pre-encoded frame string and sends
-              it over the WebSocket (injected from transport layer).
-    """
+    """Builds and sends outbound frames on behalf of the session layer."""
 
     def __init__(self, send: SendCallback) -> None:
         self._send = send
@@ -1564,6 +1653,12 @@ class OutboundFrameBuilder:
         await self._send(frame)
         return conn_id
 
+    async def ack_connection(self, conn_id: str) -> None:
+        """Acknowledge a CONN_OPEN from the client (agent side)."""
+        frame = encode_conn_ack_frame(conn_id)
+        log.debug("session: CONN_ACK   %.8s…", conn_id)
+        await self._send(frame)
+
     async def close_connection(self, conn_id: str) -> None:
         """Close an existing TCP connection through the tunnel."""
         frame = encode_conn_close_frame(conn_id)
@@ -1573,8 +1668,7 @@ class OutboundFrameBuilder:
     async def send_data(self, conn_id: str, data: bytes) -> None:
         """Send *data* over an existing TCP connection.
 
-        Automatically splits *data* into chunks that fit within
-        ``MAX_FRAME_LEN``.
+        Automatically splits *data* into chunks that fit within MAX_FRAME_LEN.
         """
         for offset in range(0, max(len(data), 1), _MAX_DATA_BYTES):
             chunk = data[offset : offset + _MAX_DATA_BYTES]
@@ -1614,15 +1708,18 @@ class OutboundFrameBuilder:
         log.debug("session: UDP_DATA   %.8s…  %d bytes", flow_id, len(data))
         await self._send(frame)
 
+    # ── Session heartbeat ─────────────────────────────────────────────────────
+
+    async def send_keepalive(self) -> None:
+        """Send a KEEPALIVE heartbeat to the agent."""
+        frame = encode_keepalive_frame()
+        log.debug("session: KEEPALIVE")
+        await self._send(frame)
+
     # ── Errors ────────────────────────────────────────────────────────────────
 
     async def send_error(self, conn_id: str, message: str) -> None:
-        """Send an ERROR frame for a specific connection or the whole session.
-
-        Args:
-            conn_id: Connection ID, or ``SESSION_CONN_ID`` for session errors.
-            message: Human-readable error description.
-        """
+        """Send an ERROR frame for a specific connection or the whole session."""
         frame = encode_error_frame(conn_id, message)
         log.debug("session: ERROR      %.8s…  %r", conn_id, message[:60])
         await self._send(frame)
@@ -1640,13 +1737,11 @@ class OutboundFrameBuilder:
 """
 proxy/socks5.py — SOCKS5 request parser
 
-Responsibilities
-────────────────
-  - Parse the SOCKS5 handshake from the local client
-  - Map SOCKS5 commands to session-layer open_connection / open_udp_flow calls
-  - Map SOCKS5 address types to host strings for encode_host_port
-  - Send RFC 1928 reply bytes back to the local client
-  - Never call encode_*_frame directly — delegate to session outbound builder
+Note on auth:
+    This tunnel negotiates only NO_AUTH with remote agents.
+    The `require_auth` parameter here controls optional local-proxy
+    authentication — credentials are validated between the SOCKS5 client
+    and this proxy server only, independent of the tunnel protocol.
 """
 
 from __future__ import annotations
@@ -1657,6 +1752,7 @@ import logging
 
 from exectunnel.exceptions import AuthenticationError
 from exectunnel.protocol import (
+    PORT_UNSPECIFIED,
     AddrType,
     AuthMethod,
     Cmd,
@@ -1673,14 +1769,13 @@ _USERPASS_VERSION = 0x01
 def _reply_bytes(
     reply: Reply,
     bind_host: str = "0.0.0.0",
-        bind_port: int = 0,  # port 0 valid here — RFC 1928 §6 "unspecified"
+        bind_port: int = PORT_UNSPECIFIED,  # RFC 1928 §6 "unspecified"
 ) -> bytes:
-    """Build a SOCKS5 reply packet (RFC 1928 §6)."""
     addr = ipaddress.IPv4Address(bind_host).packed
     return bytes([
         _SOCKS_VERSION,
         int(reply),
-        0x00,           # RSV
+        0x00,
         int(AddrType.IPV4),
         *addr,
         *bind_port.to_bytes(2),
@@ -1690,21 +1785,12 @@ def _reply_bytes(
 async def handle_socks5_client(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
-    outbound,           # OutboundFrameBuilder
+        outbound,
     *,
     require_auth: bool = False,
     username: str = "",
     password: str = "",
 ) -> str | None:
-    """Perform the full SOCKS5 handshake and open the tunnel connection.
-
-    Returns:
-        The ``conn_id`` or ``flow_id`` assigned, or ``None`` if the
-        handshake failed (reply already sent to client).
-
-    Raises:
-        AuthenticationError: If credentials are required and rejected.
-    """
     peer = writer.get_extra_info("peername")
 
     # ── Phase 1: Method negotiation ───────────────────────────────────────────
@@ -1716,14 +1802,12 @@ async def handle_socks5_client(
     n_methods = header[1]
     method_bytes = await reader.readexactly(n_methods)
 
-    # Unknown method bytes are ignored per RFC 1928 §3 — the server picks
-    # from the offered list; unrecognised values are simply not considered.
     offered: set[AuthMethod] = set()
     for b in method_bytes:
         try:
             offered.add(AuthMethod(b))
         except ValueError:
-            pass
+            pass  # unknown method bytes ignored per RFC 1928 §3
 
     if require_auth and AuthMethod.USERNAME_PASSWORD in offered:
         chosen = AuthMethod.USERNAME_PASSWORD
@@ -1801,6 +1885,12 @@ async def handle_socks5_client(
     port = int.from_bytes(port_bytes)
 
     # ── Phase 5: Command dispatch ─────────────────────────────────────────────
+    if not cmd.is_supported():
+        writer.write(_reply_bytes(Reply.CMD_NOT_SUPPORTED))
+        await writer.drain()
+        writer.close()
+        return None
+
     match cmd:
         case Cmd.CONNECT:
             tunnel_id = await outbound.open_connection(host, port)
@@ -1823,6 +1913,7 @@ async def handle_socks5_client(
             return tunnel_id
 
         case Cmd.BIND:
+            # is_supported() already caught this — unreachable
             writer.write(_reply_bytes(Reply.CMD_NOT_SUPPORTED))
             await writer.drain()
             writer.close()
@@ -1842,8 +1933,10 @@ Responsibilities
 ────────────────
   - Parse frames arriving on stdin
   - Dispatch CONN_OPEN / UDP_OPEN to raw socket creation
+  - Emit CONN_ACK after successful TCP connect
   - Forward DATA / UDP_DATA to the appropriate socket
   - Emit DATA / ERROR / CONN_CLOSE frames back on stdout
+  - Silently discard KEEPALIVE frames
   - Use only stdlib — no asyncio, no websockets library
 """
 
@@ -1858,6 +1951,7 @@ from exectunnel.protocol import (
     SESSION_CONN_ID,
     ParsedFrame,
     decode_binary_payload,
+    encode_conn_ack_frame,
     encode_conn_close_frame,
     encode_data_frame,
     encode_error_frame,
@@ -1927,11 +2021,21 @@ class AgentFrameHandler:
                 self._handle_udp_data(frame)
             case "UDP_CLOSE":
                 self._handle_udp_close(frame)
+            case "KEEPALIVE":
+                # Session-level heartbeat from client — silently discard.
+                log.debug("agent: KEEPALIVE received — discarding")
             case "ERROR":
                 log.warning(
                     "client reported error for conn %.8s…", frame.conn_id
                 )
                 self._close_tcp(frame.conn_id)
+            case "CONN_ACK":
+                # CONN_ACK is agent→client only; receiving it from the
+                # client is a protocol violation — emit a session error.
+                _emit_error(
+                    SESSION_CONN_ID,
+                    f"Unexpected CONN_ACK received from client on agent side",
+                )
             case _:
                 # parse_frame validated msg_type — this is unreachable.
                 _emit_error(
@@ -1956,6 +2060,8 @@ class AgentFrameHandler:
             return
 
         self._tcp[frame.conn_id] = sock
+        # Acknowledge the connection so the client can begin sending DATA.
+        _emit(encode_conn_ack_frame(frame.conn_id))
         log.info("agent: CONN_OPEN  %.8s… → %s:%d", frame.conn_id, host, port)
 
     def _handle_conn_close(self, frame: ParsedFrame) -> None:
@@ -2058,14 +2164,21 @@ from exectunnel.protocol import (
     SESSION_CONN_ID,
     decode_binary_payload,
     decode_error_payload,
+    encode_conn_ack_frame,
     encode_conn_open_frame,
     encode_data_frame,
     encode_error_frame,
+    encode_keepalive_frame,
     encode_udp_open_frame,
+    is_ready_frame,
     new_conn_id,
     new_flow_id,
+    new_session_id,
     parse_frame,
     parse_host_port,
+    CONN_FLOW_ID_RE,
+    ID_RE,
+    SESSION_ID_RE,
 )
 from exectunnel.exceptions import FrameDecodingError, ProtocolError
 
@@ -2093,6 +2206,27 @@ def test_conn_open_round_trip(host: str, port: int) -> None:
         assert decoded_host == host  # domain name — exact match
 
 
+def test_conn_ack_round_trip() -> None:
+    conn_id = new_conn_id()
+    frame = encode_conn_ack_frame(conn_id)
+    parsed = parse_frame(frame.strip())
+
+    assert parsed is not None
+    assert parsed.msg_type == "CONN_ACK"
+    assert parsed.conn_id == conn_id
+    assert parsed.payload == ""
+
+
+def test_keepalive_round_trip() -> None:
+    frame = encode_keepalive_frame()
+    parsed = parse_frame(frame.strip())
+
+    assert parsed is not None
+    assert parsed.msg_type == "KEEPALIVE"
+    assert parsed.conn_id is None
+    assert parsed.payload == ""
+
+
 def test_data_frame_round_trip() -> None:
     conn_id  = new_conn_id()
     original = b"\x00\x01\x02\xff" * 256
@@ -2113,7 +2247,22 @@ def test_error_frame_round_trip() -> None:
     assert parsed.msg_type == "ERROR"
     assert parsed.conn_id  == SESSION_CONN_ID
     assert decode_error_payload(parsed.payload) == message
+
+
+def test_udp_open_round_trip() -> None:
+    flow_id = new_flow_id()
+    frame = encode_udp_open_frame(flow_id, "8.8.8.8", 53)
+    parsed = parse_frame(frame.strip())
+
+    assert parsed is not None
+    assert parsed.msg_type == "UDP_OPEN"
+    assert parsed.conn_id == flow_id
+    host, port = parse_host_port(parsed.payload)
+    assert host == "8.8.8.8"
+    assert port == 53
 ```
+
+---
 
 ### 10.2 `parse_frame` Boundary Tests
 
@@ -2135,7 +2284,7 @@ def test_parse_frame_raises_on_oversized_tunnel_frame() -> None:
     assert exc_info.value.details["codec"] == "frame"
 
 
-def test_parse_frame_raises_on_corrupt_tunnel_frame() -> None:
+def test_parse_frame_raises_on_unrecognised_msg_type() -> None:
     with pytest.raises(FrameDecodingError) as exc_info:
         parse_frame("<<<EXECTUNNEL:BADTYPE:ca1b2c3d4e5f6a7b8c9d0e1f2a3b>>>")
     assert exc_info.value.details["codec"] == "frame"
@@ -2146,16 +2295,48 @@ def test_parse_frame_raises_on_malformed_conn_id() -> None:
         parse_frame("<<<EXECTUNNEL:DATA:NOTANID:abc>>>")
 
 
+def test_parse_frame_raises_on_extra_fields_for_keepalive() -> None:
+    # KEEPALIVE must not carry a conn_id — extra field is a protocol error
+    with pytest.raises(FrameDecodingError) as exc_info:
+        parse_frame("<<<EXECTUNNEL:KEEPALIVE:ca1b2c3d4e5f6a7b8c9d0e1f2a3b>>>")
+    assert exc_info.value.details["codec"] == "frame"
+
+
+def test_parse_frame_raises_on_extra_fields_for_agent_ready() -> None:
+    # AGENT_READY must not carry a conn_id — extra field is a protocol error
+    with pytest.raises(FrameDecodingError):
+        parse_frame("<<<EXECTUNNEL:AGENT_READY:ca1b2c3d4e5f6a7b8c9d0e1f2a3b>>>")
+
+
+def test_parse_frame_keepalive_conn_id_is_none() -> None:
+    parsed = parse_frame("<<<EXECTUNNEL:KEEPALIVE>>>")
+    assert parsed is not None
+    assert parsed.conn_id is None
+    assert parsed.payload == ""
+
+
+def test_parse_frame_strips_proxy_suffix() -> None:
+    # Proxy-injected metadata appended after >>> must be silently stripped
+    line = "<<<EXECTUNNEL:KEEPALIVE>>> proxy-trace-id=abc123"
+    parsed = parse_frame(line)
+    assert parsed is not None
+    assert parsed.msg_type == "KEEPALIVE"
+
+
 def test_is_ready_frame_never_raises() -> None:
-    # Must not raise even for corrupt tunnel frames
+    # Must not raise even for lines that look like corrupt tunnel frames
     for line in [
         "",
         "<<<EXECTUNNEL:BADTYPE>>>",
         "<<<EXECTUNNEL:DATA:BADID:abc>>>",
         "x" * 9000,
+        "<<<EXECTUNNEL:AGENT_READY:unexpected_extra>>>",
     ]:
-        assert is_ready_frame(line) is False  # no exception
+        result = is_ready_frame(line)
+        assert isinstance(result, bool)  # no exception raised
 ```
+
+---
 
 ### 10.3 Encoder Validation Tests
 
@@ -2167,9 +2348,21 @@ def test_encoder_rejects_bad_conn_id() -> None:
     assert "expected" in exc_info.value.details
 
 
+def test_encoder_rejects_session_id_as_conn_id() -> None:
+    # s-prefix IDs must be rejected by all frame encoders
+    with pytest.raises(ProtocolError):
+        encode_conn_open_frame(new_session_id(), "redis", 6379)
+
+
 def test_encoder_rejects_port_zero() -> None:
     with pytest.raises(ProtocolError):
         encode_conn_open_frame(new_conn_id(), "redis", 0)
+
+
+def test_encoder_rejects_port_unspecified_in_open_frame() -> None:
+    from exectunnel.protocol import PORT_UNSPECIFIED
+    with pytest.raises(ProtocolError):
+        encode_conn_open_frame(new_conn_id(), "redis", PORT_UNSPECIFIED)
 
 
 def test_encoder_rejects_frame_unsafe_host() -> None:
@@ -2188,14 +2381,105 @@ def test_encoder_rejects_oversized_data() -> None:
 
 
 def test_encoder_accepts_session_conn_id_for_error_frame() -> None:
-    # SESSION_CONN_ID must be accepted by encode_error_frame
     frame = encode_error_frame(SESSION_CONN_ID, "test session error")
     parsed = parse_frame(frame.strip())
     assert parsed is not None
     assert parsed.conn_id == SESSION_CONN_ID
+
+
+def test_keepalive_encoder_never_raises() -> None:
+    # encode_keepalive_frame() takes no arguments and must always succeed
+    frame = encode_keepalive_frame()
+    assert frame.endswith("\n")
+    parsed = parse_frame(frame.strip())
+    assert parsed is not None
+    assert parsed.msg_type == "KEEPALIVE"
+    assert parsed.conn_id is None
+
+
+def test_conn_ack_encoder_rejects_bad_conn_id() -> None:
+    with pytest.raises(ProtocolError):
+        encode_conn_ack_frame("not-an-id")
+
+
+def test_conn_ack_encoder_rejects_session_id() -> None:
+    with pytest.raises(ProtocolError):
+        encode_conn_ack_frame(new_session_id())
 ```
 
-### 10.4 Exception Contract Tests
+---
+
+### 10.4 ID Generator & Validator Tests
+
+```python
+def test_new_conn_id_matches_pattern() -> None:
+    for _ in range(100):
+        cid = new_conn_id()
+        assert CONN_FLOW_ID_RE.match(cid), f"new_conn_id() produced invalid ID: {cid!r}"
+        assert cid.startswith("c")
+
+
+def test_new_flow_id_matches_pattern() -> None:
+    for _ in range(100):
+        fid = new_flow_id()
+        assert CONN_FLOW_ID_RE.match(fid), f"new_flow_id() produced invalid ID: {fid!r}"
+        assert fid.startswith("u")
+
+
+def test_new_session_id_matches_pattern() -> None:
+    for _ in range(100):
+        sid = new_session_id()
+        assert SESSION_ID_RE.match(
+            sid), f"new_session_id() produced invalid ID: {sid!r}"
+        assert sid.startswith("s")
+
+
+def test_id_re_is_alias_for_conn_flow_id_re() -> None:
+    # ID_RE must be the exact same compiled object as CONN_FLOW_ID_RE
+    assert ID_RE is CONN_FLOW_ID_RE
+
+
+def test_conn_flow_id_re_rejects_session_id() -> None:
+    # s-prefix session IDs must not match CONN_FLOW_ID_RE
+    assert CONN_FLOW_ID_RE.match(new_session_id()) is None
+
+
+def test_session_id_re_rejects_conn_id() -> None:
+    # c-prefix conn IDs must not match SESSION_ID_RE
+    assert SESSION_ID_RE.match(new_conn_id()) is None
+
+
+def test_session_id_re_rejects_flow_id() -> None:
+    # u-prefix flow IDs must not match SESSION_ID_RE
+    assert SESSION_ID_RE.match(new_flow_id()) is None
+
+
+def test_session_conn_id_passes_conn_flow_id_re() -> None:
+    assert CONN_FLOW_ID_RE.match(SESSION_CONN_ID) is not None
+
+
+def test_session_conn_id_not_produced_by_new_conn_id() -> None:
+    # Statistical check — none of 10,000 generated IDs should equal the sentinel
+    for _ in range(10_000):
+        assert new_conn_id() != SESSION_CONN_ID
+
+
+def test_conn_id_and_flow_id_prefix_namespace_isolation() -> None:
+    from exectunnel.protocol.ids import _TCP_PREFIX, _UDP_PREFIX, _SESSION_PREFIX
+    assert _TCP_PREFIX != _UDP_PREFIX
+    assert _TCP_PREFIX != _SESSION_PREFIX
+    assert _UDP_PREFIX != _SESSION_PREFIX
+
+
+def test_conn_id_and_flow_id_are_unique() -> None:
+    ids = {new_conn_id() for _ in range(1_000)}
+    ids |= {new_flow_id() for _ in range(1_000)}
+    assert len(ids) == 2_000  # no collisions in 2,000 samples
+```
+
+---
+
+### 10.5 Exception Contract Tests
 
 ```python
 def test_frame_decoding_error_is_chained() -> None:
@@ -2204,13 +2488,31 @@ def test_frame_decoding_error_is_chained() -> None:
     assert exc_info.value.__cause__ is not None
 
 
-def test_frame_decoding_error_details_keys() -> None:
+def test_frame_decoding_error_details_keys_base64url() -> None:
     with pytest.raises(FrameDecodingError) as exc_info:
         decode_binary_payload("!!!not-base64!!!")
     details = exc_info.value.details
     assert "raw_bytes" in details
     assert "codec"     in details
     assert details["codec"] == "base64url"
+
+
+def test_frame_decoding_error_details_keys_host_port() -> None:
+    with pytest.raises(FrameDecodingError) as exc_info:
+        parse_host_port("no-port-here")
+    details = exc_info.value.details
+    assert "raw_bytes" in details
+    assert "codec" in details
+    assert details["codec"] == "host:port"
+
+
+def test_frame_decoding_error_details_keys_frame() -> None:
+    with pytest.raises(FrameDecodingError) as exc_info:
+        parse_frame("<<<EXECTUNNEL:BADTYPE:ca1b2c3d4e5f6a7b8c9d0e1f2a3b>>>")
+    details = exc_info.value.details
+    assert "raw_bytes" in details
+    assert "codec" in details
+    assert details["codec"] == "frame"
 
 
 def test_protocol_error_details_keys() -> None:
@@ -2221,47 +2523,69 @@ def test_protocol_error_details_keys() -> None:
     assert "expected"   in details
 
 
-def test_session_conn_id_passes_id_re() -> None:
-    from exectunnel.protocol import ID_RE, SESSION_CONN_ID
-    assert ID_RE.match(SESSION_CONN_ID) is not None
+def test_decode_error_payload_chains_utf8_error() -> None:
+    # Encode raw non-UTF-8 bytes as base64url, then try to decode as error payload
+    import base64
+    bad_utf8 = b"\xff\xfe"
+    bad_payload = base64.urlsafe_b64encode(bad_utf8).rstrip(b"=").decode("ascii")
+    with pytest.raises(FrameDecodingError) as exc_info:
+        decode_error_payload(bad_payload)
+    assert exc_info.value.__cause__ is not None
+    assert exc_info.value.details["codec"] == "utf-8"
 
 
-def test_conn_id_and_flow_id_never_collide() -> None:
-    # Prefix namespace isolation — same token, different prefix
-    from exectunnel.protocol.ids import _TCP_PREFIX, _UDP_PREFIX
-    assert _TCP_PREFIX != _UDP_PREFIX
+def test_parse_host_port_rejects_port_zero() -> None:
+    with pytest.raises(FrameDecodingError):
+        parse_host_port("redis:0")
+
+
+def test_parse_host_port_rejects_port_above_range() -> None:
+    with pytest.raises(FrameDecodingError):
+        parse_host_port("redis:65536")
+
+
+def test_parse_host_port_ipv6_round_trip() -> None:
+    host, port = parse_host_port("[2001:db8::1]:443")
+    assert host == "2001:db8::1"
+    assert port == 443
+
+
+def test_parse_host_port_rejects_malformed_bracket() -> None:
+    with pytest.raises(FrameDecodingError):
+        parse_host_port("[2001:db8::1:443")  # missing closing bracket
 ```
 
-## Summary of Changes from v1.0
+---
 
-| Section                            | Change                                                                                                                                |
-|------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------|
-| Quick-Reference Card               | `is_ready_frame` annotated as "never raises"                                                                                          |
-| §2 Encoder intro                   | Added thread/async safety note                                                                                                        |
-| §2 `encode_conn_open_frame` raises | Added consecutive dots and `[1, 65535]` range to raises list                                                                          |
-| §2 `encode_udp_data_frame`         | Added MTU note; documented no-split behaviour                                                                                         |
-| §2 `encode_udp_close_frame`        | Added advisory-close / in-flight ordering note                                                                                        |
-| §2 Common Encoder Mistakes         | Added consecutive-dot example; added AGENT_READY note                                                                                 |
-| §3 `parse_frame`                   | Added "Check order" section; added transport contract note; updated dispatch example to use `splitlines()`                            |
-| §3 `is_ready_frame`                | Rewritten — now documented as pure predicate that never raises; design note explains why; bootstrap loop example updated              |
-| §3 `ParsedFrame`                   | `conn_id: str \| None` — added type-checker benefit note                                                                              |
-| §4 `encode_host_port`              | Added port `0` note and asymmetry with `build_socks5_reply`                                                                           |
-| §4 `parse_host_port`               | Added port `0` note                                                                                                                   |
-| §5 Enum Hierarchy                  | New subsection documenting `_StrictIntEnum` vs `IntEnum` split                                                                        |
-| §5 `AuthMethod`                    | Replaced `is_supported()` example with method-selection pattern using per-byte `try/except`                                           |
-| §5 `Cmd`                           | Separated `is_supported()` guard from `match` dispatch                                                                                |
-| §5 `AddrType`                      | Wrapped in `try/except ValueError`                                                                                                    |
-| §5 `Reply`                         | Added port `0` comment to `_reply_bytes`                                                                                              |
-| §5 `UserPassStatus`                | Added note explaining why it uses plain `IntEnum`                                                                                     |
-| §5 `_missing_` section             | Renamed to "Behaviour Summary"; simplified to proxy-layer pattern only                                                                |
-| §7 What Not To Do                  | Added `is_ready_frame` try/except anti-pattern                                                                                        |
-| §8 Checklist                       | Added bootstrap section; added `SESSION_CONN_ID` table note; added UDP datagram no-split note; added multi-line `parse_frame` warning |
-| §9.1 Frame pump                    | Added `splitlines()` loop                                                                                                             |
-| §9.3 `_handle_udp_data`            | Changed unknown flow_id log from WARNING to DEBUG with UDP_CLOSE ordering note                                                        |
-| §9.5 Proxy                         | Split `Cmd` and `AddrType` into separate `try/except` blocks; cleaned up `AuthMethod` negotiation loop                                |
-| §9.6 Agent `_handle_udp_data`      | Changed unknown flow_id to DEBUG with ordering note                                                                                   |
-| §10.2 Tests                        | Added `test_is_ready_frame_never_raises`; added oversized non-frame test; fixed oversized tunnel frame test                           |
-| §10.3 Tests                        | Added consecutive-dot test; added `SESSION_CONN_ID` acceptance test                                                                   |
-| §10.4 Tests                        | Added `SESSION_CONN_ID` passes `ID_RE` test; added prefix namespace isolation test                                                    |
+## Summary of Changes from v1.1
+
+| Section                        | Change                                                                                                                                                                                                                                                                                            |
+|--------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Imports block                  | Added `PORT_UNSPECIFIED`, `encode_conn_ack_frame`, `encode_keepalive_frame`, `new_session_id`, `CONN_FLOW_ID_RE`, `SESSION_ID_RE`                                                                                                                                                                 |
+| Quick-Reference Card           | Added `new_session_id`, `CONN_FLOW_ID_RE`, `SESSION_ID_RE`, `encode_conn_ack_frame`, `encode_keepalive_frame`; annotated `encode_keepalive_frame` as never raises                                                                                                                                 |
+| §1 `new_session_id`            | New subsection — purpose, return format, raises nothing, must not be passed to frame encoders                                                                                                                                                                                                     |
+| §1 ID Format Contract          | Added `s`-prefix row; documented `CONN_FLOW_ID_RE` as canonical and `ID_RE` as alias; added session ID misuse example                                                                                                                                                                             |
+| §2 `encode_conn_ack_frame`     | New subsection — purpose, CONN_ACK ordering note, agent-side example                                                                                                                                                                                                                              |
+| §2 `encode_keepalive_frame`    | New subsection — purpose, never-raises contract, keepalive loop example                                                                                                                                                                                                                           |
+| §2 Common Encoder Mistakes     | Added session-ID-as-conn_id example; added `PORT_UNSPECIFIED` misuse example; added `AGENT_READY` note                                                                                                                                                                                            |
+| §3 `parse_frame` check order   | Step 6 (no-conn_id enforcement) and step 7 (conn_id validation) separated; proxy-suffix note added                                                                                                                                                                                                |
+| §3 dispatch example            | Added `CONN_ACK` and `KEEPALIVE` `case` branches                                                                                                                                                                                                                                                  |
+| §3 `ParsedFrame` intro         | Updated "one of the 10 valid frame types"; updated `conn_id` note to cover `AGENT_READY` and `KEEPALIVE`                                                                                                                                                                                          |
+| §3 `ParsedFrame` payload table | Added `KEEPALIVE` and `CONN_ACK` rows                                                                                                                                                                                                                                                             |
+| §5 `AuthMethod` table          | Corrected `USERNAME_PASSWORD` from ✓ to ✗ wire-only; added tunnel-only note; simplified negotiation example to `NO_AUTH` only                                                                                                                                                                     |
+| §5 `Reply` `_reply_bytes`      | Changed `bind_port=0` literal to `PORT_UNSPECIFIED`                                                                                                                                                                                                                                               |
+| §6 Constants — Sentinel Values | Renamed section; added `PORT_UNSPECIFIED` row with proxy-layer restriction note                                                                                                                                                                                                                   |
+| §7 What Not To Do              | Added session-ID-as-conn_id anti-pattern; added `PORT_UNSPECIFIED` misuse anti-pattern                                                                                                                                                                                                            |
+| §8 Checklist — IDs             | Added `new_session_id` item; added session-ID-in-encoder warning; added `CONN_FLOW_ID_RE` / `ID_RE` alias note                                                                                                                                                                                    |
+| §8 Checklist — Encoding        | Added `CONN_ACK` wait note; added `encode_keepalive_frame` item; added `PORT_UNSPECIFIED` warning                                                                                                                                                                                                 |
+| §8 Checklist — Decoding        | Added `conn_id is None` guard note for `AGENT_READY` and `KEEPALIVE`                                                                                                                                                                                                                              |
+| §9.3 `InboundDispatcher`       | Added `pending_connects` to constructor; added `CONN_ACK` dispatch case; added `KEEPALIVE` case (log + discard); added `CONN_ACK` error on agent receiving it                                                                                                                                     |
+| §9.4 `OutboundFrameBuilder`    | Added `ack_connection()` and `send_keepalive()` methods                                                                                                                                                                                                                                           |
+| §9.5 Proxy `_reply_bytes`      | Changed `bind_port=0` to `bind_port=PORT_UNSPECIFIED`; added tunnel auth note                                                                                                                                                                                                                     |
+| §9.6 Agent `handle_line`       | Added `KEEPALIVE` case (discard); added `CONN_ACK` error case; added `encode_conn_ack_frame` emit in `_handle_conn_open`                                                                                                                                                                          |
+| §10.1 Tests                    | Added `test_conn_ack_round_trip`, `test_keepalive_round_trip`, `test_udp_open_round_trip`                                                                                                                                                                                                         |
+| §10.2 Tests                    | Added `test_parse_frame_raises_on_extra_fields_for_keepalive`, `test_parse_frame_raises_on_extra_fields_for_agent_ready`, `test_parse_frame_keepalive_conn_id_is_none`, `test_parse_frame_strips_proxy_suffix`; updated `test_is_ready_frame_never_raises`                                        |
+| §10.3 Tests                    | Added `test_encoder_rejects_session_id_as_conn_id`, `test_encoder_rejects_port_unspecified_in_open_frame`, `test_keepalive_encoder_never_raises`, `test_conn_ack_encoder_rejects_bad_conn_id`, `test_conn_ack_encoder_rejects_session_id`                                                         |
+| §10.4 (new)                    | Full ID generator & validator test suite: pattern matching, alias identity, mutual exclusion, sentinel safety, namespace isolation, uniqueness                                                                                                                                                    |
+| §10.5 (renumbered)             | Former §10.4; added `test_decode_error_payload_chains_utf8_error`, `test_parse_host_port_rejects_port_zero/above_range`, `test_parse_host_port_ipv6_round_trip`, `test_parse_host_port_rejects_malformed_bracket`; added `test_frame_decoding_error_details_keys_host_port` and `_frame` variants |
 ```
-
