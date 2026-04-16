@@ -12,6 +12,13 @@ __all__ = ["manager"]
 _VALID_LOG_LEVELS: frozenset[str] = frozenset({"debug", "info", "warning", "error"})
 
 
+def _normalize_log_level(value: str) -> str:
+    level = value.lower().strip()
+    if level == "warn":
+        level = "warning"
+    return level
+
+
 def manager(
     env_file: Annotated[
         Path,
@@ -74,14 +81,19 @@ def manager(
       exectunnel manager --env-file .env
       exectunnel manager --env-file .env --no-tui   # log-only mode
     """
-    if log_level not in _VALID_LOG_LEVELS:
+    normalized_log_level = _normalize_log_level(log_level)
+    if normalized_log_level not in _VALID_LOG_LEVELS:
         raise typer.BadParameter(
             f"Invalid log level {log_level!r}. "
             f"Choose from: {', '.join(sorted(_VALID_LOG_LEVELS))}",
             param_hint="'--log-level'",
         )
 
-    # Deferred import to avoid circular dependencies.
-    from ..supervisor import run_manager
+    from ..supervisor import run_manager  # noqa: PLC0415
 
-    run_manager(env_file, log_level=log_level, tui=tui, show_logs=show_logs)
+    run_manager(
+        env_file,
+        log_level=normalized_log_level,
+        tui=tui,
+        show_logs=show_logs,
+    )

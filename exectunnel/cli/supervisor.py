@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import copy
 import json
 import logging
 import os
@@ -36,6 +38,29 @@ _DEFAULT_HEALTH_CHECK_INTERVAL = 15.0
 _DEFAULT_MAX_HEALTH_FAILURES = 3
 _DEFAULT_STARTUP_GRACE_PERIOD = 20.0
 _VALID_LOG_LEVELS: frozenset[str] = frozenset({"debug", "info", "warning", "error"})
+_TRUE_TOKENS: frozenset[str] = frozenset({"1", "true", "yes", "on"})
+_FALSE_TOKENS: frozenset[str] = frozenset({"0", "false", "no", "off", ""})
+
+_PASSTHROUGH_ENV_PREFIXES: tuple[str, ...] = ("EXECTUNNEL_",)
+
+_PER_TUNNEL_OVERRIDE_KEYS: tuple[str, ...] = (
+    "EXECTUNNEL_WSS_URL",
+    "EXECTUNNEL_TOKEN",
+    "EXECTUNNEL_LOG_LEVEL",
+    "EXECTUNNEL_PING_INTERVAL",
+    "EXECTUNNEL_SEND_TIMEOUT",
+    "EXECTUNNEL_SEND_QUEUE_CAP",
+    "EXECTUNNEL_RECONNECT_MAX_RETRIES",
+    "EXECTUNNEL_RECONNECT_BASE_DELAY",
+    "EXECTUNNEL_RECONNECT_MAX_DELAY",
+    "EXECTUNNEL_DNS_MAX_INFLIGHT",
+    "EXECTUNNEL_DNS_UPSTREAM_PORT",
+    "EXECTUNNEL_DNS_QUERY_TIMEOUT",
+    "EXECTUNNEL_BOOTSTRAP_DELIVERY",
+    "EXECTUNNEL_BOOTSTRAP_USE_GO_AGENT",
+    "EXECTUNNEL_FETCH_AGENT_URL",
+    "EXECTUNNEL_WSS_INSECURE",
+)
 
 
 # ── Data models ───────────────────────────────────────────────────────────────
@@ -52,6 +77,7 @@ class TunnelSpec:
     insecure: bool = False
     log_level: str = "info"
     label: str = ""
+    env_overrides: dict[str, str] = field(default_factory=dict)
 
     @property
     def display_name(self) -> str:
@@ -144,7 +170,7 @@ class TunnelMetrics:
             value = d[key]
             try:
                 if key in _BOOL_METRIC_FIELDS:
-                    cleaned[key] = bool(value)
+                    cleaned[key] = _coerce_bool_metric(value)
                 elif key in _INT_METRIC_FIELDS:
                     cleaned[key] = int(value)
                 elif key in _FLOAT_METRIC_FIELDS:
@@ -156,76 +182,85 @@ class TunnelMetrics:
         return cls(**cleaned)
 
 
-_BOOL_METRIC_FIELDS: frozenset[str] = frozenset(
-    {
-        "connected",
-        "bootstrap_ok",
-        "socks_ok",
-        "dns_enabled",
-    }
-)
+def _coerce_bool_metric(value: object) -> bool:
+    """Coerce manager metrics payload values to bool safely."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in _TRUE_TOKENS:
+            return True
+        if token in _FALSE_TOKENS:
+            return False
+    return False
 
-_INT_METRIC_FIELDS: frozenset[str] = frozenset(
-    {
-        "frames_sent",
-        "frames_recv",
-        "frames_dropped",
-        "bytes_up",
-        "bytes_down",
-        "frames_decode_errors",
-        "frames_orphaned",
-        "frames_noise",
-        "tcp_open",
-        "tcp_pending",
-        "tcp_total",
-        "tcp_failed",
-        "tcp_completed",
-        "tcp_errors",
-        "udp_open",
-        "udp_total",
-        "udp_flows_opened",
-        "udp_flows_closed",
-        "udp_datagrams_sent",
-        "udp_datagrams_accepted",
-        "udp_datagrams_dropped",
-        "ack_ok",
-        "ack_timeout",
-        "ack_failed",
-        "dns_queries",
-        "dns_ok",
-        "dns_dropped",
-        "socks5_accepted",
-        "socks5_rejected",
-        "socks5_active",
-        "socks5_handshakes_ok",
-        "socks5_handshakes_error",
-        "socks5_cmd_connect",
-        "socks5_cmd_udp",
-        "socks5_udp_relays_active",
-        "socks5_udp_datagrams",
-        "socks5_udp_dropped",
-        "session_connect_attempts",
-        "session_connect_ok",
-        "session_reconnects",
-        "session_serve_started",
-        "session_serve_stopped",
-        "cleanup_tcp",
-        "cleanup_pending",
-        "cleanup_udp",
-        "send_queue_depth",
-        "send_queue_cap",
-        "request_tasks",
-    }
-)
 
-_FLOAT_METRIC_FIELDS: frozenset[str] = frozenset(
-    {
-        "uptime_secs",
-        "reconnect_delay_avg",
-        "reconnect_delay_max",
-        "bootstrap_duration",
-    }
-)
+_BOOL_METRIC_FIELDS: frozenset[str] = frozenset({
+    "connected",
+    "bootstrap_ok",
+    "socks_ok",
+    "dns_enabled",
+})
+
+_INT_METRIC_FIELDS: frozenset[str] = frozenset({
+    "frames_sent",
+    "frames_recv",
+    "frames_dropped",
+    "bytes_up",
+    "bytes_down",
+    "frames_decode_errors",
+    "frames_orphaned",
+    "frames_noise",
+    "tcp_open",
+    "tcp_pending",
+    "tcp_total",
+    "tcp_failed",
+    "tcp_completed",
+    "tcp_errors",
+    "udp_open",
+    "udp_total",
+    "udp_flows_opened",
+    "udp_flows_closed",
+    "udp_datagrams_sent",
+    "udp_datagrams_accepted",
+    "udp_datagrams_dropped",
+    "ack_ok",
+    "ack_timeout",
+    "ack_failed",
+    "dns_queries",
+    "dns_ok",
+    "dns_dropped",
+    "socks5_accepted",
+    "socks5_rejected",
+    "socks5_active",
+    "socks5_handshakes_ok",
+    "socks5_handshakes_error",
+    "socks5_cmd_connect",
+    "socks5_cmd_udp",
+    "socks5_udp_relays_active",
+    "socks5_udp_datagrams",
+    "socks5_udp_dropped",
+    "session_connect_attempts",
+    "session_connect_ok",
+    "session_reconnects",
+    "session_serve_started",
+    "session_serve_stopped",
+    "cleanup_tcp",
+    "cleanup_pending",
+    "cleanup_udp",
+    "send_queue_depth",
+    "send_queue_cap",
+    "request_tasks",
+})
+
+_FLOAT_METRIC_FIELDS: frozenset[str] = frozenset({
+    "uptime_secs",
+    "reconnect_delay_avg",
+    "reconnect_delay_max",
+    "bootstrap_duration",
+})
 
 
 _DEFAULT_LOG_LINES_CAP = 200
@@ -271,6 +306,7 @@ class ManagerConfig:
     log_level: str = "info"
     tui: bool = True
     show_logs: bool = False
+    raw_env: dict[str, str] = field(default_factory=dict)
 
 
 # ── .env parser ───────────────────────────────────────────────────────────────
@@ -279,21 +315,79 @@ class ManagerConfig:
 def _parse_env_file(path: Path) -> dict[str, str]:
     """Parse a shell-style .env file into a dict (strips export, quotes)."""
     result: dict[str, str] = {}
-    for raw in path.read_text().splitlines():
+    for lineno, raw in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
         line = re.sub(r"^export\s+", "", line)
+        line = _strip_inline_comment(line).strip()
+        if not line:
+            continue
         if "=" not in line:
+            logger.warning(
+                "Ignoring malformed .env line %d in %s: %r", lineno, path, raw
+            )
             continue
         key, _, val = line.partition("=")
         key = key.strip()
+        if not key:
+            logger.warning("Ignoring empty .env key at line %d in %s", lineno, path)
+            continue
         val = val.strip()
-        # Strip surrounding quotes
+        # Strip surrounding quotes / escapes.
         if len(val) >= 2 and val[0] in ('"', "'") and val[-1] == val[0]:
-            val = val[1:-1]
+            try:
+                parsed = (
+                    json.loads(val) if val[0] == '"' else val[1:-1].replace("\\'", "'")
+                )
+            except Exception:
+                logger.warning(
+                    "Ignoring malformed quoted .env value for %s at line %d in %s",
+                    key,
+                    lineno,
+                    path,
+                )
+                continue
+            val = parsed
         result[key] = val
     return result
+
+
+def _strip_inline_comment(line: str) -> str:
+    out: list[str] = []
+    in_single = False
+    in_double = False
+    escaped = False
+
+    for ch in line:
+        if escaped:
+            out.append(ch)
+            escaped = False
+            continue
+
+        if ch == "\\" and in_double:
+            out.append(ch)
+            escaped = True
+            continue
+
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            out.append(ch)
+            continue
+
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            out.append(ch)
+            continue
+
+        if ch == "#" and not in_single and not in_double:
+            break
+
+        out.append(ch)
+
+    return "".join(out)
 
 
 def _load_manager_config(
@@ -317,6 +411,21 @@ def _load_manager_config(
         except ValueError:
             return default
 
+    def _getb(key: str, default: bool) -> bool:
+        raw = _get(key, str(default)).strip().lower()
+        if raw in _TRUE_TOKENS:
+            return True
+        if raw in _FALSE_TOKENS:
+            return False
+        logger.warning(
+            "Invalid boolean for %s=%r in %s; using default %s",
+            key,
+            raw,
+            env_file,
+            default,
+        )
+        return default
+
     restart_delay = _getf("RESTART_DELAY", _DEFAULT_RESTART_DELAY)
     max_restart_delay = _getf("MAX_RESTART_DELAY", _DEFAULT_MAX_RESTART_DELAY)
     backoff_multiplier = _getf("BACKOFF_MULTIPLIER", _DEFAULT_BACKOFF_MULTIPLIER)
@@ -337,17 +446,62 @@ def _load_manager_config(
             "Add at least WSS_URL_1=wss://... to the config file."
         )
 
+    fallback_log_level = (_get("LOG_LEVEL", log_level) or "info").lower()
+    if fallback_log_level not in _VALID_LOG_LEVELS:
+        logger.warning(
+            "Invalid LOG_LEVEL=%r in %s; using %r",
+            fallback_log_level,
+            env_file,
+            "info",
+        )
+        fallback_log_level = "info"
+
     tunnels: list[TunnelSpec] = []
     for i, idx in enumerate(indices):
         wss_url = _get(f"WSS_URL_{idx}")
         if not wss_url:
             continue
+        if not wss_url.startswith(("ws://", "wss://")):
+            raise ValueError(
+                f"WSS_URL_{idx} must start with ws:// or wss://, got: {wss_url!r}"
+            )
         socks_port = _geti(f"SOCKS_PORT_{idx}", _DEFAULT_SOCKS_BASE_PORT + i)
         socks_host = _get(f"SOCKS_HOST_{idx}") or _get("SOCKS_HOST", "127.0.0.1")
-        insecure_str = _get(f"WSS_INSECURE_{idx}") or _get("WSS_INSECURE", "false")
-        insecure = insecure_str.lower() in ("1", "true", "yes")
-        tun_log_level = _get(f"LOG_LEVEL_{idx}") or _get("LOG_LEVEL", log_level)
+        insecure = _getb(f"WSS_INSECURE_{idx}", _getb("WSS_INSECURE", False))
+        tun_log_level = (_get(f"LOG_LEVEL_{idx}") or fallback_log_level).lower()
+        if tun_log_level not in _VALID_LOG_LEVELS:
+            logger.warning(
+                "Invalid LOG_LEVEL_%d=%r in %s; using %r",
+                idx,
+                tun_log_level,
+                env_file,
+                fallback_log_level,
+            )
+            tun_log_level = fallback_log_level
+
         label = _get(f"LABEL_{idx}", f"tunnel-{idx}")
+
+        env_overrides: dict[str, str] = {}
+        for key, value in env.items():
+            if any(key.startswith(prefix) for prefix in _PASSTHROUGH_ENV_PREFIXES):
+                env_overrides.setdefault(key, value)
+
+        for base_key in _PER_TUNNEL_OVERRIDE_KEYS:
+            per_tunnel_key = f"{base_key}_{idx}"
+            if per_tunnel_key in env:
+                env_overrides[base_key] = env[per_tunnel_key]
+
+        legacy_insecure_key = f"WSS_INSECURE_{idx}"
+        if legacy_insecure_key in env:
+            env_overrides["WSS_INSECURE"] = env[legacy_insecure_key]
+        elif "WSS_INSECURE" in env:
+            env_overrides["WSS_INSECURE"] = env["WSS_INSECURE"]
+
+        if f"LOG_LEVEL_{idx}" in env:
+            env_overrides["EXECTUNNEL_LOG_LEVEL"] = env[f"LOG_LEVEL_{idx}"]
+        elif "LOG_LEVEL" in env:
+            env_overrides.setdefault("EXECTUNNEL_LOG_LEVEL", env["LOG_LEVEL"])
+
         tunnels.append(
             TunnelSpec(
                 index=idx,
@@ -357,8 +511,20 @@ def _load_manager_config(
                 insecure=insecure,
                 log_level=tun_log_level,
                 label=label,
+                env_overrides=env_overrides,
             )
         )
+
+    seen_ports: dict[int, str] = {}
+    for tunnel in tunnels:
+        prior = seen_ports.get(tunnel.socks_port)
+        if prior is not None:
+            raise ValueError(
+                f"Duplicate SOCKS port {tunnel.socks_port} configured for "
+                f"{prior!r} and {tunnel.display_name!r}. "
+                "Each managed tunnel must use a unique local SOCKS port."
+            )
+        seen_ports[tunnel.socks_port] = tunnel.display_name
 
     return ManagerConfig(
         tunnels=tunnels,
@@ -371,6 +537,7 @@ def _load_manager_config(
         log_level=log_level,
         tui=tui,
         show_logs=show_logs,
+        raw_env=env,
     )
 
 
@@ -418,7 +585,7 @@ class TunnelWorker:
         self._state.uptime_secs = (
             time.monotonic() - self._start_time if self._start_time else 0.0
         )
-        self._on_state_change(self._state)
+        self._on_state_change(copy.deepcopy(self._state))
 
     def _build_cmd(self) -> list[str]:
         cmd = [
@@ -432,7 +599,9 @@ class TunnelWorker:
             str(self._spec.socks_port),
             "--no-dashboard",
             "--log-level",
-            self._spec.log_level if self._spec.log_level in _VALID_LOG_LEVELS else "info",
+            self._spec.log_level
+            if self._spec.log_level in _VALID_LOG_LEVELS
+            else "info",
         ]
         if self._spec.insecure:
             cmd.append("--insecure")
@@ -440,10 +609,11 @@ class TunnelWorker:
 
     def _build_env(self) -> dict[str, str]:
         env = os.environ.copy()
+        env.update(self._spec.env_overrides)
         env["EXECTUNNEL_WSS_URL"] = self._spec.wss_url
         env["WSS_INSECURE"] = "1" if self._spec.insecure else "0"
         env["EXECTUNNEL_METRICS_REPORT"] = "1"
-        env.pop("EXECTUNNEL_LOG_LEVEL", None)
+        env["EXECTUNNEL_LOG_LEVEL"] = self._spec.log_level
         return env
 
     async def run_forever(self, stop_event: asyncio.Event) -> None:
@@ -452,6 +622,7 @@ class TunnelWorker:
             if stop_event.is_set():
                 break
             # Backoff restart
+            self._state.restart_count += 1
             self._state.status = "restarting"
             self._state.next_restart_in = self._current_delay
             self._emit()
@@ -470,7 +641,6 @@ class TunnelWorker:
                 self._current_delay * self._cfg.backoff_multiplier,
                 self._cfg.max_restart_delay,
             )
-            self._state.restart_count += 1
 
         self._state.status = "stopped"
         self._state.next_restart_in = 0.0
@@ -492,6 +662,7 @@ class TunnelWorker:
             logger.error("[%s] failed to start: %s", self._spec.display_name, exc)
             self._state.status = "unhealthy"
             self._state.exit_code = -1
+            self._state.log_lines.append(f"failed to start subprocess: {exc}")
             self._emit()
             return
 
@@ -510,35 +681,37 @@ class TunnelWorker:
         stop_task = asyncio.create_task(stop_event.wait())
         wait_task = asyncio.create_task(proc.wait())
 
-        done, _ = await asyncio.wait(
-            {wait_task, stop_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-
-        health_task.cancel()
-        log_task.cancel()
-
-        if stop_task in done:
-            # Graceful shutdown
-            wait_task.cancel()
-            try:
-                proc.send_signal(signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=5.0)
-            except (TimeoutError, ProcessLookupError):
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-        else:
-            stop_task.cancel()
-
         try:
-            await asyncio.gather(health_task, log_task, return_exceptions=True)
-        except Exception:
-            pass
+            done, _ = await asyncio.wait(
+                {wait_task, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if stop_task in done:
+                # Graceful shutdown
+                wait_task.cancel()
+                with contextlib.suppress(ProcessLookupError):
+                    proc.send_signal(signal.SIGTERM)
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5.0)
+                except (TimeoutError, ProcessLookupError):
+                    with contextlib.suppress(ProcessLookupError):
+                        proc.kill()
+                    with contextlib.suppress(ProcessLookupError, TimeoutError):
+                        await asyncio.wait_for(proc.wait(), timeout=5.0)
+            else:
+                stop_task.cancel()
+        finally:
+            for task in (health_task, log_task, stop_task, wait_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                health_task,
+                log_task,
+                stop_task,
+                wait_task,
+                return_exceptions=True,
+            )
 
         rc = proc.returncode
         self._state.exit_code = rc
@@ -563,8 +736,20 @@ class TunnelWorker:
                 else:
                     logger.debug("[%s] %s", self._spec.display_name, text)
                     self._state.log_lines.append(text)
+                    self._emit()
         except asyncio.CancelledError:
-            pass
+            with contextlib.suppress(Exception):
+                while True:
+                    line = await asyncio.wait_for(proc.stdout.readline(), timeout=0.05)
+                    if not line:
+                        break
+                    text = line.decode(errors="replace").rstrip()
+                    if text.startswith(self._METRICS_PREFIX):
+                        self._parse_metrics(text[len(self._METRICS_PREFIX) :])
+                    else:
+                        logger.debug("[%s] %s", self._spec.display_name, text)
+                        self._state.log_lines.append(text)
+                        self._emit()
         except Exception:
             pass
 
@@ -607,10 +792,8 @@ class TunnelWorker:
                         self._state.consecutive_health_failures,
                     )
                     if self._proc is not None:
-                        try:
+                        with contextlib.suppress(ProcessLookupError):
                             self._proc.send_signal(signal.SIGTERM)
-                        except ProcessLookupError:
-                            pass
                     self._emit()
                     return
             self._emit()
@@ -655,13 +838,11 @@ async def _run_manager_async(cfg: ManagerConfig) -> None:
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
+        with contextlib.suppress(NotImplementedError, RuntimeError):
             loop.add_signal_handler(sig, stop_event.set)
-        except (NotImplementedError, RuntimeError):
-            pass
 
     if cfg.tui:
-        from .dashboards import ManagerDashboard
+        from .dashboards import ManagerDashboard  # noqa: PLC0415
 
         dashboard = ManagerDashboard(cfg)
 
@@ -706,20 +887,22 @@ async def _run_manager_async(cfg: ManagerConfig) -> None:
         stop_event.set()
         dashboard.stop()
         dashboard_task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await dashboard_task
-        except asyncio.CancelledError:
-            pass
         stop_watcher.cancel()
     else:
-        await stop_event.wait()
+        stop_watcher = asyncio.create_task(stop_event.wait(), name="stop-watcher")
+        await asyncio.wait(
+            {stop_watcher, *worker_tasks},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        stop_event.set()
+        stop_watcher.cancel()
 
     await asyncio.gather(*worker_tasks, return_exceptions=True)
 
     for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
+        with contextlib.suppress(NotImplementedError, RuntimeError):
             loop.remove_signal_handler(sig)
-        except (NotImplementedError, RuntimeError):
-            pass
 
     logger.info("Manager stopped.")
