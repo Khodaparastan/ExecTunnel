@@ -38,7 +38,7 @@ client-side ``encode_data_frame`` / ``decode_binary_payload`` helpers.
 
 Design notes
 ------------
-* Self-contained — no third-party deps; runs on any bare Python 3.11+ pod.
+* Self-contained — no third-party deps; runs on any bare Python 3.12+ pod.
 * TCP and UDP workers use threads with a self-pipe to avoid blocking the
   stdin-reader thread.
 * All TCP sends use a per-chunk write loop with ``select``-based blocking so
@@ -386,7 +386,6 @@ def _parse_host_port(
         return None
     return host, port
 
-
 class _FrameWriter:
     _STOP: object = object()
 
@@ -396,23 +395,23 @@ class _FrameWriter:
         self._data: queue.Queue[str | object] = queue.Queue(
             maxsize=_STDOUT_DATA_QUEUE_CAP
         )
+        self._stopping = False
         self._thread = threading.Thread(
-            target=self._run, daemon=True, name="stdout-writer"
+            target=self._run,
+            daemon=True,
+            name="stdout-writer",
         )
         self._thread.start()
 
     def emit_ctrl(self, line: str) -> None:
         """Enqueue a control frame — never blocks, never drops."""
+        if self._stopping or self._out.is_dead:
+            return
         self._ctrl.put(line)
 
     def emit_data(self, line: str) -> None:
-        """Enqueue a data frame with periodic liveness checks.
-
-        Blocks the calling thread when the stdout queue is full, but
-        periodically checks whether the writer thread's stdout channel is
-        dead.  If dead, the frame is silently dropped.
-        """
-        while not self._out.is_dead:
+        """Enqueue a data frame with periodic liveness and shutdown checks."""
+        while not self._out.is_dead and not self._stopping:
             try:
                 self._data.put(line, timeout=_EMIT_DATA_PUT_TIMEOUT_SECS)
                 return
@@ -421,6 +420,9 @@ class _FrameWriter:
 
     def stop(self) -> None:
         """Signal the writer thread to flush remaining frames and exit."""
+        if self._stopping:
+            return
+        self._stopping = True
         self._ctrl.put(self._STOP)
         with contextlib.suppress(queue.Full):
             self._data.put_nowait(self._STOP)
@@ -432,11 +434,9 @@ class _FrameWriter:
 
     @property
     def is_dead(self) -> bool:
-        """``True`` once the stdout channel has raised ``OSError``."""
         return self._out.is_dead
 
     def _run(self) -> None:
-        """Writer loop — runs until the stop sentinel is received or channel dies."""
         out = self._out
         ctrl = self._ctrl
         data = self._data
@@ -453,10 +453,6 @@ class _FrameWriter:
                 item = None
 
             if item is stop:
-                # Drain ALL remaining ctrl AND data frames before exiting.
-                # Ctrl frames (CONN_CLOSE / UDP_CLOSE) emitted by workers
-                # during shutdown may have arrived after the last ctrl-drain
-                # but before STOP.
                 self._drain_remaining(out, ctrl, data, stop)
                 return
 
@@ -464,7 +460,6 @@ class _FrameWriter:
                 out.write(item + "\n")
                 if out.is_dead:
                     return
-                # Drain additional pending control frames first.
                 while True:
                     try:
                         nxt = ctrl.get_nowait()
@@ -472,7 +467,6 @@ class _FrameWriter:
                         break
                     if nxt is stop:
                         out.flush()
-                        # Re-queue stop so the outer loop picks it up.
                         ctrl.put(stop)
                         break
                     if isinstance(nxt, str):
@@ -480,7 +474,6 @@ class _FrameWriter:
                         if out.is_dead:
                             return
 
-            # Drain pending data frames (bounded batch for fairness).
             batch = 0
             while batch < batch_size:
                 if out.is_dead:
@@ -506,9 +499,6 @@ class _FrameWriter:
         data: queue.Queue[str | object],
         stop: object,
     ) -> None:
-        """Drain all remaining ctrl and data frames on shutdown."""
-        # Drain ctrl first — these are CONN_CLOSE / UDP_CLOSE frames
-        # that must be emitted before the process exits.
         while True:
             if out.is_dead:
                 return
@@ -521,7 +511,6 @@ class _FrameWriter:
             if isinstance(c, str):
                 out.write(c + "\n")
 
-        # Then drain data.
         while True:
             if out.is_dead:
                 return

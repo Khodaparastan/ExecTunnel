@@ -134,4 +134,10 @@ class Socks5ServerConfig:
     @property
     def url(self) -> str:
         """Human-readable ``tcp://host:port`` string for logging."""
+        try:
+            ip = ipaddress.ip_address(self.host)
+        except ValueError:
+            return f"tcp://{self.host}:{self.port}"
+        if ip.version == 6:
+            return f"tcp://[{self.host}]:{self.port}"
         return f"tcp://{self.host}:{self.port}"
