@@ -87,7 +87,6 @@ class Socks5Server:
                 "Socks5Server.start() has already been called. "
                 "Create a new Socks5Server instance to rebind."
             )
-        self._started = True
 
         cfg = self._config
         try:
@@ -110,6 +109,7 @@ class Socks5Server:
                 ),
             ) from exc
 
+        self._started = True
         logger.info("SOCKS5 listening on %s:%d", cfg.host, cfg.port)
 
         if not cfg.is_loopback:
