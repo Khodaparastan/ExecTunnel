@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from threading import RLock
 from typing import Protocol, runtime_checkable
 
 from exectunnel.observability import metrics_snapshot
@@ -244,10 +245,10 @@ class TunnelHealth:
 # ── Metric name mapping ──────────────────────────────────────────────────────
 
 _METRIC_TO_COUNTER: dict[str, str] = {
-    # Frames (outbound)
+    # Frames - outbound
     "session.frames.outbound": "frames.sent",
     "session.keepalive.sent": "frames.sent",
-    # Frames (inbound)
+    # Frames - inbound
     "session.frames.inbound": "frames.recv",
     # Drops
     "session.frames.outbound.drop": "frames.dropped",
@@ -349,6 +350,14 @@ _BYTE_COUNTER_KEYS: tuple[str, ...] = (
 )
 
 
+def _coerce_increment(raw: object, default: int = 1) -> int:
+    try:
+        value = int(raw) if raw is not None else default
+    except (TypeError, ValueError):
+        return default
+    return max(0, value)
+
+
 class HealthMonitor:
     """Collects live health statistics from the running session.
 
@@ -363,9 +372,7 @@ class HealthMonitor:
     Thread / task safety
     --------------------
     ``on_metric`` may be called from any context that the observability layer
-    chooses.  The counter dict and deque mutations are GIL-protected on CPython
-    and therefore safe.  For other runtimes, add an ``asyncio.Lock`` guard
-    around ``_counters`` and ``_recent_conns``.
+    chooses. Internal mutable state is protected by a re-entrant lock.
     """
 
     __slots__ = (
@@ -382,6 +389,7 @@ class HealthMonitor:
         "_counters",
         "_recent_conns",
         "_conn_index",
+        "_lock",
     )
 
     def __init__(
@@ -405,25 +413,30 @@ class HealthMonitor:
         self._counters: dict[str, int] = {}
         self._recent_conns: deque[ConnectionStat] = deque(maxlen=_MAX_RECENT_CONNS)
         self._conn_index: dict[str, ConnectionStat] = {}
+        self._lock = RLock()
 
     # ── Mutation ──────────────────────────────────────────────────────────
 
     def record_reconnect(self) -> None:
-        self._reconnect_count += 1
-        self._last_reconnect_at = time.monotonic()
+        with self._lock:
+            self._reconnect_count += 1
+            self._last_reconnect_at = time.monotonic()
 
     def set_connected(self, connected: bool) -> None:
-        self._connected = connected
+        with self._lock:
+            self._connected = connected
 
     def record_bootstrap_ok(self) -> None:
-        self._bootstrap_ok = True
+        with self._lock:
+            self._bootstrap_ok = True
 
     def record_connection(self, stat: ConnectionStat) -> None:
-        if len(self._recent_conns) == _MAX_RECENT_CONNS:
-            evicted = self._recent_conns[0]
-            self._conn_index.pop(evicted.conn_id, None)
-        self._recent_conns.append(stat)
-        self._conn_index[stat.conn_id] = stat
+        with self._lock:
+            if len(self._recent_conns) == _MAX_RECENT_CONNS:
+                evicted = self._recent_conns[0]
+                self._conn_index.pop(evicted.conn_id, None)
+            self._recent_conns.append(stat)
+            self._conn_index[stat.conn_id] = stat
 
     def update_connection(
         self,
@@ -433,22 +446,24 @@ class HealthMonitor:
         bytes_up: int | None = None,
         bytes_down: int | None = None,
     ) -> None:
-        conn = self._conn_index.get(conn_id)
-        if conn is None:
-            return
-        if state is not None:
-            conn.state = state
-        if bytes_up is not None:
-            conn.bytes_up += bytes_up
-        if bytes_down is not None:
-            conn.bytes_down += bytes_down
+        with self._lock:
+            conn = self._conn_index.get(conn_id)
+            if conn is None:
+                return
+            if state is not None:
+                conn.state = state
+            if bytes_up is not None:
+                conn.bytes_up += bytes_up
+            if bytes_down is not None:
+                conn.bytes_down += bytes_down
 
     def on_metric(self, name: str, **tags: object) -> None:
         """Observability listener callback.
 
         Registered with ``exectunnel.observability.register_metric_listener``.
 
-        Each invocation increments the internal counter for *name* by 1.
+        The callback increments the internal counter for *name* by the
+        increment amount propagated by ``metrics_inc(..., value=...)``.
 
         .. note::
             Byte-counting metrics (``session.frames.outbound.bytes``,
@@ -458,18 +473,25 @@ class HealthMonitor:
             ensure accurate cumulative values.
 
         .. note::
-            If the observability layer passes ``value=N`` as a tag, it will
-            appear in *tags* but is intentionally ignored here.  Byte values
-            must be read from the registry snapshot.
+            Byte totals still come from the metrics registry snapshot for
+            coherence with gauge extraction.
         """
+        if name in _BYTE_COUNTER_KEYS:
+            # Byte totals are sourced from metrics_snapshot() in snapshot()
+            # to keep them coherent with gauge reads. Do not mirror them into
+            # the internal counters map.
+            return
         canonical = _METRIC_TO_COUNTER.get(name, name)
-        self._counters[canonical] = self._counters.get(canonical, 0) + 1
+        increment = _coerce_increment(tags.get("value"))
+        with self._lock:
+            self._counters[canonical] = self._counters.get(canonical, 0) + increment
 
-        if canonical == "bootstrap.ok":
-            self._bootstrap_ok = True
+            if canonical == "bootstrap.ok":
+                self._bootstrap_ok = True
 
-        if canonical == "session.reconnect":
-            self.record_reconnect()
+            if canonical == "session.reconnect":
+                self._reconnect_count += increment
+                self._last_reconnect_at = time.monotonic()
 
         self._update_conn_from_metric(name, tags)
 
@@ -489,63 +511,80 @@ class HealthMonitor:
         host = str(tags.get("host", ""))
         port = int(tags.get("port", 0)) if tags.get("port") else 0
 
-        match name:
-            case "tunnel.conn_open":
-                if conn_id not in self._conn_index:
-                    self.record_connection(
-                        ConnectionStat(
+        with self._lock:
+            match name:
+                case "tunnel.conn_open":
+                    if conn_id not in self._conn_index:
+                        stat = ConnectionStat(
                             conn_id=conn_id,
                             host=host,
                             port=port,
                             state="pending",
                         )
-                    )
+                        if len(self._recent_conns) == _MAX_RECENT_CONNS:
+                            evicted = self._recent_conns[0]
+                            self._conn_index.pop(evicted.conn_id, None)
+                        self._recent_conns.append(stat)
+                        self._conn_index[stat.conn_id] = stat
 
-            case "tunnel.conn_ack.ok":
-                existing = self._conn_index.get(conn_id)
-                if existing is not None:
-                    existing.state = "open"
-                else:
-                    self.record_connection(
-                        ConnectionStat(
+                case "tunnel.conn_ack.ok":
+                    existing = self._conn_index.get(conn_id)
+                    if existing is not None:
+                        existing.state = "open"
+                    else:
+                        stat = ConnectionStat(
                             conn_id=conn_id,
                             host=host,
                             port=port,
                             state="open",
                         )
-                    )
+                        if len(self._recent_conns) == _MAX_RECENT_CONNS:
+                            evicted = self._recent_conns[0]
+                            self._conn_index.pop(evicted.conn_id, None)
+                        self._recent_conns.append(stat)
+                        self._conn_index[stat.conn_id] = stat
 
-            case "tunnel.conn_ack.failed" | "tunnel.conn_ack.timeout":
-                existing = self._conn_index.get(conn_id)
-                if existing is not None:
-                    existing.state = "closed"
-                else:
-                    self.record_connection(
-                        ConnectionStat(
+                case "tunnel.conn_ack.failed" | "tunnel.conn_ack.timeout":
+                    existing = self._conn_index.get(conn_id)
+                    if existing is not None:
+                        existing.state = "closed"
+                    else:
+                        stat = ConnectionStat(
                             conn_id=conn_id,
                             host=host,
                             port=port,
                             state="closed",
                         )
-                    )
+                        if len(self._recent_conns) == _MAX_RECENT_CONNS:
+                            evicted = self._recent_conns[0]
+                            self._conn_index.pop(evicted.conn_id, None)
+                        self._recent_conns.append(stat)
+                        self._conn_index[stat.conn_id] = stat
 
-            case "tunnel.conn.completed" | "tunnel.conn.error":
-                self.update_connection(conn_id, state="closed")
+                case "tunnel.conn.completed" | "tunnel.conn.error":
+                    existing = self._conn_index.get(conn_id)
+                    if existing is not None:
+                        existing.state = "closed"
 
-            case "tcp.connection.upstream.bytes":
-                val = int(tags.get("bytes", 0)) if tags.get("bytes") else 0
-                if val:
-                    self.update_connection(conn_id, bytes_up=val)
+                case "tcp.connection.upstream.bytes":
+                    val = _coerce_increment(tags.get("value"))
+                    if val:
+                        existing = self._conn_index.get(conn_id)
+                        if existing is not None:
+                            existing.bytes_up += val
 
-            case "tcp.connection.downstream.bytes":
-                val = int(tags.get("bytes", 0)) if tags.get("bytes") else 0
-                if val:
-                    self.update_connection(conn_id, bytes_down=val)
+                case "tcp.connection.downstream.bytes":
+                    val = _coerce_increment(tags.get("value"))
+                    if val:
+                        existing = self._conn_index.get(conn_id)
+                        if existing is not None:
+                            existing.bytes_down += val
 
     # ── Read ──────────────────────────────────────────────────────────────
 
     def _counter(self, key: str) -> int:
-        return self._counters.get(key, 0)
+        with self._lock:
+            return self._counters.get(key, 0)
 
     @staticmethod
     def _hist_field(snap: dict[str, object], metric: str, field: str) -> float | None:
@@ -568,36 +607,61 @@ class HealthMonitor:
         bytes_up = int(snap.get("session.frames.outbound.bytes", 0))
         bytes_down = int(snap.get("session.frames.bytes.in", 0))
 
-        ack_ok = self._counter("ack.ok")
-        ack_failed = self._counter("ack.failed")
-        ack_timeout = self._counter("ack.timeout")
+        with self._lock:
+            counters = dict(self._counters)
+            recent_conns = [replace(c) for c in self._recent_conns]
+            connected = self._connected
+            reconnect_count = self._reconnect_count
+            last_reconnect_at = self._last_reconnect_at
+            bootstrap_ok = self._bootstrap_ok
 
-        tcp_open = sum(1 for c in self._recent_conns if c.state == "open")
-        tcp_pending = sum(1 for c in self._recent_conns if c.state == "pending")
+        ack_ok = counters.get("ack.ok", 0)
+        ack_failed = counters.get("ack.failed", 0)
+        ack_timeout = counters.get("ack.timeout", 0)
 
-        dns_drops = self._counter("dns.query.drop") + self._counter("dns.query.timeout")
+        tcp_open = sum(1 for c in recent_conns if c.state == "open")
+        tcp_pending = sum(1 for c in recent_conns if c.state == "pending")
+
+        dns_drops = counters.get("dns.query.drop", 0) + counters.get(
+            "dns.query.timeout", 0
+        )
+        cleanup_tcp = counters.get("session.cleanup.tcp", 0) + counters.get(
+            "session.recv.cleanup.tcp", 0
+        )
+        cleanup_udp = counters.get("session.cleanup.udp", 0) + counters.get(
+            "session.recv.cleanup.udp", 0
+        )
+        socks_listener_ok = (
+            connected
+            and bootstrap_ok
+            and (
+                int(gauges.get("socks5.connections.active", 0)) > 0
+                or counters.get("socks5.handshakes.ok", 0) > 0
+                or counters.get("session.serve.started", 0) > 0
+            )
+        )
 
         h = TunnelHealth(
-            connected=self._connected,
+            connected=connected,
             ws_url=self._ws_url,
-            reconnect_count=self._reconnect_count,
-            last_reconnect_at=self._last_reconnect_at,
-            bootstrap_ok=self._bootstrap_ok,
+            reconnect_count=reconnect_count,
+            last_reconnect_at=last_reconnect_at,
+            bootstrap_ok=bootstrap_ok,
             socks_host=self._socks_host,
             socks_port=self._socks_port,
-            socks_ok=self._bootstrap_ok,
+            socks_ok=socks_listener_ok,
             # Frames
-            frames_sent=self._counter("frames.sent"),
-            frames_recv=self._counter("frames.recv"),
-            frames_dropped=self._counter("frames.dropped"),
+            frames_sent=counters.get("frames.sent", 0),
+            frames_recv=counters.get("frames.recv", 0),
+            frames_dropped=counters.get("frames.dropped", 0),
             bytes_up_total=bytes_up,
             bytes_down_total=bytes_down,
             # Frame errors
-            frames_decode_errors=self._counter("frames.decode_error"),
-            frames_orphaned=self._counter("frames.orphaned"),
-            frames_noise=self._counter("frames.noise"),
-            frames_outbound_timeout=self._counter("frames.outbound.timeout"),
-            frames_outbound_ws_closed=self._counter("frames.outbound.ws_closed"),
+            frames_decode_errors=counters.get("frames.decode_error", 0),
+            frames_orphaned=counters.get("frames.orphaned", 0),
+            frames_noise=counters.get("frames.noise", 0),
+            frames_outbound_timeout=counters.get("frames.outbound.timeout", 0),
+            frames_outbound_ws_closed=counters.get("frames.outbound.ws_closed", 0),
             # TCP — prefer ring-buffer counts; fall back to live gauge
             tcp_open=tcp_open or int(gauges.get("session.active.tcp_connections", 0)),
             tcp_pending=tcp_pending
@@ -605,44 +669,44 @@ class HealthMonitor:
             tcp_total=ack_ok + ack_failed + ack_timeout,
             tcp_failed=ack_failed,
             # TCP detail
-            tcp_upstream_started=self._counter("tcp.upstream.started"),
-            tcp_downstream_started=self._counter("tcp.downstream.started"),
-            tcp_completed=self._counter("tcp.completed"),
-            tcp_errors=self._counter("tcp.error"),
+            tcp_upstream_started=counters.get("tcp.upstream.started", 0),
+            tcp_downstream_started=counters.get("tcp.downstream.started", 0),
+            tcp_completed=counters.get("tcp.completed", 0),
+            tcp_errors=counters.get("tcp.error", 0),
             # UDP — from gauge
             udp_open=int(gauges.get("session.active.udp_flows", 0)),
             udp_total=int(gauges.get("session.registry.udp", 0)),
             # UDP detail
-            udp_flows_opened=self._counter("udp.flow.opened"),
-            udp_flows_closed=self._counter("udp.flow.closed"),
-            udp_datagrams_sent=self._counter("udp.flow.datagram.sent"),
-            udp_datagrams_accepted=self._counter("udp.flow.datagram.accepted"),
-            udp_datagrams_dropped=self._counter("udp.flow.datagram.dropped"),
+            udp_flows_opened=counters.get("udp.flow.opened", 0),
+            udp_flows_closed=counters.get("udp.flow.closed", 0),
+            udp_datagrams_sent=counters.get("udp.flow.datagram.sent", 0),
+            udp_datagrams_accepted=counters.get("udp.flow.datagram.accepted", 0),
+            udp_datagrams_dropped=counters.get("udp.flow.datagram.dropped", 0),
             # ACK
             ack_ok=ack_ok,
             ack_timeout=ack_timeout,
             ack_failed=ack_failed,
             # DNS
-            dns_enabled=self._counter("dns.started") > 0,
-            dns_queries=self._counter("dns.query.received"),
-            dns_ok=self._counter("dns.query.ok"),
+            dns_enabled=counters.get("dns.started", 0) > 0,
+            dns_queries=counters.get("dns.query.received", 0),
+            dns_ok=counters.get("dns.query.ok", 0),
             dns_dropped=dns_drops,
             # SOCKS5
-            socks5_accepted=self._counter("socks5.accepted"),
-            socks5_rejected=self._counter("socks5.rejected"),
+            socks5_accepted=counters.get("socks5.accepted", 0),
+            socks5_rejected=counters.get("socks5.rejected", 0),
             socks5_active=int(gauges.get("socks5.connections.active", 0)),
-            socks5_handshakes_ok=self._counter("socks5.handshakes.ok"),
-            socks5_handshakes_timeout=self._counter("socks5.handshakes.timeout"),
-            socks5_handshakes_error=self._counter("socks5.handshakes.error"),
-            socks5_cmd_connect=self._counter("socks5.cmd.connect"),
-            socks5_cmd_udp=self._counter("socks5.cmd.udp"),
+            socks5_handshakes_ok=counters.get("socks5.handshakes.ok", 0),
+            socks5_handshakes_timeout=counters.get("socks5.handshakes.timeout", 0),
+            socks5_handshakes_error=counters.get("socks5.handshakes.error", 0),
+            socks5_cmd_connect=counters.get("socks5.cmd.connect", 0),
+            socks5_cmd_udp=counters.get("socks5.cmd.udp", 0),
             socks5_udp_relays_active=int(gauges.get("socks5.udp.relays_active", 0)),
-            socks5_udp_datagrams=self._counter("socks5.udp.datagrams"),
-            socks5_udp_dropped=self._counter("socks5.udp.dropped"),
+            socks5_udp_datagrams=counters.get("socks5.udp.datagrams", 0),
+            socks5_udp_dropped=counters.get("socks5.udp.dropped", 0),
             # Session connect / reconnect
-            session_connect_attempts=self._counter("session.connect.attempt"),
-            session_connect_ok=self._counter("session.connect.ok"),
-            session_reconnects=self._counter("session.reconnect"),
+            session_connect_attempts=counters.get("session.connect.attempt", 0),
+            session_connect_ok=counters.get("session.connect.ok", 0),
+            session_reconnects=counters.get("session.reconnect", 0),
             reconnect_delay_avg=self._hist_field(
                 snap, "session.reconnect.delay_sec", "avg"
             ),
@@ -650,12 +714,12 @@ class HealthMonitor:
                 snap, "session.reconnect.delay_sec", "max"
             ),
             # Session serve
-            session_serve_started=self._counter("session.serve.started"),
-            session_serve_stopped=self._counter("session.serve.stopped"),
+            session_serve_started=counters.get("session.serve.started", 0),
+            session_serve_stopped=counters.get("session.serve.stopped", 0),
             # Session cleanup
-            cleanup_tcp=self._counter("session.cleanup.tcp"),
-            cleanup_pending=self._counter("session.cleanup.pending"),
-            cleanup_udp=self._counter("session.cleanup.udp"),
+            cleanup_tcp=cleanup_tcp,
+            cleanup_pending=counters.get("session.cleanup.pending", 0),
+            cleanup_udp=cleanup_udp,
             # Bootstrap detail
             bootstrap_duration=self._hist_field(
                 snap, "bootstrap.duration_seconds", "sum"
@@ -669,7 +733,7 @@ class HealthMonitor:
             session_start=self._start,
             uptime_secs=now - self._start,
             # Recent connections — shallow copy of deque
-            recent_conns=list(self._recent_conns),
+            recent_conns=recent_conns,
         )
 
         if self._pod is not None:
