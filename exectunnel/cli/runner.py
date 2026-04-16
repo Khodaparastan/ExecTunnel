@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -13,6 +14,7 @@ from collections.abc import Callable
 from typing import Any
 
 from rich.console import Console
+from rich.traceback import Traceback
 
 from exectunnel.exceptions import (
     BootstrapError,
@@ -20,6 +22,7 @@ from exectunnel.exceptions import (
     ReconnectExhaustedError,
 )
 from exectunnel.observability import metrics_inc, metrics_observe
+from exectunnel.observability.logging import install_ring_buffer
 from exectunnel.session import SessionConfig, TunnelConfig
 
 from .dashboards.tunnel import TunnelDashboard
@@ -123,12 +126,13 @@ async def run_session(
     (connection timeout / exec error) and Phase 1 resolves naturally.
     An explicit bootstrap timeout can be added to ``TunnelConfig`` if needed.
     """
-    from exectunnel.session import TunnelSession  # local to avoid circular import
+    from exectunnel.session import TunnelSession  # noqa: PLC0415
 
     _session_start = time.monotonic()
     metrics_inc("cli.session.start")
 
     session = TunnelSession(session_cfg, tun_cfg)
+    loop = asyncio.get_running_loop()
     monitor = HealthMonitor(
         pod_spec=pod_spec,
         ws_url=ws_url,
@@ -148,7 +152,7 @@ async def run_session(
     _add_listener(monitor.on_metric)
 
     if spinner is not None:
-        _add_listener(_make_spinner_listener(spinner))
+        _add_listener(_make_spinner_listener(spinner, loop))
 
     # ── Bootstrap-done signal ─────────────────────────────────────────────
     # A separate lightweight listener that gates Phase 1 → Phase 2 transition.
@@ -156,7 +160,7 @@ async def run_session(
 
     def _on_bootstrap_done(name: str, **_: object) -> None:
         if name == "bootstrap.ok":
-            bootstrap_done.set()
+            loop.call_soon_threadsafe(bootstrap_done.set)
 
     _add_listener(_on_bootstrap_done)
 
@@ -170,9 +174,8 @@ async def run_session(
         )
         stop_event.set()
 
-    loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
+        try:  # noqa: SIM105
             loop.add_signal_handler(sig, _handle_signal, sig)
         except (NotImplementedError, RuntimeError):
             pass  # Windows / environments that restrict signal handling
@@ -223,7 +226,6 @@ async def run_session(
             # Install a log ring buffer when the user wants log tail in the dashboard.
             log_buf = None
             if show_logs:
-                from exectunnel.observability.logging import install_ring_buffer
 
                 log_buf = install_ring_buffer(maxlen=200)
 
@@ -278,17 +280,13 @@ async def run_session(
 
         if dashboard_task is not None:
             dashboard_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await dashboard_task
-            except asyncio.CancelledError:
-                pass
 
         if metrics_reporter_task is not None:
             metrics_reporter_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await metrics_reporter_task
-            except asyncio.CancelledError:
-                pass
 
         # Unregister all listeners to prevent memory leaks.
         for cb in registered_listeners:
@@ -296,10 +294,8 @@ async def run_session(
         registered_listeners.clear()
 
         for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
+            with contextlib.suppress(NotImplementedError, RuntimeError):
                 loop.remove_signal_handler(sig)
-            except (NotImplementedError, RuntimeError):
-                pass
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
@@ -323,7 +319,10 @@ def _try_unregister_listener(callback: Callable[..., None]) -> None:
     _unregister_metric_listener(callback)  # type: ignore[arg-type]
 
 
-def _make_spinner_listener(spinner: BootstrapSpinner) -> Callable[..., None]:
+def _make_spinner_listener(
+    spinner: BootstrapSpinner,
+    loop: asyncio.AbstractEventLoop,
+) -> Callable[..., None]:
     """Return a metric listener that advances spinner phases."""
 
     def _on_metric(name: str, **_: object) -> None:
@@ -331,15 +330,19 @@ def _make_spinner_listener(spinner: BootstrapSpinner) -> Callable[..., None]:
         if entry is None:
             return
         phase_name, action = entry
-        match action:
-            case "start":
-                spinner.start_phase(phase_name)
-            case "done":
-                spinner.done_phase(phase_name)
-            case "skip":
-                spinner.skip_phase(phase_name)
-            case "fail":
-                spinner.fail_phase(phase_name)
+
+        def _apply() -> None:
+            match action:
+                case "start":
+                    spinner.start_phase(phase_name)
+                case "done":
+                    spinner.done_phase(phase_name)
+                case "skip":
+                    spinner.skip_phase(phase_name)
+                case "fail":
+                    spinner.fail_phase(phase_name)
+
+        loop.call_soon_threadsafe(_apply)
 
     return _on_metric
 
@@ -457,7 +460,6 @@ def _handle_session_error(exc: BaseException, console: Console) -> int:
         return 1
 
     console.print(f"\n[et.error]{Icons.CROSS} Unexpected error: {exc}[/et.error]")
-    from rich.traceback import Traceback
 
     console.print(Traceback.from_exception(type(exc), exc, exc.__traceback__))
     return 1

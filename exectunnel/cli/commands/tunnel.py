@@ -11,20 +11,31 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
+from exectunnel import __version__
 from exectunnel.defaults import Defaults
 from exectunnel.exceptions import ConfigurationError
+from exectunnel.observability.logging import configure_logging
 from exectunnel.session import (
     SessionConfig,
     TunnelConfig,
     get_default_exclusion_networks,
 )
 
+from .._config import build_session_config, build_tunnel_config
 from ..runner import run_session
 from ..ui import BANNER, THEME, BootstrapSpinner, Icons
 
 __all__ = ["tunnel"]
 
 console = Console(theme=THEME, highlight=False)
+_VALID_LOG_LEVELS = frozenset({"debug", "info", "warning", "error"})
+
+
+def _normalize_log_level(value: str) -> str:
+    level = value.lower().strip()
+    if level == "warn":
+        level = "warning"
+    return level
 
 
 # ── Argument validators ──────────────────────────────────────────────────────
@@ -242,24 +253,22 @@ def tunnel(
     Set ALL_PROXY=socks5://127.0.0.1:1080 to route your shell traffic.
     RFC1918 + loopback CIDRs are bypassed by default unless --no-default-exclude is set.
     """
-    _VALID_LOG_LEVELS = frozenset({"debug", "info", "warning", "error"})
-    if log_level not in _VALID_LOG_LEVELS:
+    normalized_log_level = _normalize_log_level(log_level)
+    if normalized_log_level not in _VALID_LOG_LEVELS:
         raise typer.BadParameter(
             f"Invalid log level {log_level!r}. "
             f"Choose from: {', '.join(sorted(_VALID_LOG_LEVELS))}",
             param_hint="'--log-level'",
         )
 
-    from exectunnel.observability.logging import configure_logging
 
-    configure_logging(log_level)  # type: ignore[arg-type]
+    configure_logging(normalized_log_level)
 
     _print_banner()
 
     dns_upstream = _dns_upstream_callback(dns)
     exclude_nets = _parse_excludes(exclude, no_default_exclude)
 
-    from .._config import build_session_config, build_tunnel_config
 
     try:
         session_cfg = build_session_config(insecure=insecure)
@@ -346,7 +355,6 @@ async def _tunnel_async(
 
 
 def _print_banner() -> None:
-    from exectunnel import __version__
 
     console.print(BANNER.format(version=__version__))
 
