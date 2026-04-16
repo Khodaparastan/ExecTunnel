@@ -86,11 +86,24 @@ async def run_metrics_reporter(
             "truncated": len(keys) > top_n,
             "final": final,
         }
-        log_fn("metrics_summary=%s", json.dumps(summary, sort_keys=True))
+        log_fn(
+            "metrics_summary=%s",
+            json.dumps(
+                summary,
+                sort_keys=True,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
         if verbose:
             logger.debug(
                 "metrics_snapshot=%s",
-                json.dumps(snapshot, sort_keys=True),
+                json.dumps(
+                    snapshot,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
             )
 
     # ------------------------------------------------------------------

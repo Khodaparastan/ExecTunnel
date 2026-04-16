@@ -23,12 +23,8 @@ __all__ = [
     "metrics_reset",
     "metrics_snapshot",
     "register_metric_listener",
+    "unregister_all_listeners",
 ]
-
-
-# ------------------------------------------------------------------
-# Tag helpers
-# ------------------------------------------------------------------
 
 
 def _normalize_tags(tags: dict[str, object] | None) -> tuple[tuple[str, str], ...]:
@@ -53,11 +49,6 @@ def _render_metric_key(name: str, tags: tuple[tuple[str, str], ...]) -> str:
         return name
     joined = ",".join(f"{k}={v}" for k, v in tags)
     return f"{name}{{{joined}}}"
-
-
-# ------------------------------------------------------------------
-# Metric types
-# ------------------------------------------------------------------
 
 
 class HistogramSnapshot(NamedTuple):
@@ -111,10 +102,6 @@ class _Gauge:
         self.value -= delta
 
 
-# ------------------------------------------------------------------
-# Registry
-# ------------------------------------------------------------------
-
 _TagKey = tuple[str, tuple[tuple[str, str], ...]]
 
 
@@ -127,8 +114,6 @@ class MetricsRegistry:
         self._hists: dict[_TagKey, _Histogram] = {}
         self._gauges: dict[_TagKey, _Gauge] = {}
 
-    # -- Counter ---------------------------------------------------
-
     def inc(
         self,
         name: str,
@@ -138,8 +123,6 @@ class MetricsRegistry:
         key: _TagKey = (name, _normalize_tags(tags))
         with self._lock:
             self._counters[key] += value
-
-    # -- Histogram -------------------------------------------------
 
     def observe(
         self,
@@ -155,8 +138,6 @@ class MetricsRegistry:
                 self._hists[key] = hist
             hist.observe(value)
 
-    # -- Gauge -----------------------------------------------------
-
     def gauge_set(
         self,
         name: str,
@@ -165,8 +146,8 @@ class MetricsRegistry:
     ) -> None:
         key: _TagKey = (name, _normalize_tags(tags))
         with self._lock:
-            g = self._gauges.setdefault(key, _Gauge())
-            g.set(value)
+            gauge = self._gauges.setdefault(key, _Gauge())
+            gauge.set(value)
 
     def gauge_inc(
         self,
@@ -176,8 +157,8 @@ class MetricsRegistry:
     ) -> None:
         key: _TagKey = (name, _normalize_tags(tags))
         with self._lock:
-            g = self._gauges.setdefault(key, _Gauge())
-            g.inc(delta)
+            gauge = self._gauges.setdefault(key, _Gauge())
+            gauge.inc(delta)
 
     def gauge_dec(
         self,
@@ -187,10 +168,8 @@ class MetricsRegistry:
     ) -> None:
         key: _TagKey = (name, _normalize_tags(tags))
         with self._lock:
-            g = self._gauges.setdefault(key, _Gauge())
-            g.dec(delta)
-
-    # -- Snapshot / reset ------------------------------------------
+            gauge = self._gauges.setdefault(key, _Gauge())
+            gauge.dec(delta)
 
     def snapshot(self) -> dict[str, object]:
         """Return a point-in-time copy of all metrics.
@@ -232,47 +211,32 @@ class MetricsRegistry:
             self._gauges.clear()
 
 
-# ------------------------------------------------------------------
-# Module-level singleton
-# ------------------------------------------------------------------
-
 METRICS = MetricsRegistry()
 
-# ------------------------------------------------------------------
-# Metric listeners
-# ------------------------------------------------------------------
-# Listeners are called synchronously inside metrics_inc() after the
-# counter is incremented.  Keep listeners fast — no I/O, no blocking.
-
+_listener_lock = threading.Lock()
 _listeners: list[Callable[..., None]] = []
 
 
 def register_metric_listener(fn: Callable[..., None]) -> None:
-    """Register a callback invoked on every ``metrics_inc()`` call.
-
-    The callback receives ``(name: str, **tags)`` matching the arguments
-    passed to ``metrics_inc()``.  Exceptions raised by the callback are
-    silently suppressed to avoid disrupting the caller.
-    """
-    _listeners.append(fn)
+    """Register a callback invoked on every ``metrics_inc()`` call."""
+    with _listener_lock:
+        _listeners.append(fn)
 
 
 def unregister_all_listeners() -> None:
     """Remove all metric listeners."""
-    _listeners.clear()
-
-
-# ------------------------------------------------------------------
-# Convenience module-level helpers
-# ------------------------------------------------------------------
+    with _listener_lock:
+        _listeners.clear()
 
 
 def metrics_inc(metric: str, value: int = 1, **tags: object) -> None:
     METRICS.inc(metric, value=value, tags=tags or None)
-    for fn in _listeners:
+    with _listener_lock:
+        listeners = tuple(_listeners)
+    for fn in listeners:
         try:
             fn(metric, **tags)
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
 
@@ -297,6 +261,6 @@ def metrics_snapshot() -> dict[str, object]:
 
 
 def metrics_reset() -> None:
-    """Reset all metrics **and** remove all listeners."""
+    """Reset all metrics and remove all listeners."""
     METRICS.reset()
     unregister_all_listeners()

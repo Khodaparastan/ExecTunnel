@@ -165,7 +165,7 @@ class _JsonLogFormatter(logging.Formatter):
                 payload[key] = val
         if record.exc_info:
             payload["exc_info"] = self.formatException(record.exc_info)
-        return json.dumps(payload)
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 class _ConsoleFormatter(logging.Formatter):
