@@ -2,7 +2,7 @@
 
 > **Alpha / Proof-of-Concept** — not production-ready. APIs and behaviour may change without notice.
 
-SOCKS5 tunnel over Kubernetes exec/WebSocket channels for restricted environments.
+SOCKS5 tunnel over PTY WEBSCOKET for restricted environments.
 
 `ExecTunnel` exists for the real-world case where you do **not** get normal Kubernetes access (no kubeconfig, no namespace, no port-forward), but you **do** get a web terminal that internally uses an exec WebSocket stream.
 
