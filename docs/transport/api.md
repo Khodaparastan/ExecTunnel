@@ -204,14 +204,17 @@ class TransportHandler(Protocol):
 # ✅ Use TransportHandler when your code only needs the generic interface
 def log_all_handlers(handlers: dict[str, TransportHandler]) -> None:
     for hid, h in handlers.items():
-        logger.info("%s: closed=%s drops=%d", hid, h.is_closed, h.drop_count)
+        logger.info("%s: closed=%s drops=%d", hid, h._closed, h.drop_count)
+
 
 # ✅ Use concrete types when you need handler-specific methods
-def handle_data_frame(frame: ParsedFrame, tcp_registry: dict[str, TcpConnection]) -> None:
+def handle_data_frame(frame: ParsedFrame,
+                      tcp_registry: dict[str, TcpConnection]) -> None:
     conn = tcp_registry.get(frame.conn_id)
     if conn is None:
         return
-    conn.feed(data)   # TcpConnection-specific method
+    conn.feed(data)  # TcpConnection-specific method
+
 
 # ✅ Type-narrow when dispatching from a generic registry
 def dispatch(handler: TransportHandler, data: bytes) -> None:

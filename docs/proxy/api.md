@@ -1,7 +1,7 @@
 # ExecTunnel Proxy Package — Developer API Reference
 
 ```
-exectunnel/proxy/  |  api-doc v1.0  |  Python 3.13+
+exectunnel/proxy/  |  api-doc v2.0  |  Python 3.13+
 ```
 
 ---
@@ -79,25 +79,33 @@ config = Socks5ServerConfig(
     host="127.0.0.1",
     port=1080,
     handshake_timeout=30.0,
-    queue_capacity=2_048,
+    request_queue_capacity=256,
+    udp_relay_queue_capacity=2_048,
     queue_put_timeout=5.0,
-    udp_drop_warn_interval=100,
+    udp_drop_warn_interval=1_000,
 )
 server = Socks5Server(config)
 ```
 
 #### `Socks5ServerConfig` fields
 
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `host` | `str` | `"127.0.0.1"` | Bind address. Binding to anything non-loopback logs a `WARNING`. |
-| `port` | `int` | `1080` | TCP port to listen on. Must be in `[1, 65535]`. |
-| `handshake_timeout` | `float` | `30.0` | Seconds allowed for a single SOCKS5 handshake. |
-| `queue_capacity` | `int` | `2_048` | Max completed handshakes buffered before backpressure. |
-| `queue_put_timeout` | `float` | `5.0` | Max seconds to wait when enqueueing a handshake. |
-| `udp_drop_warn_interval` | `int` | `100` | Log a `WARNING` every N UDP queue-full drops. |
+| Field                      | Type    | Default       | Description                                                             |
+|----------------------------|---------|---------------|-------------------------------------------------------------------------|
+| `host`                     | `str`   | `"127.0.0.1"` | Bind address. Binding to anything non-loopback logs a `WARNING`.        |
+| `port`                     | `int`   | `1080`        | TCP port to listen on. Must be in `[1, 65535]`.                         |
+| `handshake_timeout`        | `float` | `30.0`        | Seconds allowed for a single SOCKS5 handshake.                          |
+| `request_queue_capacity`   | `int`   | `256`         | Max completed handshakes buffered before backpressure.                  |
+| `udp_relay_queue_capacity` | `int`   | `2_048`       | Max inbound datagrams buffered per `UdpRelay` instance before dropping. |
+| `queue_put_timeout`        | `float` | `5.0`         | Max seconds to wait when enqueueing a completed handshake.              |
+| `udp_drop_warn_interval`   | `int`   | `1_000`       | Log a `WARNING` every N UDP queue-full drops to avoid log flooding.     |
 
 All fields are validated at construction time — `ConfigurationError` is raised on invalid values.
+
+> **`request_queue_capacity` vs `udp_relay_queue_capacity`:** These are two
+> distinct bounded queues. `request_queue_capacity` caps the number of
+> fully-negotiated TCP handshakes waiting to be consumed by your `async for`
+> loop. `udp_relay_queue_capacity` caps the per-session inbound UDP datagram
+> buffer inside each `UdpRelay` instance.
 
 ---
 
@@ -185,7 +193,7 @@ async for req in server:
 
 ```python
 import asyncio
-from exectunnel.proxy import Socks5Server, Socks5Request
+from exectunnel.proxy import Socks5Server, Socks5ServerConfig, Socks5Request
 from exectunnel.exceptions import ExecTunnelError
 
 async def handle(req: Socks5Request) -> None:
@@ -212,15 +220,15 @@ You never construct `Socks5Request` directly. You receive it from
 
 ### Attributes
 
-| Attribute | Type | Description |
-|---|---|---|
-| `cmd` | `Cmd` | The SOCKS5 command. Use `is_connect` / `is_udp_associate` instead of comparing directly. |
-| `host` | `str` | Destination hostname or IP address. Already validated and safe to pass to the session layer. |
-| `port` | `int` | Destination port. Always in `[1, 65535]` — the proxy layer rejects port 0. |
-| `reader` | `asyncio.StreamReader` | Client TCP stream. Read from this after sending a success reply. |
-| `writer` | `asyncio.StreamWriter` | Client TCP stream. Do not write to this directly — use the reply methods. |
-| `udp_relay` | `UdpRelay \| None` | Bound relay for `UDP_ASSOCIATE`. Always `None` for `CONNECT`. |
-| `replied` | `bool` | `True` once a reply has been sent. Read-only. |
+| Attribute   | Type                   | Description                                                                                                                                                                                                |
+|-------------|------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `cmd`       | `Cmd`                  | The SOCKS5 command. Use `is_connect` / `is_udp_associate` instead of comparing directly.                                                                                                                   |
+| `host`      | `str`                  | Destination hostname or IP address. Already validated and safe to pass to the session layer.                                                                                                               |
+| `port`      | `int`                  | Destination port. Always in `[1, 65535]` for `CONNECT` — the proxy layer rejects port 0. For `UDP_ASSOCIATE`, port 0 in the original request is permitted but the port here reflects what the client sent. |
+| `reader`    | `asyncio.StreamReader` | Client TCP stream. Read from this after sending a success reply.                                                                                                                                           |
+| `writer`    | `asyncio.StreamWriter` | Client TCP stream. Do not write to this directly — use the reply methods.                                                                                                                                  |
+| `udp_relay` | `UdpRelay \| None`     | Bound relay for `UDP_ASSOCIATE`. Always `None` for `CONNECT`.                                                                                                                                              |
+| `replied`   | `bool`                 | `True` once a reply has been sent. Read-only.                                                                                                                                                              |
 
 ---
 
@@ -350,7 +358,7 @@ await req.send_reply_error(Reply.HOST_UNREACHABLE)
 #### `await req.close() → None`
 
 Closes the writer and any associated UDP relay. Idempotent — safe to call
-multiple times. `OSError` is suppressed.
+multiple times. `OSError` and `RuntimeError` are suppressed.
 
 Called automatically by `__aexit__` and `send_reply_error`. You only need
 to call this directly if you are not using the context manager and not
@@ -426,7 +434,7 @@ building a custom server that bypasses `Socks5Server`.
 UdpRelay(
     *,
     queue_capacity: int = 2_048,
-    drop_warn_interval: int = 100,
+    drop_warn_interval: int = 1_000,
 )
 ```
 
@@ -455,9 +463,9 @@ port = await relay.start()
 
 **Parameters**
 
-| Parameter | Type | Description |
-|---|---|---|
-| `expected_client_addr` | `tuple[str, int] \| None` | Optional `(host, port)` hint from the `UDP_ASSOCIATE` request. When set and specific (not `0.0.0.0:0`), datagrams from other addresses are dropped before the first datagram binds the client address. |
+| Parameter              | Type                      | Description                                                                                                                                                                                                                                                                                     |
+|------------------------|---------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `expected_client_addr` | `tuple[str, int] \| None` | Optional `(host, port)` hint from the `UDP_ASSOCIATE` request. When set, non-unspecified, and non-zero-port, datagrams from other addresses are dropped before the first datagram binds the client address. Hints with an unspecified host (`0.0.0.0`/`::`) or port `0` are silently discarded. |
 
 **Returns** the ephemeral port number.
 
@@ -556,22 +564,22 @@ relay.send_to_client(
 
 **Raises**
 
-| Exception | When |
-|---|---|
-| `ProtocolError` | `payload` is not `bytes` — caller bug. |
-| `ProtocolError` | `src_port` outside `[0, 65535]` — caller bug. |
+| Exception        | When                                          |
+|------------------|-----------------------------------------------|
+| `TransportError` | `payload` is not `bytes` — caller bug.        |
+| `TransportError` | `src_port` outside `[0, 65535]` — caller bug. |
 
 ---
 
 ### Properties
 
-| Property | Type | Description |
-|---|---|---|
-| `local_port` | `int` | Ephemeral port the relay is bound to. `0` before `start()`. |
-| `is_running` | `bool` | `True` after `start()` and before `close()`. |
-| `accepted_count` | `int` | Total datagrams successfully enqueued. |
-| `drop_count` | `int` | Total datagrams dropped due to full queue. |
-| `foreign_client_count` | `int` | Total datagrams dropped from unexpected source addresses. |
+| Property               | Type   | Description                                                                          |
+|------------------------|--------|--------------------------------------------------------------------------------------|
+| `local_port`           | `int`  | Ephemeral port the relay is bound to. `0` before `start()`.                          |
+| `is_running`           | `bool` | `True` after `start()` and before `close()`, and while the transport is not closing. |
+| `accepted_count`       | `int`  | Total datagrams successfully enqueued.                                               |
+| `drop_count`           | `int`  | Total datagrams dropped due to full queue.                                           |
+| `foreign_client_count` | `int`  | Total datagrams dropped from unexpected source addresses.                            |
 
 ---
 
@@ -641,16 +649,16 @@ The proxy layer handles all SOCKS5 negotiation errors internally. By the time
 a `Socks5Request` reaches your handler, the handshake has already succeeded.
 The exceptions below are what you may encounter **in your handler code**:
 
-| Exception | Source | When you see it |
-|---|---|---|
-| `ProtocolError` | `req.send_reply_success()` | Writer closed between handshake and your reply call |
-| `ProtocolError` | `req.send_reply_success()` or `req.send_reply_error()` | You called a reply method twice |
-| `ConfigurationError` | `req.send_reply_success()` | You passed an invalid `bind_host` or `bind_port` |
-| `ConfigurationError` | `req.send_reply_error()` | You passed an invalid `Reply` value |
-| `ProtocolError` | `relay.send_to_client()` | You passed non-`bytes` payload or out-of-range port |
-| `RuntimeError` | `relay.recv()` | You called `recv()` before `start()` |
-| `TransportError` | `server.start()` | OS refused to bind the listen socket |
-| `OSError` | `req.send_reply_success()` | Socket write or drain failed |
+| Exception            | Source                                                 | When you see it                                     |
+|----------------------|--------------------------------------------------------|-----------------------------------------------------|
+| `ProtocolError`      | `req.send_reply_success()`                             | Writer closed between handshake and your reply call |
+| `ProtocolError`      | `req.send_reply_success()` or `req.send_reply_error()` | You called a reply method twice                     |
+| `ConfigurationError` | `req.send_reply_success()`                             | You passed an invalid `bind_host` or `bind_port`    |
+| `ConfigurationError` | `req.send_reply_error()`                               | You passed an invalid `Reply` value                 |
+| `TransportError`     | `relay.send_to_client()`                               | You passed non-`bytes` payload or out-of-range port |
+| `RuntimeError`       | `relay.recv()`                                         | You called `recv()` before `start()`                |
+| `TransportError`     | `server.start()`                                       | OS refused to bind the listen socket                |
+| `OSError`            | `req.send_reply_success()`                             | Socket write or drain failed                        |
 
 ### What the proxy layer never raises toward you
 
@@ -740,6 +748,9 @@ Before shipping any code that consumes this API, verify:
 
 □  req.replied checked before calling send_reply_error() in exception
    handlers — prevents double-reply ProtocolError masking the real error.
+
+□  Socks5ServerConfig constructed with request_queue_capacity (not
+   queue_capacity) — incorrect field names raise TypeError at construction.
 ```
 
 ---
@@ -748,7 +759,9 @@ Before shipping any code that consumes this API, verify:
 
 ```
 Socks5ServerConfig
-├── __init__(host, port, handshake_timeout, queue_capacity, queue_put_timeout, udp_drop_warn_interval)
+├── __init__(host, port, handshake_timeout,
+│           request_queue_capacity, udp_relay_queue_capacity,
+│           queue_put_timeout, udp_drop_warn_interval)
 ├── .is_loopback    bool
 └── .url            str  ("tcp://host:port")
 
@@ -775,16 +788,18 @@ Socks5Request                          (received from server, never constructed)
 └── async with req
 
 UdpRelay                               (received via req.udp_relay, rarely constructed)
-├── __init__(*, queue_capacity=2_048, drop_warn_interval=100)
+├── __init__(*, queue_capacity=2_048, drop_warn_interval=1_000)
 ├── await start(expected_client_addr) → int
 ├── close()
 ├── await recv() → (bytes, str, int) | None
 ├── send_to_client(payload, src_host, src_port)
-├── .local_port         int
-├── .is_running         bool
-├── .accepted_count     int
-├── .drop_count         int
+├── .local_port           int
+├── .is_running           bool
+├── .accepted_count       int
+├── .drop_count           int
 ├── .foreign_client_count int
 └── async with relay
+```
+
 ```
 
