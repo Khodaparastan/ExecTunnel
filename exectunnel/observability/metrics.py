@@ -6,6 +6,7 @@ All public helpers operate on the module-level ``METRICS`` singleton.
 
 from __future__ import annotations
 
+import contextlib
 import threading
 from collections import defaultdict
 from collections.abc import Callable
@@ -214,14 +215,20 @@ class MetricsRegistry:
 
 METRICS = MetricsRegistry()
 
-_listener_lock = threading.Lock()
+_listener_lock = threading.RLock()
 _listeners: list[Callable[..., None]] = []
 
 
 def register_metric_listener(fn: Callable[..., None]) -> None:
-    """Register a callback invoked on every ``metrics_inc()`` call."""
+    """Register a callback invoked on every ``metrics_inc()`` call.
+
+    Listener call contract:
+    * positional arg 1: metric name
+    * keyword args: metric tags plus ``value`` for increment amount
+    """
     with _listener_lock:
-        _listeners.append(fn)
+        if fn not in _listeners:
+            _listeners.append(fn)
 
 
 def unregister_metric_listener(fn: Callable[..., None]) -> None:
@@ -229,11 +236,8 @@ def unregister_metric_listener(fn: Callable[..., None]) -> None:
 
     Safe to call even if *fn* is not currently registered.
     """
-    with _listener_lock:
-        try:
-            _listeners.remove(fn)
-        except ValueError:
-            pass
+    with _listener_lock, contextlib.suppress(ValueError):
+        _listeners.remove(fn)
 
 
 def unregister_all_listeners() -> None:
@@ -247,10 +251,10 @@ def metrics_inc(metric: str, value: int = 1, **tags: object) -> None:
     with _listener_lock:
         listeners = tuple(_listeners)
     for fn in listeners:
-        try:
-            fn(metric, **tags)
-        except Exception:
-            pass
+        with contextlib.suppress(Exception):
+            fn(metric, value=value, **tags)
+            # Listener failures must never break the metrics path.
+            # Intentionally swallowed.
 
 
 def metrics_observe(metric: str, value: float, **tags: object) -> None:

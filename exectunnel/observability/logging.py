@@ -126,6 +126,7 @@ def install_ring_buffer(
     for handler in logger.handlers:
         if getattr(handler, _RING_BUFFER_ATTR, False):
             assert isinstance(handler, LogRingBuffer)
+            handler.clear()
             return handler
 
     buf = LogRingBuffer(maxlen=maxlen, level=level)
@@ -171,9 +172,7 @@ class _JsonLogFormatter(logging.Formatter):
             "trace_id": getattr(record, "trace_id", "-"),
             "span_id": getattr(record, "span_id", "-"),
         }
-        for key, val in record.__dict__.items():
-            if key not in _LOG_RECORD_BUILTIN_ATTRS:
-                payload[key] = val
+        payload.update({key: val for key, val in record.__dict__.items() if key not in _LOG_RECORD_BUILTIN_ATTRS})
         if record.exc_info:
             payload["exc_info"] = self.formatException(record.exc_info)
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))

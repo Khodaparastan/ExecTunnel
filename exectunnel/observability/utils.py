@@ -1,18 +1,27 @@
-"""Environment-variable parsing helpers for exectunnel observability."""
+"""Environment-variable parsing helpers for exectunnel observability.
+
+Delegates to shared CLI env parsers so semantics stay identical across
+the codebase.
+"""
 
 from __future__ import annotations
 
-import os
+from exectunnel.cli.utils import (
+    parse_bool_env as _parse_bool_env,
+)
+from exectunnel.cli.utils import (
+    parse_float_env as _parse_float_env,
+)
+from exectunnel.cli.utils import (
+    parse_int_env as _parse_int_env,
+)
 
 __all__ = ["parse_bool_env", "parse_float_env", "parse_int_env"]
 
 
 def parse_bool_env(name: str, default: bool = False) -> bool:
     """Read an env var as a boolean flag."""
-    val = os.environ.get(name, "").strip().lower()
-    if not val:
-        return default
-    return val in ("1", "true", "yes", "on")
+    return _parse_bool_env(name, default)
 
 
 def parse_int_env(
@@ -29,18 +38,12 @@ def parse_int_env(
     against the bounds — callers cannot accidentally return an out-of-range
     fallback.
     """
-    val = os.environ.get(name, "").strip()
-    if not val:
-        return _clamp_int(default, min_value, max_value)
-    try:
-        result = int(val)
-    except ValueError:
-        return _clamp_int(default, min_value, max_value)
-    if min_value is not None and result < min_value:
-        return _clamp_int(default, min_value, max_value)
-    if max_value is not None and result > max_value:
-        return _clamp_int(default, min_value, max_value)
-    return result
+    return _parse_int_env(
+        name,
+        _clamp_int(default, min_value, max_value),
+        min_value=min_value,
+        max_value=max_value,
+    )
 
 
 def parse_float_env(
@@ -54,23 +57,12 @@ def parse_float_env(
 
     Same semantics as :func:`parse_int_env` but for floating-point values.
     """
-    val = os.environ.get(name, "").strip()
-    if not val:
-        return _clamp_float(default, min_value, max_value)
-    try:
-        result = float(val)
-    except ValueError:
-        return _clamp_float(default, min_value, max_value)
-    if min_value is not None and result < min_value:
-        return _clamp_float(default, min_value, max_value)
-    if max_value is not None and result > max_value:
-        return _clamp_float(default, min_value, max_value)
-    return result
-
-
-# ------------------------------------------------------------------
-# Internal helpers
-# ------------------------------------------------------------------
+    return _parse_float_env(
+        name,
+        _clamp_float(default, min_value, max_value),
+        min_value=min_value,
+        max_value=max_value,
+    )
 
 
 def _clamp_int(value: int, lo: int | None, hi: int | None) -> int:
