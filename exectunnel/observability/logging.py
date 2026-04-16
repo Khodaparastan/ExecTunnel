@@ -29,6 +29,7 @@ __all__ = [
     "LogEntry",
     "LogRingBuffer",
     "configure_logging",
+    "install_ring_buffer",
 ]
 
 _LEVELS: dict[str, int] = {

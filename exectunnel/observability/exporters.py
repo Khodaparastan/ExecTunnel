@@ -259,7 +259,9 @@ def build_exporters(
                 last_exc = exc
                 if attempt < http_max_retries:
                     time.sleep(_HTTP_RETRY_BACKOFF_BASE * (2**attempt))
-        raise last_exc  # type: ignore[misc]
+        if last_exc is None:
+            raise RuntimeError("HTTP exporter failed without capturing an exception")
+        raise last_exc
 
     async def _emit_http(payload: dict[str, object]) -> None:
         if not http_url:
