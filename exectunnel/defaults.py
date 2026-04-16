@@ -23,14 +23,14 @@ class Defaults:
     # The websockets built-in ping is disabled (ping_interval=None) because its
     # background task competes for the internal write lock under sustained load.
     # 20 s is well below the standard NAT/proxy idle timeout floor (30–60 s) and
-    # gives a full 10 s of headroom before WS_SEND_TIMEOUT_SECS (30 s) fires,
+    # gives a small safety margin versus WS_SEND_TIMEOUT_SECS (15 s),
     # preventing a slow ping send from spuriously triggering a tunnel teardown.
     WS_PING_INTERVAL_SECS: float = 20.0
 
     # Maximum time to wait for a single WebSocket frame send to complete.
     # Over a kubectl exec channel, a stalled send indicates a dead tunnel.
-    # 30 s is generous enough to survive transient API server hiccups while
-    # still detecting truly stalled connections before the OS TCP timeout (2 min).
+    # 15 s is enough to survive brief API server hiccups while still
+    # detecting stalled tunnels promptly.
     WS_SEND_TIMEOUT_SECS: float = 15.0
 
     # Bounded outbound data queue.  Control frames use a separate unbounded queue.
@@ -40,7 +40,8 @@ class Defaults:
     WS_SEND_QUEUE_CAP: int = 512
 
     # Reconnect policy — exponential backoff with jitter.
-    # 5 retries × max_delay 30 s ≈ up to ~2.5 min of retry window.
+    # 10 retries × max_delay 15 s ≈ roughly ~2 min of retry window with
+    # backoff+jitter.
     # Enough to survive a rolling API server restart without giving up.
     WS_RECONNECT_MAX_RETRIES: int = 10
     WS_RECONNECT_BASE_DELAY_SECS: float = 1.0
@@ -106,16 +107,10 @@ class Defaults:
     # of ~2 s + DNS resolution + TCP connect on the agent side) while still
     # detecting stalled connections promptly.
     #
-    # Previous value was 30 s — too high.  At 30 s a stalled connection holds
-    # a semaphore slot for 30 s, blocking up to CONNECT_MAX_PENDING other
-    # connections.  At 10 s the slot is released 3× faster.
-    #
     # Cross-check with ACK hardening:
     #   ACK_TIMEOUT_RECONNECT_THRESHOLD = 5 timeouts
-    #   ACK_TIMEOUT_WINDOW_SECS = 60 s
-    #   → trigger fires when 5 × 10 s = 50 s of ACK wait accumulates in 60 s
-    #   → correctly identifies a degraded tunnel without false-positives on
-    #     transient single-connection failures.
+    #   ACK_TIMEOUT_WINDOW_SECS = 30 s
+    # This intentionally detects repeated failures quickly on degraded tunnels.
     CONN_ACK_TIMEOUT_SECS: float = 30.0
 
     # Pre-ACK buffer: bytes buffered before the agent ACKs CONN_OPEN.
@@ -202,15 +197,15 @@ class Defaults:
     # check.  When bootstrap_skip_if_present=True and bootstrap_syntax_check=True,
     # the bootstrapper checks for this file before running the syntax check again.
     # Avoids re-parsing a large agent script on every reconnect.
-    BOOTSTRAP_SYNTAX_OK_SENTINEL: str = "/tmp/exectunnel_agent.syntax_ok"
+    BOOTSTRAP_SYNTAX_OK_SENTINEL: str = "/tmp/exectunnel_agent.syntax_ok"  # noqa: S108
 
     # Path of the agent script inside the pod.
-    BOOTSTRAP_AGENT_PATH: str = "/tmp/exectunnel_agent.py"
+    BOOTSTRAP_AGENT_PATH: str = "/tmp/exectunnel_agent.py"  # noqa: S108
 
     # Path of the Go agent binary inside the pod.
     # The Go agent is a static Linux/amd64 binary that replaces the Python script.
     # Override via EXECTUNNEL_BOOTSTRAP_GO_AGENT_PATH if /tmp is noexec.
-    BOOTSTRAP_GO_AGENT_PATH: str = "/tmp/agent"
+    BOOTSTRAP_GO_AGENT_PATH: str = "/tmp/agent"  # noqa: S108
 
     # TCP read chunk size for upstream copy and direct pipe.
     # 4 KiB is the standard Linux socket buffer quantum and matches the typical
