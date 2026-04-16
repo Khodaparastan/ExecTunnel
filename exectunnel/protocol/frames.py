@@ -668,7 +668,7 @@ def decode_binary_payload(payload: str) -> bytes:
     padding = (4 - len(payload) % 4) % 4
     try:
         return base64.urlsafe_b64decode(payload + "=" * padding)
-    except binascii.Error as exc:
+    except (binascii.Error, ValueError) as exc:
         raise FrameDecodingError(
             f"Invalid base64url payload: {payload[:64]!r}"
             f"{'...' if len(payload) > 64 else ''}",

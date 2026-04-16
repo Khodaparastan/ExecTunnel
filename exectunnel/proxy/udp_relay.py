@@ -237,17 +237,6 @@ class UdpRelay:
         if self._closed or self._queue is None:
             return
 
-        # Size guard.
-        if len(data) > MAX_UDP_PAYLOAD_BYTES:
-            logger.debug(
-                "udp relay dropping oversized datagram from %s:%d (%d bytes > %d)",
-                addr[0],
-                addr[1],
-                len(data),
-                MAX_UDP_PAYLOAD_BYTES,
-            )
-            return
-
         # Client address binding / filtering.
         if self._client_addr is None:
             if (
@@ -300,6 +289,16 @@ class UdpRelay:
                 addr[1],
                 exc.error_code,
                 exc.message,
+            )
+            return
+
+        if len(payload) > MAX_UDP_PAYLOAD_BYTES:
+            logger.debug(
+                "udp relay dropping oversized payload from %s:%d (%d bytes > %d)",
+                addr[0],
+                addr[1],
+                len(payload),
+                MAX_UDP_PAYLOAD_BYTES,
             )
             return
 
