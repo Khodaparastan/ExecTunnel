@@ -903,7 +903,6 @@ class TcpConnection:
             return
         self._conn_close_sent = True
 
-        frame = encode_conn_close_frame(self._id)
         try:
             await self._ws_send(encode_conn_close_frame(self._id), control=True)
         except WebSocketSendTimeoutError as exc:
