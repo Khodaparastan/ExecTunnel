@@ -143,6 +143,22 @@ _VALID_MSG_TYPES: Final[frozenset[str]] = frozenset({
 # KEEPALIVE:   client→agent heartbeat   — session-level, no connection context.
 _NO_CONN_ID_TYPES: Final[frozenset[str]] = frozenset({"AGENT_READY", "KEEPALIVE"})
 
+# Frame types that require a payload field.
+_PAYLOAD_REQUIRED_TYPES: Final[frozenset[str]] = frozenset({
+    "CONN_OPEN",
+    "DATA",
+    "UDP_OPEN",
+    "UDP_DATA",
+    "ERROR",
+})
+
+# Frame types that must not carry a payload field.
+_PAYLOAD_FORBIDDEN_TYPES: Final[frozenset[str]] = frozenset({
+    "CONN_ACK",
+    "CONN_CLOSE",
+    "UDP_CLOSE",
+})
+
 # ── Validation helpers ────────────────────────────────────────────────────────
 
 # Characters that are structurally significant in the frame wire format.
@@ -810,6 +826,24 @@ def parse_frame(line: str) -> ParsedFrame | None:
             "If this follows a known-good encode, suspect proxy body corruption.",
             details={
                 "raw_bytes": line.encode(errors="replace").hex()[:128],
+                "codec": "frame",
+            },
+        )
+
+    if msg_type in _PAYLOAD_REQUIRED_TYPES and payload == "":
+        raise FrameDecodingError(
+            f"Tunnel frame {msg_type!r} requires a payload but none was found.",
+            details={
+                "raw_bytes": line.encode("ascii", errors="replace").hex()[:128],
+                "codec": "frame",
+            },
+        )
+
+    if msg_type in _PAYLOAD_FORBIDDEN_TYPES and payload != "":
+        raise FrameDecodingError(
+            f"Tunnel frame {msg_type!r} must not carry a payload.",
+            details={
+                "raw_bytes": line.encode("ascii", errors="replace").hex()[:128],
                 "codec": "frame",
             },
         )
