@@ -1,0 +1,49 @@
+# Version control
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.mypy_cache
+.ruff_cache
+htmlcov
+.coverage
+.pytest_cache
+.venv
+venv
+
+# Build artifacts
+dist
+build
+
+# IDE
+.idea
+.vscode
+
+# CI / docs / non-runtime
+.github
+docs
+contexts
+tests
+loot
+irh
+*.md
+!README.md
+
+# Go agent source (binary is embedded separately)
+go_agent
+
+# PodWrangler (separate project)
+podwrangler
+
+# Misc
+diag.py
+limit.sh
+run.sh
+run
+proto.md
+mise.toml
+.env*
