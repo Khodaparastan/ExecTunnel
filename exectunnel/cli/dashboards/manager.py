@@ -54,7 +54,7 @@ def _fmt_bytes(n: int) -> str:
     if n < 1024:
         return f"{n} B"
     for unit in ("KB", "MB", "GB", "TB"):
-        n /= 1024  # type: ignore[assignment]
+        n /= 1024
         if abs(n) < 1024:
             return f"{n:.1f} {unit}"
     return f"{n:.1f} PB"

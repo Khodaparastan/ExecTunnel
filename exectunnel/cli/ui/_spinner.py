@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -171,10 +172,8 @@ class BootstrapSpinner:
         # Cancel tick first to prevent update-after-stop races.
         if self._task is not None:
             self._task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._task
-            except asyncio.CancelledError:
-                pass
             self._task = None
 
         # Ensure a clean final state before printing the summary.

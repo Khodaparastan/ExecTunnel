@@ -36,11 +36,11 @@ def _register_commands() -> None:
     because they in turn import from ``exectunnel.session``, which imports
     from ``exectunnel.cli`` — registering lazily breaks the cycle.
     """
-    from .commands.config import app as _config_app
-    from .commands.connect import connect
-    from .commands.manager import manager
-    from .commands.status import status
-    from .commands.tunnel import tunnel
+    from .commands.config import app as _config_app  # noqa: PLC0415
+    from .commands.connect import connect  # noqa: PLC0415
+    from .commands.manager import manager  # noqa: PLC0415
+    from .commands.status import status  # noqa: PLC0415
+    from .commands.tunnel import tunnel  # noqa: PLC0415
 
     app.add_typer(_config_app, name="config")
     app.command("tunnel")(tunnel)
@@ -64,12 +64,12 @@ def _root(
     ),
 ) -> None:
     if version:
-        from exectunnel import __version__
+        from exectunnel import __version__  # noqa: PLC0415
 
         _console.print(
             f"[et.brand]ExecTunnel[/et.brand] [et.value]{__version__}[/et.value]"
         )
-        raise typer.Exit()
+        raise typer.Exit
 
     if ctx.invoked_subcommand is None:
         _console.print(ctx.get_help())
