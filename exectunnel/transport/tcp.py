@@ -553,18 +553,49 @@ class TcpConnection:
                 hint="Check is_closed before calling feed_async().",
             )
 
-        await self._inbound.put(data)
-
-        if self._closed.is_set():
-            raise ConnectionClosedError(
-                f"conn {self._id!r}: connection closed while enqueuing data.",
-                error_code="transport.feed_async_closed_during_enqueue",
-                details={"conn_id": self._id},
-                hint=(
-                    "The connection closed concurrently with feed_async(). "
-                    "Queued data will be drained before EOF where possible."
-                ),
+        put_task = asyncio.create_task(
+            self._inbound.put(data),
+            name=f"tcp-feed-put-{self._id}",
+        )
+        close_task = asyncio.create_task(
+            self._closed.wait(),
+            name=f"tcp-feed-close-{self._id}",
+        )
+        try:
+            done, _ = await asyncio.wait(
+                {put_task, close_task},
+                return_when=asyncio.FIRST_COMPLETED,
             )
+        except asyncio.CancelledError:
+            put_task.cancel()
+            close_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await put_task
+            with contextlib.suppress(asyncio.CancelledError):
+                await close_task
+            raise
+
+        if put_task in done:
+            close_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await close_task
+            return
+
+        put_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await put_task
+        close_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await close_task
+        raise ConnectionClosedError(
+            f"conn {self._id!r}: connection closed while waiting to enqueue data.",
+            error_code="transport.feed_async_closed_during_enqueue",
+            details={"conn_id": self._id},
+            hint=(
+                "The connection closed concurrently with feed_async(). "
+                "The chunk was not enqueued."
+            ),
+        )
 
     async def close_unstarted(self) -> None:
         """Close the writer directly when :meth:`start` was never called.
