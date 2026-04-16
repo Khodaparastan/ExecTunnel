@@ -37,6 +37,7 @@ import collections
 import logging
 import math
 import os
+import shlex
 import uuid
 from typing import TYPE_CHECKING, Final
 
@@ -63,22 +64,11 @@ logger = logging.getLogger(__name__)
 
 _VALID_DELIVERY_MODES: Final[frozenset[str]] = frozenset({"upload", "fetch"})
 
-# Characters that are unsafe inside single-quoted POSIX shell strings or that
-# could trigger shell expansion / history substitution in any context.
-_SHELL_UNSAFE_CHARS: Final[frozenset[str]] = frozenset({
-    "'",
-    "`",
-    "$",
-    "\\",
-    "\n",
-    "\r",
-    "!",
-})
-
 # Unique marker prefix for file-existence probes.
 _MARKER_PREFIX: Final[str] = "EXECTUNNEL_EXISTS"
 _MARKER_YES: Final[str] = f"{_MARKER_PREFIX}:1"
 _MARKER_NO: Final[str] = f"{_MARKER_PREFIX}:0"
+_MAX_STASH_LINES: Final[int] = 256
 
 # Fence marker prefix for command synchronisation.
 _FENCE_PREFIX: Final[str] = "EXECTUNNEL_FENCE"
@@ -95,6 +85,11 @@ _MIN_FENCE_TIMEOUT_SECS: Final[float] = 2.0
 # Replacement character used when a WebSocket binary frame contains bytes
 # that are not valid UTF-8.
 _WS_DECODE_ERRORS: Final[str] = "replace"
+_PYTHON_CANDIDATES: Final[tuple[str, ...]] = (
+    "python3.12",
+    "python3",
+    "python",
+)
 
 
 class AgentBootstrapper:
@@ -117,6 +112,8 @@ class AgentBootstrapper:
         "_tun",
         "_diag",
         "_start",
+        "_stash_lines",
+        "_stash_carry",
         "_post_ready_lines",
         "_pre_ready_carry",
     )
@@ -135,6 +132,8 @@ class AgentBootstrapper:
             maxlen=Defaults.BOOTSTRAP_DIAG_MAX_LINES,
         )
         self._start: float = 0.0
+        self._stash_lines: list[str] = []
+        self._stash_carry: str = ""
         self._post_ready_lines: list[str] = []
         self._pre_ready_carry: str = ""
 
@@ -142,7 +141,11 @@ class AgentBootstrapper:
 
     @staticmethod
     def _validate_shell_literals(tun_cfg: TunnelConfig) -> None:
-        """Reject values that would break single-quoted shell interpolation."""
+        """Validate only semantic constraints for shell-bound values.
+
+        Shell escaping is handled centrally by :meth:`_shq`, so this validation
+        only rejects values that are structurally unusable.
+        """
         values_to_check: tuple[tuple[str, str], ...] = (
             ("bootstrap_agent_path", tun_cfg.bootstrap_agent_path),
             ("bootstrap_go_agent_path", tun_cfg.bootstrap_go_agent_path),
@@ -150,20 +153,24 @@ class AgentBootstrapper:
             ("bootstrap_fetch_url", tun_cfg.bootstrap_fetch_url),
         )
         for attr, value in values_to_check:
-            bad = _SHELL_UNSAFE_CHARS.intersection(value)
-            if bad:
-                safe_repr = sorted(repr(c) for c in bad)
+            if not value.strip():
                 raise BootstrapError(
-                    f"Configuration {attr}={value!r} contains shell-unsafe "
-                    f"character(s) {safe_repr} — this would break shell commands "
-                    "constructed during bootstrap.",
-                    details={
-                        "attr": attr,
-                        "value": value,
-                        "unsafe_chars": sorted(bad),
-                    },
-                    hint=f"Remove unsafe characters {safe_repr} from the {attr} value.",
+                    f"Configuration {attr} must not be empty.",
+                    details={"attr": attr, "value": value},
+                    hint=f"Set a non-empty value for {attr}.",
                 )
+            if "\x00" in value:
+                raise BootstrapError(
+                    f"Configuration {attr} contains a NUL byte, which is invalid "
+                    "for shell command construction.",
+                    details={"attr": attr, "value": value},
+                    hint=f"Remove NUL bytes from {attr}.",
+                )
+
+    @staticmethod
+    def _shq(value: str) -> str:
+        """Return a POSIX-shell-escaped single token."""
+        return shlex.quote(value)
 
     # ── Read-only properties consumed by TunnelSession ────────────────────────
 
@@ -253,7 +260,7 @@ class AgentBootstrapper:
 
         # Decide whether to run the syntax check.
         run_syntax = self._tun.bootstrap_syntax_check
-        if run_syntax and skip and not delivered:
+        if run_syntax and skip and not delivered:  # noqa: SIM102
             if await self._check_file_exists(sentinel_path):
                 logger.info(
                     "bootstrap: syntax-OK sentinel present — skipping syntax check"
@@ -262,13 +269,13 @@ class AgentBootstrapper:
                 run_syntax = False
 
         if run_syntax:
-            await self._run_syntax_check(agent_path, sentinel_path)
+            py = await self._resolve_remote_python()
+            await self._run_syntax_check(agent_path, sentinel_path, py)
         else:
             metrics_inc("bootstrap.syntax_skipped")
+            py = await self._resolve_remote_python()
 
-        await self._send_command(
-            f"exec python3.12 '{agent_path}' || exec python3 '{agent_path}'"
-        )
+        await self._send_command(f"exec {self._shq(py)} {self._shq(agent_path)}")
 
     async def _run_go_bootstrap(self, delivery: str) -> None:
         """Deliver and exec the pre-built Go agent binary."""
@@ -280,8 +287,8 @@ class AgentBootstrapper:
             label="go",
         )
 
-        await self._send_fenced_command(f"chmod +x '{go_path}'")
-        await self._send_command(f"exec '{go_path}'")
+        await self._send_fenced_command(f"chmod +x {self._shq(go_path)}")
+        await self._send_command(f"exec {self._shq(go_path)}")
 
     # ── Unified delivery orchestration ────────────────────────────────────────
 
@@ -317,7 +324,7 @@ class AgentBootstrapper:
                 label,
                 agent_path,
             )
-            await self._send_fenced_command(f"rm -f '{agent_path}'")
+            await self._send_fenced_command(f"rm -f {self._shq(agent_path)}")
 
         if delivery == "upload":
             b64_data = load_go_agent_b64() if label == "go" else load_agent_b64()
@@ -369,9 +376,10 @@ class AgentBootstrapper:
         fence_marker = f"{_FENCE_PREFIX}:{fence_id}"
 
         await self._send_command(cmd)
-        await self._send_command(f"printf '{fence_marker}\\n'")
+        await self._send_command(f"printf '%s\\n' {self._shq(fence_marker)}")
 
-        buf = ""
+        buf = self._stash_carry
+        self._stash_carry = ""
         try:
             async with asyncio.timeout(timeout):
                 async for msg in self._ws:
@@ -381,18 +389,18 @@ class AgentBootstrapper:
                         line, buf = buf.split("\n", 1)
                         stripped = line.strip()
                         if stripped == fence_marker:
-                            if buf.strip():
-                                logger.debug(
-                                    "bootstrap: %d chars of residual data "
-                                    "after fence marker discarded: %r",
-                                    len(buf),
-                                    buf[:80],
-                                )
+                            self._stash_carry = buf
                             return
                         if stripped:
                             logger.debug("bootstrap fence output: %s", stripped)
                             self._diag.append(stripped)
+                            self._stash_lines.append(line)
+                            if len(self._stash_lines) > _MAX_STASH_LINES:
+                                overflow = len(self._stash_lines) - _MAX_STASH_LINES
+                                if overflow > 0:
+                                    del self._stash_lines[:overflow]
         except TimeoutError:
+            self._stash_carry = buf
             raise BootstrapError(
                 f"Timed out after {timeout}s waiting for command fence ({cmd[:40]!r}).",
                 details={
@@ -434,11 +442,14 @@ class AgentBootstrapper:
             BootstrapError: If the WebSocket closes or the timeout expires
                             before the marker arrives.
         """
+        path_q = self._shq(path)
         await self._send_command(
-            f"[ -f '{path}' ] && printf '{_MARKER_YES}\\n' || printf '{_MARKER_NO}\\n'",
+            f"[ -f {path_q} ] && printf '%s\\n' {self._shq(_MARKER_YES)} "
+            f"|| printf '%s\\n' {self._shq(_MARKER_NO)}",
         )
 
-        buf = ""
+        buf = self._stash_carry
+        self._stash_carry = ""
         try:
             async with asyncio.timeout(timeout):
                 async for msg in self._ws:
@@ -448,13 +459,21 @@ class AgentBootstrapper:
                         line, buf = buf.split("\n", 1)
                         stripped = line.strip()
                         if stripped == _MARKER_YES:
+                            self._stash_carry = buf
                             return True
                         if stripped == _MARKER_NO:
+                            self._stash_carry = buf
                             return False
                         if stripped:
                             logger.debug("bootstrap probe output: %s", stripped)
                             self._diag.append(stripped)
+                            self._stash_lines.append(line)
+                            if len(self._stash_lines) > _MAX_STASH_LINES:
+                                overflow = len(self._stash_lines) - _MAX_STASH_LINES
+                                if overflow > 0:
+                                    del self._stash_lines[:overflow]
         except TimeoutError:
+            self._stash_carry = buf
             raise BootstrapError(
                 f"Timed out after {timeout}s waiting for file-existence "
                 f"probe response for {path!r}.",
@@ -503,6 +522,8 @@ class AgentBootstrapper:
         )
 
         b64_path = self._b64_staging_path(agent_path)
+        b64_path_q = self._shq(b64_path)
+        agent_path_q = self._shq(agent_path)
         chunk_size = Defaults.BOOTSTRAP_CHUNK_SIZE_CHARS
         total_chunks = math.ceil(len(b64_data) / chunk_size)
 
@@ -515,14 +536,14 @@ class AgentBootstrapper:
         )
 
         # 1. Clear stale staging file.
-        await self._send_fenced_command(f"rm -f '{b64_path}'")
+        await self._send_fenced_command(f"rm -f {b64_path_q}")
 
         # 2. Stream chunks — fire-and-forget per chunk for throughput;
         #    we fence once after the last chunk (step 3).
         metrics_inc(f"bootstrap.{label}.upload_started")
         for idx, offset in enumerate(range(0, len(b64_data), chunk_size)):
             chunk = b64_data[offset : offset + chunk_size]
-            await self._send_command(f"printf '%s' '{chunk}' >> '{b64_path}'")
+            await self._send_command(f"printf '%s' {self._shq(chunk)} >> {b64_path_q}")
             if (idx + 1) % _UPLOAD_PROGRESS_LOG_INTERVAL == 0:
                 logger.debug(
                     "bootstrap(%s): upload progress %d/%d chunks",
@@ -532,21 +553,25 @@ class AgentBootstrapper:
                 )
 
         # 3. Fence after the last chunk.
-        await self._send_fenced_command(f"sync '{b64_path}' 2>/dev/null || true")
+        await self._send_fenced_command(f"sync {b64_path_q} 2>/dev/null || true")
         metrics_inc(f"bootstrap.{label}.upload_done")
 
+        py = "python3"
+        if label == "python":
+            py = await self._resolve_remote_python()
+        py_q = self._shq(py)
+
         # 4. Decode: convert URL-safe base64 back to standard alphabet.
-        await self._send_fenced_command(
-            f"(sed 's/-/+/g; s/_/\\//g' '{b64_path}' | base64 -d > '{agent_path}') "
-            f"|| python3.12 -c \"import base64; "
-            f"open('{agent_path}','wb').write(base64.urlsafe_b64decode(open('{b64_path}','rb').read()))\" "
-            f"|| python3 -c \"import base64; "
-            f"open('{agent_path}','wb').write(base64.urlsafe_b64decode(open('{b64_path}','rb').read()))\""
+        decode_cmd = (
+            f"(sed 's/-/+/g; s/_/\\//g' {b64_path_q} | base64 -d > {agent_path_q}) "
+            f"|| {py_q} -c "
+            f"{self._shq(f'import base64; open({agent_path!r},"wb").write(base64.urlsafe_b64decode(open({b64_path!r},"rb").read()))')}"
         )
+        await self._send_fenced_command(decode_cmd)
         metrics_inc(f"bootstrap.{label}.decode_done")
 
         # 5. Clean up staging file.
-        await self._send_fenced_command(f"rm -f '{b64_path}'")
+        await self._send_fenced_command(f"rm -f {b64_path_q}")
 
     # ── Delivery: Fetch ───────────────────────────────────────────────────────
 
@@ -558,10 +583,12 @@ class AgentBootstrapper:
     ) -> None:
         """Fetch the agent inside the pod from a URL using curl/wget."""
         logger.info("bootstrap(%s/fetch): fetching agent from %s", label, url)
+        agent_path_q = self._shq(agent_path)
+        url_q = self._shq(url)
 
         fetch_cmd = (
-            f"curl -fsSL '{url}' -o '{agent_path}' 2>/dev/null"
-            f" || wget -qO '{agent_path}' '{url}'"
+            f"curl -fsSL {url_q} -o {agent_path_q} 2>/dev/null"
+            f" || wget -qO {agent_path_q} {url_q}"
         )
         await self._send_command(fetch_cmd)
         metrics_inc(f"bootstrap.{label}.fetch_started")
@@ -616,17 +643,62 @@ class AgentBootstrapper:
         self,
         agent_path: str,
         sentinel_path: str,
+        py: str,
     ) -> None:
         """Run a remote ``ast.parse`` syntax check and write the sentinel on success."""
         metrics_inc("bootstrap.syntax_started")
         check_cmd = (
-            f'python3 -c "import ast, sys; '
-            f"ast.parse(open('{agent_path}').read()); "
-            f"sys.stdout.write('SYNTAX_OK\\\\n'); "
-            f"sys.stdout.flush(); "
-            f"open('{sentinel_path}', 'w').close()\""
+            f"{self._shq(py)} -c "
+            f"{self._shq(f'import ast, sys; ast.parse(open({agent_path!r}).read()); sys.stdout.write("SYNTAX_OK\\\\n"); sys.stdout.flush(); open({sentinel_path!r}, "w").close()')}"
         )
         await self._send_fenced_command(check_cmd)
+
+    async def _resolve_remote_python(self) -> str:
+        """Return the first usable Python interpreter on the remote pod."""
+        for candidate in _PYTHON_CANDIDATES:
+            marker = f"{_FENCE_PREFIX}:PY:{candidate}"
+            cmd = (
+                f"command -v {candidate} >/dev/null 2>&1 "
+                f"&& printf '%s\\n' {self._shq(marker)} || true"
+            )
+            await self._send_command(cmd)
+
+            buf = self._stash_carry
+            self._stash_carry = ""
+            try:
+                async with asyncio.timeout(_MIN_FENCE_TIMEOUT_SECS):
+                    async for msg in self._ws:
+                        chunk = self._decode_ws_message(msg)
+                        buf += chunk
+                        while "\n" in buf:
+                            line, buf = buf.split("\n", 1)
+                            stripped = line.strip()
+                            if stripped == marker:
+                                self._stash_carry = buf
+                                return candidate
+                            if stripped:
+                                self._diag.append(stripped)
+                                self._stash_lines.append(line)
+                                if len(self._stash_lines) > _MAX_STASH_LINES:
+                                    overflow = len(self._stash_lines) - _MAX_STASH_LINES
+                                    if overflow > 0:
+                                        del self._stash_lines[:overflow]
+            except TimeoutError:
+                self._stash_carry = buf
+                continue
+
+        raise BootstrapError(
+            "No supported Python interpreter found on remote pod.",
+            details={
+                "candidates": list(_PYTHON_CANDIDATES),
+                "host": self._cfg.wss_url,
+                "elapsed_s": self._elapsed,
+            },
+            hint=(
+                "Install Python 3.12+ on the target pod or enable the Go agent "
+                "delivery path."
+            ),
+        )
 
     # ── Wait for AGENT_READY ──────────────────────────────────────────────────
 
@@ -661,8 +733,16 @@ class AgentBootstrapper:
             AgentVersionMismatchError: Remote agent version incompatible.
             BootstrapError:            WebSocket closed before ``AGENT_READY``.
         """
-        buf = ""
+        buf = self._stash_carry
+        self._stash_carry = ""
         ready = False
+
+        while self._stash_lines and not ready:
+            line = self._stash_lines.pop(0)
+            if is_ready_frame(line):
+                ready = True
+                continue
+            self._handle_pre_ready_line(line.strip(), agent_path)
 
         async for msg in self._ws:
             chunk = self._decode_ws_message(msg)

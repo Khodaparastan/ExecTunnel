@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed
 
+from exectunnel.defaults import Defaults
 from exectunnel.exceptions import (
     BootstrapError,
     ConnectionClosedError,
@@ -277,6 +278,8 @@ class TunnelSession:
                     "session.reconnect",
                     reason=_reconnect_reason_tag(reconnect_reason),
                 )
+                if self._dispatcher is not None:
+                    self._dispatcher.reset_ack_state()
                 metrics_observe("session.reconnect.delay_sec", delay)
                 logger.warning(
                     "WebSocket disconnected (%s), reconnecting in %.1fs "
@@ -321,6 +324,22 @@ class TunnelSession:
             metrics_gauge_set(name, 0.0)
 
     # ── Session initialisation ────────────────────────────────────────────────
+
+    async def _request_reconnect(self, reason: str) -> None:
+        """Force-close the current websocket so the reconnect loop proceeds."""
+        ws = self._ws
+        if ws is None:
+            return
+        try:
+            await ws.close(
+                code=Defaults.WS_CLOSE_CODE_UNHEALTHY,
+                reason=reason[:120],
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "failed to close websocket during forced reconnect request",
+                exc_info=True,
+            )
 
     async def _clear_session_state(self) -> None:
         """Abort/close all per-session state before a new session starts.
@@ -437,6 +456,7 @@ class TunnelSession:
                 pending_connects=self._pending_connects,
                 udp_registry=self._udp_registry,
                 pre_ack_buffer_cap_bytes=self._tun.pre_ack_buffer_cap_bytes,
+                request_reconnect=self._request_reconnect,
             )
 
             if self._sender is None or self._dispatcher is None:
