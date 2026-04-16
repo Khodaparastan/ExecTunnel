@@ -266,7 +266,9 @@ class AgentBootstrapper:
         else:
             metrics_inc("bootstrap.syntax_skipped")
 
-        await self._send_command(f"exec python3 '{agent_path}'")
+        await self._send_command(
+            f"exec python3.12 '{agent_path}' || exec python3 '{agent_path}'"
+        )
 
     async def _run_go_bootstrap(self, delivery: str) -> None:
         """Deliver and exec the pre-built Go agent binary."""
@@ -535,7 +537,11 @@ class AgentBootstrapper:
 
         # 4. Decode: convert URL-safe base64 back to standard alphabet.
         await self._send_fenced_command(
-            f"sed 's/-/+/g; s/_/\\//g' '{b64_path}' | base64 -d > '{agent_path}'"
+            f"(sed 's/-/+/g; s/_/\\//g' '{b64_path}' | base64 -d > '{agent_path}') "
+            f"|| python3.12 -c \"import base64; "
+            f"open('{agent_path}','wb').write(base64.urlsafe_b64decode(open('{b64_path}','rb').read()))\" "
+            f"|| python3 -c \"import base64; "
+            f"open('{agent_path}','wb').write(base64.urlsafe_b64decode(open('{b64_path}','rb').read()))\""
         )
         metrics_inc(f"bootstrap.{label}.decode_done")
 

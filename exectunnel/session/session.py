@@ -334,6 +334,11 @@ class TunnelSession:
             self._dispatcher.close()
             self._dispatcher = None
 
+        if self._sender is not None:
+            with contextlib.suppress(Exception):
+                await self._sender.stop()
+            self._sender = None
+
         # Cancel and await all in-flight request tasks BEFORE clearing
         # registries — request tasks may reference registry entries.
         for task in list(self._request_tasks):
@@ -612,6 +617,8 @@ class TunnelSession:
 
                         if self._dispatcher is not None:
                             self._dispatcher.close()
+                            self._dispatcher = None
+                        self._sender = None
 
                         metrics_inc("session.serve.stopped")
 
