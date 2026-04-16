@@ -18,7 +18,6 @@ from exectunnel.exceptions import (
 )
 from exectunnel.observability import (
     aspan,
-    metrics_gauge_dec,
     metrics_gauge_inc,
     metrics_gauge_set,
     metrics_inc,
@@ -223,7 +222,6 @@ class DnsForwarder:
         """
         if self._started:
             return
-        self._started = True
 
         loop = asyncio.get_running_loop()
         try:
@@ -259,6 +257,7 @@ class DnsForwarder:
                 hint="This is an asyncio internal error. Please report it.",
             )
 
+        self._started = True
         # Authoritative assignment — on_transport_ready() may have already
         # set this during create_datagram_endpoint, but this is the canonical
         # assignment that start() guarantees.
@@ -408,7 +407,6 @@ class DnsForwarder:
                 asyncio.get_running_loop().time() - start,
             )
             await self._cleanup_flow(handler, flow_id, opened, agent_closed)
-            metrics_gauge_dec("session.active.udp_flows")
 
     async def _recv_response(
         self,
