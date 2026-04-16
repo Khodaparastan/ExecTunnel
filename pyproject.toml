@@ -130,6 +130,8 @@ ignore = [
     "TRY400",
     "TRY401",
     "N811",
+    "PLR2004",
+    "S311",
     "N801",
     "TRY003", # Long exception messages
     "TRY300", # Consider moving this statement to an `else` block
