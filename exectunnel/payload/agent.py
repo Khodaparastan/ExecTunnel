@@ -29,6 +29,7 @@ agent → local::
     <<<EXECTUNNEL:ERROR:cN:base64url_reason>>>
     <<<EXECTUNNEL:UDP_DATA:uN:base64url>>>
     <<<EXECTUNNEL:UDP_CLOSE:uN>>>
+    <<<EXECTUNNEL:STATS:base64url_json>>>   # optional observability snapshot
 
 Encoding
 --------
@@ -84,6 +85,7 @@ import base64
 import binascii
 import contextlib
 import errno
+import json as _json
 import os
 import queue
 import re as _re
@@ -94,6 +96,7 @@ import sys
 import termios
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from datetime import UTC, datetime
 
@@ -115,6 +118,20 @@ _LOG_LEVEL: int = _LOG_LEVELS.get(
 
 # Maximum queued inbound chunks before a TCP connection is declared saturated.
 _MAX_TCP_INBOUND_CHUNKS: int = 1_024
+
+# Global hard cap on concurrent TCP workers the agent will accept.  Guards
+# against runaway/adversarial CONN_OPEN storms that could exhaust the pod's
+# thread/FD budget.  Additional opens beyond the cap are rejected with an
+# ERROR frame.
+_MAX_TCP_WORKERS: int = int(os.getenv("EXECTUNNEL_AGENT_MAX_TCP_WORKERS", "2048"))
+
+# Hard per-call deadline for ``_FrameWriter.emit_data`` to avoid permanent
+# wedge when the writer channel is silently half-dead (no OSError raised
+# yet so ``is_dead`` has not flipped).  After this deadline the writer is
+# force-marked dead so all workers unblock.
+_EMIT_DATA_HARD_DEADLINE_SECS: float = float(
+    os.getenv("EXECTUNNEL_AGENT_EMIT_DATA_DEADLINE_SECS", "30.0")
+)
 
 # Maximum queued inbound datagrams before a UDP flow starts dropping.
 _MAX_UDP_INBOUND_DGRAMS: int = 2_048
@@ -141,6 +158,7 @@ _TCP_RECV_CHUNK_BYTES: int = 4_096
 
 # Maximum UDP datagram size (theoretical IPv4/IPv6 maximum).
 _MAX_UDP_DGRAM_BYTES: int = 65_535
+_MAX_PORT: int = 65_535
 
 # Log a UDP drop warning every N drops.
 _UDP_DROP_WARN_EVERY: int = 1_000
@@ -163,6 +181,10 @@ _SEND_WRITABLE_TIMEOUT_SECS: float = 5.0
 
 # Maximum inbound frame length accepted by dispatch().
 _MAX_INBOUND_FRAME_LEN: int = 8_192
+_MIN_PARTS_WITH_CONN_ID: int = 2
+_MIN_PARTS_WITH_PAYLOAD: int = 3
+_HOST_PORT_PART_INDEX: int = 2
+_ARGC_FIXED_TARGET: int = 3
 
 # Regex pattern for valid connection / flow IDs.
 _ID_RE: _re.Pattern[str] = _re.compile(r"^[cu][0-9a-f]{24}$")
@@ -172,24 +194,78 @@ _EMIT_DATA_PUT_TIMEOUT_SECS: float = 1.0
 
 # Grace period for worker threads to emit final frames during shutdown.
 _WORKER_SHUTDOWN_GRACE_SECS: float = 3.0
+
+# Maximum number of entries in the per-process DNS cache.  The agent is
+# normally short-lived so expiry is unnecessary, but a hard cap prevents
+# unbounded growth under pathological fan-out (many distinct hosts).
+_DNS_CACHE_MAX_ENTRIES: int = 4_096
+
 _TERMINATE = False
+
+# ── Observability counters (Step 2 — measurement framework) ──────────────────
+# Module-level atomic-ish counters. Plain ints are safe to read/write under
+# CPython's GIL for our purposes (sampler only observes monotonic snapshots;
+# small races on the *rate* computation are acceptable — we never rely on
+# byte-for-byte accuracy, only on trend).
+_TX_BYTES_TOTAL: int = 0
+_RX_BYTES_TOTAL: int = 0
+_FRAMES_TX_TOTAL: int = 0
+_FRAMES_RX_TOTAL: int = 0
+
+# Bounded ring-buffer of recent dispatch latencies (seconds, float).
+# Used by the stats sampler to compute p50/p95 for the last sampling window.
+_DISPATCH_SAMPLES_MAX: int = 1_024
+_DISPATCH_SAMPLES: deque[float] = deque(maxlen=_DISPATCH_SAMPLES_MAX)
+_DISPATCH_SAMPLES_LOCK: threading.Lock = threading.Lock()
+
+# Stats sampling interval (seconds). 1 Hz matches the client bench harness.
+_STATS_SAMPLE_INTERVAL_SECS: float = float(
+    os.getenv("EXECTUNNEL_AGENT_STATS_INTERVAL_SECS", "1.0")
+)
+# Feature flag — default ON; set to "0" to disable STATS emission entirely
+# for sessions that must stay byte-identical to the pre-observability agent.
+_STATS_ENABLED: bool = os.getenv("EXECTUNNEL_AGENT_STATS_ENABLED", "1") != "0"
+
+
+def _record_dispatch_sample(seconds: float) -> None:
+    """Append one dispatch-latency sample (bounded, thread-safe)."""
+    with _DISPATCH_SAMPLES_LOCK:
+        _DISPATCH_SAMPLES.append(seconds)
 
 
 class _DnsCache:
-    """Thread-safe DNS cache with per-key deduplication.
+    """Thread-safe DNS cache with per-key deduplication and an LRU cap.
 
     Only the first caller for a given ``(host, port, socktype)`` key blocks
     on ``getaddrinfo``; concurrent callers wait on a per-key lock.
 
-    The cache never expires — the agent process is short-lived.
+    Entries never expire, but the cache is bounded by
+    ``_DNS_CACHE_MAX_ENTRIES`` and evicts oldest entries (and their
+    deduplication locks) when the cap is exceeded.
     """
 
-    __slots__ = ("_cache", "_key_locks", "_mu")
+    __slots__ = ("_cache", "_key_locks", "_mu", "_max_entries")
 
-    def __init__(self) -> None:
+    def __init__(self, max_entries: int = _DNS_CACHE_MAX_ENTRIES) -> None:
+        # ``dict`` preserves insertion order (Py 3.7+), which is what we use
+        # for cheap LRU eviction.  We *re-insert* on each hit so the most
+        # recently used key is at the end.
         self._cache: dict[tuple[str, int, int], list[tuple]] = {}
         self._key_locks: dict[tuple[str, int, int], threading.Lock] = {}
         self._mu = threading.Lock()
+        self._max_entries = max_entries
+
+    def _touch_locked(self, key: tuple[str, int, int]) -> None:
+        """Move *key* to the MRU end of the ordered dict (caller holds ``_mu``)."""
+        value = self._cache.pop(key, None)
+        if value is not None:
+            self._cache[key] = value
+
+    def _evict_if_needed_locked(self) -> None:
+        while len(self._cache) > self._max_entries:
+            oldest_key, _ = next(iter(self._cache.items()))
+            self._cache.pop(oldest_key, None)
+            self._key_locks.pop(oldest_key, None)
 
     def getaddrinfo(
         self,
@@ -203,6 +279,7 @@ class _DnsCache:
         with self._mu:
             cached = self._cache.get(key)
             if cached is not None:
+                self._touch_locked(key)
                 return cached
             key_lock = self._key_locks.get(key)
             if key_lock is None:
@@ -213,12 +290,14 @@ class _DnsCache:
             with self._mu:
                 cached = self._cache.get(key)
                 if cached is not None:
+                    self._touch_locked(key)
                     return cached
 
             infos = socket.getaddrinfo(host, port, type=socktype)
 
             with self._mu:
                 self._cache[key] = infos
+                self._evict_if_needed_locked()
             return infos
 
 
@@ -257,6 +336,16 @@ def _install_termination_handlers() -> None:
     def _handle(_signum: int, _frame: object | None) -> None:
         global _TERMINATE  # noqa: PLW0603
         _TERMINATE = True
+        # The stdin reader loop iterates ``for raw_line in sys.stdin`` which
+        # blocks inside a C-level ``read()``; a bare ``_TERMINATE`` flag is
+        # only inspected between lines.  Closing the underlying fd unblocks
+        # the pending read and propagates EOF to the dispatcher, letting
+        # ``main()`` shut down promptly on SIGTERM / SIGINT.
+        with contextlib.suppress(OSError, ValueError, AttributeError):
+            fd = sys.stdin.fileno()
+            # ``os.close`` rather than ``sys.stdin.close`` avoids re-entrant
+            # buffer flush inside the signal handler.
+            os.close(fd)
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         with contextlib.suppress(OSError, ValueError):
@@ -268,29 +357,35 @@ class _FaultTolerantStdout:
 
     def __init__(self, inner: object) -> None:
         self._inner = inner
-        self._dead = False
+        # ``threading.Event`` rather than plain bool — gives cross-thread
+        # ordering guarantees (and a cheap wait primitive if ever needed).
+        self._dead = threading.Event()
 
     def write(self, s: str) -> int:
-        if self._dead:
+        if self._dead.is_set():
             return 0
         try:
             return self._inner.write(s)  # type: ignore[union-attr]
         except OSError:
-            self._dead = True
+            self._dead.set()
             return 0
 
     def flush(self) -> None:
-        if self._dead:
+        if self._dead.is_set():
             return
         try:
-            self._inner.flush()  # type: ignore[union-attr]
+            self._inner.flush()
         except OSError:
-            self._dead = True
+            self._dead.set()
 
     @property
     def is_dead(self) -> bool:
         """``True`` once any write or flush has raised ``OSError``."""
-        return self._dead
+        return self._dead.is_set()
+
+    def mark_dead(self) -> None:
+        """Force the stdout into the dead state (e.g. on hard deadline)."""
+        self._dead.set()
 
 
 def _b64encode(data: bytes) -> str:
@@ -420,12 +515,33 @@ class _FrameWriter:
         self._ctrl.put(line)
 
     def emit_data(self, line: str) -> None:
-        """Enqueue a data frame with periodic liveness and shutdown checks."""
-        while not self._out.is_dead and not self._stopping:
+        """Enqueue a data frame with periodic liveness and shutdown checks.
+
+        Observes the module-level ``_TERMINATE`` flag so signal handlers can
+        unblock workers stuck on a full queue even if ``is_dead`` has not yet
+        flipped (e.g. before the first blocked write discovers the closed
+        kubectl channel).
+
+        Applies a hard deadline (``_EMIT_DATA_HARD_DEADLINE_SECS``) after
+        which stdout is force-marked dead so this worker — and all other
+        workers blocked on a full data queue — can unblock.  Protects
+        against silently-wedged writer channels (e.g. half-dead TCP) where
+        neither an OSError nor a signal ever arrives.
+        """
+        deadline = time.monotonic() + _EMIT_DATA_HARD_DEADLINE_SECS
+        while not self._out.is_dead and not self._stopping and not _TERMINATE:
             try:
                 self._data.put(line, timeout=_EMIT_DATA_PUT_TIMEOUT_SECS)
                 return
             except queue.Full:
+                if time.monotonic() >= deadline:
+                    _log(
+                        "warning",
+                        "emit_data: hard deadline %.1fs exceeded — marking stdout dead",
+                        _EMIT_DATA_HARD_DEADLINE_SECS,
+                    )
+                    self._out.mark_dead()
+                    return
                 continue
 
     def stop(self) -> None:
@@ -539,6 +655,95 @@ class _FrameWriter:
 _writer: _FrameWriter | None = None
 
 
+class _StatsSampler:
+    """Periodic emitter of ``STATS`` control frames.
+
+    Runs as a daemon thread. Every ``_STATS_SAMPLE_INTERVAL_SECS`` it
+    builds a JSON snapshot of the module-level observability counters,
+    base64url-encodes it, and emits a ``STATS`` frame via the existing
+    control-frame lane (``_emit_ctrl``) so it inherits the same FIFO +
+    priority semantics as ``CONN_ACK`` / ``CONN_CLOSE``.
+
+    Frame format (new type, forward-compatible for old clients which
+    fall through to the ``unknown frame type ignored`` path)::
+
+        <<<EXECTUNNEL:STATS:<base64url-no-padding-JSON>>>>
+
+    The decoded JSON is a single snapshot carrying byte/frame totals,
+    stdout-queue depth, worker counts, and dispatch latency percentiles
+    computed from the bounded sample ring. The client aggregates many
+    snapshots into percentile distributions at report-generation time.
+    """
+
+    def __init__(
+        self,
+        dispatcher: _Dispatcher,
+        interval_secs: float = _STATS_SAMPLE_INTERVAL_SECS,
+    ) -> None:
+        self._dispatcher = dispatcher
+        self._interval = interval_secs
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="stats-sampler"
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        # Daemon thread — best effort join; do not block shutdown.
+        self._thread.join(timeout=0.5)
+
+    def _snapshot(self) -> dict[str, object]:
+        with _DISPATCH_SAMPLES_LOCK:
+            samples = list(_DISPATCH_SAMPLES)
+        samples.sort()
+        n = len(samples)
+
+        def pct(p: float) -> float:
+            if n == 0:
+                return 0.0
+            idx = min(n - 1, int(p * n))
+            return samples[idx]
+
+        tcp_count, udp_count = self._dispatcher.worker_counts()
+        data_queue_depth = _writer.data_queue_size if _writer is not None else 0
+        return {
+            "ts": time.time(),
+            "agent_version": _AGENT_VERSION,
+            "tx_bytes_total": _TX_BYTES_TOTAL,
+            "rx_bytes_total": _RX_BYTES_TOTAL,
+            "frames_tx_total": _FRAMES_TX_TOTAL,
+            "frames_rx_total": _FRAMES_RX_TOTAL,
+            "data_queue_depth": data_queue_depth,
+            "data_queue_cap": _STDOUT_DATA_QUEUE_CAP,
+            "tcp_worker_count": tcp_count,
+            "udp_worker_count": udp_count,
+            "dispatch_ms_p50": pct(0.50) * 1000.0,
+            "dispatch_ms_p95": pct(0.95) * 1000.0,
+            "dispatch_ms_p99": pct(0.99) * 1000.0,
+            "dispatch_samples": n,
+        }
+
+    def _run(self) -> None:
+        # Stagger the first emission so it does not race with AGENT_READY.
+        if self._stop.wait(timeout=self._interval):
+            return
+        while not self._stop.is_set() and not _TERMINATE:
+            try:
+                snap = self._snapshot()
+                payload = _b64encode(_json.dumps(snap, separators=(",", ":")).encode())
+                _emit_ctrl(_make_frame("STATS", payload))
+            except Exception as exc:  # noqa: BLE001 — sampler must never crash
+                _log("debug", "stats sampler error: %s", exc)
+            if self._stop.wait(timeout=self._interval):
+                return
+
+
+_stats_sampler: _StatsSampler | None = None
+
+
 def _emit_ctrl(line: str) -> None:
     """Emit a control frame — always delivered before any pending data frame."""
     if _writer is not None:
@@ -550,6 +755,12 @@ def _emit_ctrl(line: str) -> None:
 
 def _emit_data(line: str) -> None:
     """Emit a data frame — blocks the calling thread when the stdout queue is full."""
+    # Count bytes before the frame is enqueued. We count the wire-level
+    # frame length (including marker + base64 overhead) so the number
+    # reflects real stdout traffic, not raw payload.
+    global _TX_BYTES_TOTAL, _FRAMES_TX_TOTAL  # noqa: PLW0603
+    _TX_BYTES_TOTAL += len(line) + 1  # +1 for newline
+    _FRAMES_TX_TOTAL += 1
     if _writer is not None:
         _writer.emit_data(line)
     else:
@@ -610,18 +821,51 @@ class TcpConnectionWorker:
         self._sock: socket.socket | None = None
         self._inbound: list[bytes] = []
         self._inbound_lock = threading.Lock()
+        # H1: once ``_run`` has finished and cleared ``_inbound``, any late
+        # ``feed()`` call would silently leak bytes into a list that is
+        # never read again.  We gate feeds on this flag (held under
+        # ``_inbound_lock``) to log + drop instead.
+        self._final_closed = False
 
         self._notify_r, self._notify_w = os.pipe()
         os.set_blocking(self._notify_r, False)
         os.set_blocking(self._notify_w, False)
+        # H2: guard os.write to the self-pipe against fd-reuse after close.
+        # ``_pipe_lock`` serialises write-vs-close; ``_pipe_closed`` is set
+        # under the lock before the fd is released.
+        self._pipe_lock = threading.Lock()
+        self._pipe_closed = False
 
         self._closed = False
         self._saturated = False
         self._drop_count: int = 0
+        # When true, ``_run`` will NOT emit a trailing ``CONN_CLOSE`` because
+        # an ``ERROR`` frame was already emitted and the client has torn the
+        # connection down.  Avoids noisy orphan-frame metrics on the client.
+        self._suppress_close_frame = False
 
         self._thread = threading.Thread(
             target=self._run, daemon=True, name=f"tcp-conn-{conn_id}"
         )
+
+    def _wake(self) -> None:
+        """Write one byte to the self-pipe under the pipe lock (H2)."""
+        with self._pipe_lock:
+            if self._pipe_closed:
+                return
+            with contextlib.suppress(OSError):
+                os.write(self._notify_w, b"\x00")
+
+    def _close_pipe(self) -> None:
+        """Close both ends of the self-pipe atomically with the guard flag."""
+        with self._pipe_lock:
+            if self._pipe_closed:
+                return
+            self._pipe_closed = True
+            with contextlib.suppress(OSError):
+                os.close(self._notify_r)
+            with contextlib.suppress(OSError):
+                os.close(self._notify_w)
 
     def start(self) -> None:
         self._thread.start()
@@ -636,6 +880,16 @@ class TcpConnectionWorker:
     def feed(self, data: bytes) -> None:
         saturated = False
         with self._inbound_lock:
+            # H1: worker already torn down — log and drop so late bytes are
+            # not silently leaked into a dead list.
+            if self._final_closed:
+                _log(
+                    "debug",
+                    "conn %s late feed dropped (%d bytes) — worker already closed",
+                    self.conn_id,
+                    len(data),
+                )
+                return
             if self._saturated:
                 return
             if len(self._inbound) >= _MAX_TCP_INBOUND_CHUNKS:
@@ -646,21 +900,23 @@ class TcpConnectionWorker:
                 self._inbound.append(data)
 
         if saturated:
+            self._suppress_close_frame = True
             _emit_ctrl(_make_error_frame(self.conn_id, "agent tcp inbound saturated"))
             _log(
                 "warning",
                 "conn %s inbound saturated; closing connection",
                 self.conn_id,
             )
+            # Wake the IO loop (if already running) so it observes ``_closed``
+            # and exits promptly.
+            self._wake()
             return
 
-        with contextlib.suppress(OSError):
-            os.write(self._notify_w, b"\x00")
+        self._wake()
 
     def signal_eof(self) -> None:
         self._closed = True
-        with contextlib.suppress(OSError):
-            os.write(self._notify_w, b"\x00")
+        self._wake()
 
     def _run(self) -> None:
         cid = self.conn_id
@@ -675,8 +931,31 @@ class TcpConnectionWorker:
         except OSError as exc:
             _emit_ctrl(_make_error_frame(cid, str(exc)))
             _log("warning", "conn %s connect failed: %s", cid, exc)
-            os.close(self._notify_r)
-            os.close(self._notify_w)
+            self._close_pipe()
+            with self._inbound_lock:
+                self._final_closed = True
+                self._inbound.clear()
+            if self._on_close is not None:
+                self._on_close()
+            return
+
+        # H3: saturation may have fired during connect.  If so, the client
+        # already received ERROR and will treat CONN_ACK as belonging to an
+        # unknown connection (orphaned frame).  Skip CONN_ACK entirely —
+        # ``_suppress_close_frame`` is already set, so the client sees only
+        # the ERROR frame and a clean local teardown.
+        if self._closed:
+            _log(
+                "debug",
+                "conn %s already closed before CONN_ACK — suppressing ACK",
+                cid,
+            )
+            with contextlib.suppress(OSError):
+                sock.close()
+            self._close_pipe()
+            with self._inbound_lock:
+                self._final_closed = True
+                self._inbound.clear()
             if self._on_close is not None:
                 self._on_close()
             return
@@ -687,10 +966,25 @@ class TcpConnectionWorker:
         try:
             self._io_loop(sock, cid)
         finally:
+            # Count any client-side bytes still queued at close — the remote
+            # peer closed (or we were saturated) before we could forward them.
+            with self._inbound_lock:
+                dropped = sum(len(c) for c in self._inbound)
+                self._inbound.clear()
+                # H1: mark final so late ``feed()`` calls short-circuit
+                # with a log instead of silently appending to a dead list.
+                self._final_closed = True
+            if dropped:
+                _log(
+                    "debug",
+                    "conn %s closed with %d bytes of undelivered client data",
+                    cid,
+                    dropped,
+                )
             sock.close()
-            os.close(self._notify_r)
-            os.close(self._notify_w)
-            _emit_ctrl(_make_frame("CONN_CLOSE", cid))
+            self._close_pipe()
+            if not self._suppress_close_frame:
+                _emit_ctrl(_make_frame("CONN_CLOSE", cid))
             if self._on_close is not None:
                 self._on_close()
 
@@ -785,10 +1079,14 @@ class UdpFlowWorker:
         self._sock: socket.socket | None = None
         self._inbound: list[bytes] = []
         self._inbound_lock = threading.Lock()
+        self._final_closed = False  # H1 parity for UDP
 
         self._notify_r, self._notify_w = os.pipe()
         os.set_blocking(self._notify_r, False)
         os.set_blocking(self._notify_w, False)
+        # H2 parity: guard self-pipe against fd-reuse after close.
+        self._pipe_lock = threading.Lock()
+        self._pipe_closed = False
 
         self._closed = False
         self._drop_count: int = 0
@@ -797,6 +1095,23 @@ class UdpFlowWorker:
         self._thread = threading.Thread(
             target=self._run, daemon=True, name=f"udp-flow-{flow_id}"
         )
+
+    def _wake(self) -> None:
+        with self._pipe_lock:
+            if self._pipe_closed:
+                return
+            with contextlib.suppress(OSError):
+                os.write(self._notify_w, b"\x00")
+
+    def _close_pipe(self) -> None:
+        with self._pipe_lock:
+            if self._pipe_closed:
+                return
+            self._pipe_closed = True
+            with contextlib.suppress(OSError):
+                os.close(self._notify_r)
+            with contextlib.suppress(OSError):
+                os.close(self._notify_w)
 
     def start(self) -> None:
         self._thread.start()
@@ -814,6 +1129,8 @@ class UdpFlowWorker:
         Silently drops when the inbound queue is full — UDP semantics.
         """
         with self._inbound_lock:
+            if self._final_closed:
+                return
             if len(self._inbound) >= _MAX_UDP_INBOUND_DGRAMS:
                 self._drop_count += 1
                 if (
@@ -829,14 +1146,12 @@ class UdpFlowWorker:
                 return
             self._inbound.append(data)
 
-        with contextlib.suppress(OSError):
-            os.write(self._notify_w, b"\x00")
+        self._wake()
 
     def close(self) -> None:
         """Signal the IO loop to exit after draining pending sends."""
         self._closed = True
-        with contextlib.suppress(OSError):
-            os.write(self._notify_w, b"\x00")
+        self._wake()
 
     def _run(self) -> None:
         fid = self._id
@@ -850,8 +1165,10 @@ class UdpFlowWorker:
         except OSError as exc:
             _emit_ctrl(_make_frame("UDP_CLOSE", fid))
             _log("warning", "udp flow %s resolve failed: %s", fid, exc)
-            os.close(self._notify_r)
-            os.close(self._notify_w)
+            self._close_pipe()
+            with self._inbound_lock:
+                self._final_closed = True
+                self._inbound.clear()
             if self._on_close is not None:
                 self._on_close()
             return
@@ -873,8 +1190,10 @@ class UdpFlowWorker:
         if sock is None:
             _emit_ctrl(_make_frame("UDP_CLOSE", fid))
             _log("warning", "udp flow %s open failed: %s", fid, last_exc)
-            os.close(self._notify_r)
-            os.close(self._notify_w)
+            self._close_pipe()
+            with self._inbound_lock:
+                self._final_closed = True
+                self._inbound.clear()
             if self._on_close is not None:
                 self._on_close()
             return
@@ -884,8 +1203,10 @@ class UdpFlowWorker:
             self._io_loop(sock, fid)
         finally:
             sock.close()
-            os.close(self._notify_r)
-            os.close(self._notify_w)
+            self._close_pipe()
+            with self._inbound_lock:
+                self._final_closed = True
+                self._inbound.clear()
             _emit_ctrl(_make_frame("UDP_CLOSE", fid))
             if self._on_close is not None:
                 self._on_close()
@@ -933,7 +1254,37 @@ class UdpFlowWorker:
                             fid,
                             self._send_block_count,
                         )
-                except OSError:
+                except OSError as exc:
+                    # M4: classify UDP send errors.  ICMP unreachable
+                    # (ECONNREFUSED), oversized datagram (EMSGSIZE), and
+                    # transient routing issues (ENETUNREACH / EHOSTUNREACH
+                    # / ENETDOWN / EHOSTDOWN) are per-datagram faults —
+                    # drop the datagram and keep the flow alive.  Anything
+                    # else (EBADF, ENOTCONN, ...) indicates the socket
+                    # itself is broken and we must tear down.
+                    transient = {
+                        errno.ECONNREFUSED,
+                        errno.EMSGSIZE,
+                        errno.ENETUNREACH,
+                        errno.EHOSTUNREACH,
+                        errno.ENETDOWN,
+                        errno.EHOSTDOWN,
+                    }
+                    if exc.errno in transient:
+                        self._send_block_count += 1
+                        if (
+                            self._send_block_count == 1
+                            or self._send_block_count % _UDP_DROP_WARN_EVERY == 0
+                        ):
+                            _log(
+                                "debug",
+                                "udp flow %s send transient error %s; "
+                                "datagram dropped (send_blocks=%d)",
+                                fid,
+                                errno.errorcode.get(exc.errno, exc.errno),
+                                self._send_block_count,
+                            )
+                        continue
                     return
 
 
@@ -954,6 +1305,18 @@ class _Dispatcher:
 
     def dispatch(self, line: str) -> None:
         """Parse and dispatch one raw frame line."""
+        # Step 2: count inbound bytes / frames at the earliest point so the
+        # sampler sees real ingress even for malformed / oversized frames.
+        global _RX_BYTES_TOTAL, _FRAMES_RX_TOTAL  # noqa: PLW0603
+        _RX_BYTES_TOTAL += len(line) + 1  # +1 for newline consumed by stdin iter
+        _FRAMES_RX_TOTAL += 1
+        dispatch_started = time.monotonic()
+        try:
+            self._dispatch_inner(line)
+        finally:
+            _record_dispatch_sample(time.monotonic() - dispatch_started)
+
+    def _dispatch_inner(self, line: str) -> None:
         line = line.strip()
 
         if len(line) > _MAX_INBOUND_FRAME_LEN:
@@ -992,6 +1355,17 @@ class _Dispatcher:
                 pass
             case _:
                 _log("debug", "unknown frame type ignored: %s", parts[0])
+
+    def worker_counts(self) -> tuple[int, int]:
+        """Return current ``(tcp_workers, udp_workers)`` count.
+
+        Used by the stats sampler to report concurrency in the STATS frame.
+        """
+        with self._conn_lock:
+            tcp = len(self._conn_map)
+        with self._udp_lock:
+            udp = len(self._udp_map)
+        return tcp, udp
 
     def shutdown(self) -> None:
         """Signal all workers to close and wait briefly for clean teardown.
@@ -1034,7 +1408,7 @@ class _Dispatcher:
             )
 
     def _on_conn_open(self, parts: list[str]) -> None:
-        if len(parts) < 2:
+        if len(parts) < _MIN_PARTS_WITH_CONN_ID:
             return
         cid = parts[1]
         if not _ID_RE.match(cid):
@@ -1046,6 +1420,19 @@ class _Dispatcher:
                 _log("debug", "duplicate CONN_OPEN for %s — sending ERROR", cid)
                 _emit_ctrl(_make_error_frame(cid, "duplicate CONN_OPEN"))
                 return
+            # L13: global TCP worker cap — cheap DoS defence against
+            # runaway/adversarial CONN_OPEN storms.
+            if len(self._conn_map) >= _MAX_TCP_WORKERS:
+                _log(
+                    "warning",
+                    "CONN_OPEN rejected: worker cap %d reached (conn=%s)",
+                    _MAX_TCP_WORKERS,
+                    cid,
+                )
+                _emit_ctrl(
+                    _make_error_frame(cid, "agent: too many concurrent connections")
+                )
+                return
 
         if self._fixed_host is not None:
             if self._fixed_port is None:
@@ -1053,10 +1440,10 @@ class _Dispatcher:
                 return
             host, port = self._fixed_host, self._fixed_port
         elif len(parts) >= 3:
-            result = _parse_host_port(parts[2], cid, "CONN_OPEN")
+            result = _parse_host_port(parts[_HOST_PORT_PART_INDEX], cid, "CONN_OPEN")
             if result is None:
                 _emit_ctrl(
-                    _make_error_frame(cid, f"invalid CONN_OPEN host:port: {parts[2]!r}")
+                    _make_error_frame(cid, f"invalid CONN_OPEN host:port: {parts[_HOST_PORT_PART_INDEX]!r}")
                 )
                 return
             host, port = result
@@ -1081,11 +1468,24 @@ class _Dispatcher:
                 )
                 _emit_ctrl(_make_error_frame(cid, "duplicate CONN_OPEN"))
                 return
+            # L13: re-check the worker cap (late) in case concurrent opens
+            # raced past the early check.
+            if len(self._conn_map) >= _MAX_TCP_WORKERS:
+                _log(
+                    "warning",
+                    "CONN_OPEN rejected (late check): worker cap %d reached (conn=%s)",
+                    _MAX_TCP_WORKERS,
+                    cid,
+                )
+                _emit_ctrl(
+                    _make_error_frame(cid, "agent: too many concurrent connections")
+                )
+                return
             self._conn_map[cid] = worker
         worker.start()
 
     def _on_data(self, parts: list[str]) -> None:
-        if len(parts) < 3:
+        if len(parts) < _MIN_PARTS_WITH_PAYLOAD:
             return
         cid = parts[1]
         with self._conn_lock:
@@ -1093,7 +1493,7 @@ class _Dispatcher:
         if worker is None:
             return
         try:
-            data = _b64decode(parts[2])
+            data = _b64decode(parts[_HOST_PORT_PART_INDEX])
         except ValueError:
             _log("debug", "invalid base64url DATA for conn %s", cid)
             _emit_ctrl(_make_error_frame(cid, "invalid base64url in DATA frame"))
@@ -1101,7 +1501,7 @@ class _Dispatcher:
         worker.feed(data)
 
     def _on_conn_close(self, parts: list[str]) -> None:
-        if len(parts) < 2:
+        if len(parts) < _MIN_PARTS_WITH_CONN_ID:
             return
         cid = parts[1]
         with self._conn_lock:
@@ -1110,14 +1510,14 @@ class _Dispatcher:
             worker.signal_eof()
 
     def _on_udp_open(self, parts: list[str]) -> None:
-        if len(parts) < 3:
+        if len(parts) < _MIN_PARTS_WITH_PAYLOAD:
             return
         fid = parts[1]
         if not _ID_RE.match(fid):
             _log("debug", "UDP_OPEN invalid flow_id format: %r", fid)
             return
 
-        result = _parse_host_port(parts[2], fid, "UDP_OPEN")
+        result = _parse_host_port(parts[_HOST_PORT_PART_INDEX], fid, "UDP_OPEN")
         if result is None:
             _emit_ctrl(_make_frame("UDP_CLOSE", fid))
             return
@@ -1139,7 +1539,7 @@ class _Dispatcher:
         flow.start()
 
     def _on_udp_data(self, parts: list[str]) -> None:
-        if len(parts) < 3:
+        if len(parts) < _MIN_PARTS_WITH_PAYLOAD:
             return
         fid = parts[1]
         with self._udp_lock:
@@ -1147,7 +1547,7 @@ class _Dispatcher:
         if flow is None:
             return
         try:
-            data = _b64decode(parts[2])
+            data = _b64decode(parts[_HOST_PORT_PART_INDEX])
         except ValueError:
             _log("debug", "invalid base64url UDP_DATA for flow %s", fid)
             _emit_ctrl(_make_frame("UDP_CLOSE", fid))
@@ -1155,7 +1555,7 @@ class _Dispatcher:
         flow.feed(data)
 
     def _on_udp_close(self, parts: list[str]) -> None:
-        if len(parts) < 2:
+        if len(parts) < _MIN_PARTS_WITH_CONN_ID:
             return
         fid = parts[1]
         with self._udp_lock:
@@ -1180,14 +1580,14 @@ def main() -> None:
     if len(sys.argv) == 1:
         fixed_host = None
         fixed_port = None
-    elif len(sys.argv) == 3:
+    elif len(sys.argv) == _ARGC_FIXED_TARGET:
         fixed_host = sys.argv[1]
         try:
             fixed_port = int(sys.argv[2])
         except ValueError:
             sys.stderr.write(f"invalid port: {sys.argv[2]!r}\n")
             sys.exit(1)
-        if fixed_port <= 0 or fixed_port > 65_535:
+        if fixed_port <= 0 or fixed_port > _MAX_PORT:
             sys.stderr.write(f"port out of range: {fixed_port}\n")
             sys.exit(1)
     else:
@@ -1198,15 +1598,25 @@ def main() -> None:
         with contextlib.suppress(OSError):
             os.unlink(path)
 
-    global _writer  # noqa: PLW0603
+    global _writer, _stats_sampler  # noqa: PLW0603
     _disable_echo()
     _writer = _FrameWriter()
+    # AGENT_READY stays byte-identical to v1 so existing clients'
+    # ``is_ready_frame()`` predicate continues to match.  Version/feature
+    # negotiation is handled implicitly: new clients recognise the
+    # periodic STATS frame; old clients fall through their forward-
+    # compatible "unknown frame type" path and ignore it.
     _emit_ctrl(_make_frame("AGENT_READY"))
 
     dispatcher = _Dispatcher(fixed_host, fixed_port)
+    if _STATS_ENABLED:
+        _stats_sampler = _StatsSampler(dispatcher)
+        _stats_sampler.start()
     try:
         dispatcher.run()
     finally:
+        if _stats_sampler is not None:
+            _stats_sampler.stop()
         dispatcher.shutdown()
         if _writer is not None:
             _writer.stop()
