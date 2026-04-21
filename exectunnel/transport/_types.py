@@ -1,39 +1,4 @@
-"""
-Shared types for the ``exectunnel.transport`` package.
-
-This module is the single source of truth for:
-
-* :class:`WsSendCallable`   — structural ``Protocol`` for the WebSocket send
-  callable injected into both :class:`~exectunnel.transport.tcp.TcpConnection`
-  and :class:`~exectunnel.transport.udp.UdpFlow`.
-
-* :class:`TransportHandler` — structural ``Protocol`` that both concrete
-  handlers satisfy, allowing the ``session`` layer to type its handler
-  registries uniformly without importing concrete handler classes, which would
-  create cross-layer coupling.
-
-* ``TcpRegistry`` / ``UdpRegistry`` — type aliases for the shared handler
-  registries passed into each handler on construction.
-
-Design notes
-------------
-* All types are defined here to avoid circular imports: ``tcp.py`` and
-  ``udp.py`` both import from ``_types.py``; ``_types.py`` imports nothing
-  from within the transport package.
-
-* ``WsSendCallable`` is ``@runtime_checkable`` so that injection points can
-  be validated with ``isinstance()`` in tests and at session-layer wiring time.
-
-* ``TransportHandler`` is intentionally *not* ``@runtime_checkable`` — the
-  structural check would require inspecting async methods at runtime, which is
-  fragile. Use static type checking (mypy / pyright) instead.
-
-* Registry aliases use ``type`` statement (Python 3.12+) with string forward
-  references. The ``TYPE_CHECKING`` guard ensures the concrete handler imports
-  are erased at runtime, preventing the circular import that would otherwise
-  occur. The ``type`` statement itself is lazily evaluated, so forward
-  references resolve correctly at static-analysis time without any runtime cost.
-"""
+"""Shared types for the ``exectunnel.transport`` package."""
 
 from __future__ import annotations
 
@@ -52,27 +17,17 @@ __all__ = [
 ]
 
 
-# ── WebSocket send callable ───────────────────────────────────────────────────
-
-
 @runtime_checkable
 class WsSendCallable(Protocol):
     """Structural type for the WebSocket send callable injected into handlers.
 
-    Implementations must accept:
+    Implementations accept a newline-terminated frame string and two
+    keyword-only flow-control flags:
 
-    * ``frame``      — the newline-terminated frame string to send.
-    * ``must_queue`` — if ``True``, block until the frame is enqueued even
-                       when the send queue is under backpressure.
-                       Ignored when ``control=True``.
-    * ``control``    — if ``True``, the frame is a priority control frame
-                       that bypasses normal flow-control ordering.
-                       When ``control=True``, ``must_queue`` is ignored and
-                       the frame is enqueued immediately.
-
-    Note:
-        ``must_queue`` and ``control`` are not mutually exclusive at the call
-        site, but ``control=True`` always takes precedence over ``must_queue``.
+    * ``must_queue`` — block until enqueued under backpressure; ignored when
+      ``control=True``.
+    * ``control``    — priority frame that bypasses flow-control ordering;
+      when ``True``, ``must_queue`` is ignored.
     """
 
     def __call__(
@@ -84,27 +39,20 @@ class WsSendCallable(Protocol):
     ) -> Coroutine[Any, Any, None]: ...
 
 
-# ── Shared handler protocol ───────────────────────────────────────────────────
-
-
 class TransportHandler(Protocol):
     """Structural protocol satisfied by both ``TcpConnection`` and ``UdpFlow``.
 
-    Provides the ``session`` layer with a uniform interface for typing its
-    handler registries without importing concrete handler classes, which would
-    create cross-layer coupling.
+    Provides the ``session`` layer with a uniform interface for typing handler
+    registries without importing concrete classes.
 
-    Only the subset of the interface that the ``session`` layer needs to call
-    through the *generic* registry path is declared here.  Handler-specific
-    methods (e.g. ``TcpConnection.feed_async``, ``UdpFlow.send_datagram``)
-    are accessed after type-narrowing to the concrete class within the session
-    layer's dispatch logic.
+    Note:
+        Handler-specific methods (e.g. ``TcpConnection.abort``,
+        ``UdpFlow.send_datagram``) require type-narrowing to the concrete
+        class before use.
 
-    Naming convention
-    -----------------
-    ``on_remote_closed()`` is the canonical name for the agent-initiated
-    teardown signal on **both** concrete handlers.  The session layer must
-    call this method — never any deprecated alias.
+        ``on_remote_closed()`` must remain synchronous on all concrete
+        implementations — the session layer calls it from a synchronous
+        dispatch path and cannot ``await`` it.
     """
 
     @property
@@ -114,21 +62,11 @@ class TransportHandler(Protocol):
 
     @property
     def drop_count(self) -> int:
-        """Total number of inbound chunks/datagrams dropped."""
+        """Total number of inbound chunks or datagrams dropped."""
         ...
 
     def on_remote_closed(self) -> None:
-        """Signal that the remote agent has closed its side of the flow.
-
-        Note:
-            This method **must remain synchronous** on all concrete handlers.
-            Both :class:`~exectunnel.transport.tcp.TcpConnection` and
-            :class:`~exectunnel.transport.udp.UdpFlow` implement it as a plain
-            ``def``.  The session layer calls it from a synchronous dispatch
-            path and cannot ``await`` it.  If a future handler requires async
-            teardown, introduce a separate ``async def close()`` method rather
-            than changing this protocol.
-        """
+        """Signal that the remote agent has closed its side of the flow."""
         ...
 
 
