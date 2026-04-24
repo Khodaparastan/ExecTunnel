@@ -6,6 +6,7 @@ import asyncio
 import threading
 import time
 from datetime import timedelta
+from typing import Final
 
 from rich import box
 from rich.align import Align
@@ -24,6 +25,8 @@ __all__ = ["ManagerDashboard"]
 
 _REFRESH_HZ: int = 2
 _FRAME_INTERVAL: float = 1.0 / _REFRESH_HZ
+_BYTES_UNIT_BASE: int = 1024
+_ERROR_BAD_STYLE_THRESHOLD: int = 5
 
 _RUNNING_STATES: frozenset[str] = frozenset({"running", "healthy"})
 
@@ -38,6 +41,12 @@ _STATUS_DISPLAY: dict[str, tuple[str, str]] = {
     "stopped": (_ICON_STOPPED, "et.conn.closed"),
 }
 _STATUS_DISPLAY_DEFAULT: tuple[str, str] = ("?", "et.muted")
+_LOG_LEVEL_STYLES: Final[dict[str, str]] = {
+    "DEBUG": "dim cyan",
+    "INFO": "green",
+    "WARNING": "yellow",
+    "ERROR": "bold red",
+}
 
 
 def _fmt_uptime(secs: float) -> str:
@@ -51,11 +60,11 @@ def _fmt_uptime(secs: float) -> str:
 
 def _fmt_bytes(n: int) -> str:
     """Human-readable byte count (e.g. '1.2 MB')."""
-    if n < 1024:
+    if n < _BYTES_UNIT_BASE:
         return f"{n} B"
     for unit in ("KB", "MB", "GB", "TB"):
-        n /= 1024
-        if abs(n) < 1024:
+        n /= _BYTES_UNIT_BASE
+        if abs(n) < _BYTES_UNIT_BASE:
             return f"{n:.1f} {unit}"
     return f"{n:.1f} PB"
 
@@ -63,7 +72,7 @@ def _fmt_bytes(n: int) -> str:
 def _err_style(count: int) -> str:
     if count == 0:
         return "et.muted"
-    return "et.stat.bad" if count >= 5 else "et.stat.warn"
+    return "et.stat.bad" if count >= _ERROR_BAD_STYLE_THRESHOLD else "et.stat.warn"
 
 
 def _label_col() -> Table:
@@ -696,12 +705,6 @@ class ManagerDashboard:
 
     @staticmethod
     def _render_pod_logs(states: list[TunnelRuntimeState]) -> Panel:
-        _LOG_LEVEL_STYLES: dict[str, str] = {
-            "DEBUG": "dim cyan",
-            "INFO": "green",
-            "WARNING": "yellow",
-            "ERROR": "bold red",
-        }
         lines: list[Text] = []
         max_lines_per_pod = max(5, 40 // max(len(states), 1))
 

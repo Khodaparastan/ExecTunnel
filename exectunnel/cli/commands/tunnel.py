@@ -24,18 +24,13 @@ from exectunnel.session import (
 from .._config import build_session_config, build_tunnel_config
 from ..runner import run_session
 from ..ui import BANNER, THEME, BootstrapSpinner, Icons
+from ..utils import VALID_LOG_LEVELS, normalize_log_level
 
 __all__ = ["tunnel"]
 
-console = Console(theme=THEME, highlight=False)
-_VALID_LOG_LEVELS = frozenset({"debug", "info", "warning", "error"})
-
-
-def _normalize_log_level(value: str) -> str:
-    level = value.lower().strip()
-    if level == "warn":
-        level = "warning"
-    return level
+# Module-level console is intentionally a single instance per process;
+# tunnel is never invoked concurrently within one process.
+_console = Console(theme=THEME, highlight=False)
 
 
 # ── Argument validators ──────────────────────────────────────────────────────
@@ -69,6 +64,43 @@ def _parse_excludes(
         except ValueError as exc:
             raise typer.BadParameter(f"Invalid CIDR {cidr!r}: {exc}") from exc
     return nets
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _print_banner() -> None:
+    _console.print(BANNER.format(version=__version__))
+
+
+def _print_config_error(exc: ConfigurationError) -> None:
+    _console.print(
+        f"[et.error]{Icons.CROSS} [{exc.error_code}] {exc.message}[/et.error]"
+    )
+    if exc.hint:
+        _console.print(f"  [et.muted]{Icons.BULLET} {exc.hint}[/et.muted]")
+
+
+def _print_tunnel_summary(tun_cfg: TunnelConfig, wss_url: str) -> None:
+    t = Table.grid(padding=(0, 2))
+    t.add_column(style="et.label", min_width=14)
+    t.add_column(style="et.value")
+
+    url_display = wss_url[:80] + "…" if len(wss_url) > 83 else wss_url
+    t.add_row("WSS URL", url_display)
+    t.add_row("SOCKS5", f"{tun_cfg.socks_host}:{tun_cfg.socks_port}")
+    t.add_row(
+        "DNS",
+        f"{tun_cfg.dns_upstream}:{tun_cfg.dns_local_port}"
+        if tun_cfg.dns_upstream
+        else Text("disabled", style="et.muted"),
+    )
+    exclude_count = len(tun_cfg.exclude) if tun_cfg.exclude else 0
+    t.add_row("Excludes", str(exclude_count))
+    t.add_row("Bootstrap", tun_cfg.bootstrap_delivery)
+
+    _console.print(f"\n[et.brand]{Icons.TUNNEL} Tunnel Configuration[/et.brand]")
+    _console.print(t)
 
 
 # ── Command ──────────────────────────────────────────────────────────────────
@@ -253,22 +285,27 @@ def tunnel(
     Set ALL_PROXY=socks5://127.0.0.1:1080 to route your shell traffic.
     RFC1918 + loopback CIDRs are bypassed by default unless --no-default-exclude is set.
     """
-    normalized_log_level = _normalize_log_level(log_level)
-    if normalized_log_level not in _VALID_LOG_LEVELS:
+    normalized = normalize_log_level(log_level)
+    if normalized not in VALID_LOG_LEVELS:
         raise typer.BadParameter(
             f"Invalid log level {log_level!r}. "
-            f"Choose from: {', '.join(sorted(_VALID_LOG_LEVELS))}",
+            f"Choose from: {', '.join(sorted(VALID_LOG_LEVELS))}",
             param_hint="'--log-level'",
         )
 
-
-    configure_logging(normalized_log_level)
-
+    configure_logging(normalized)  # type: ignore[arg-type]
     _print_banner()
+
+    # Validate bootstrap_delivery before passing to config layer.
+    if bootstrap_delivery not in {"upload", "fetch"}:
+        raise typer.BadParameter(
+            f"Invalid bootstrap delivery {bootstrap_delivery!r}. "
+            "Choose from: upload, fetch",
+            param_hint="'--bootstrap-delivery'",
+        )
 
     dns_upstream = _dns_upstream_callback(dns)
     exclude_nets = _parse_excludes(exclude, no_default_exclude)
-
 
     try:
         session_cfg = build_session_config(insecure=insecure)
@@ -277,7 +314,7 @@ def tunnel(
         raise typer.Exit(1)
 
     if insecure:
-        console.print(f"[et.warn]{Icons.WARN} TLS verification disabled.[/et.warn]")
+        _console.print(f"[et.warn]{Icons.WARN} TLS verification disabled.[/et.warn]")
 
     try:
         tun_cfg = build_tunnel_config(
@@ -323,7 +360,7 @@ def tunnel(
             )
         )
     except KeyboardInterrupt:
-        console.print(f"\n[et.warn]{Icons.WARN} Interrupted.[/et.warn]")
+        _console.print(f"\n[et.warn]{Icons.WARN} Interrupted.[/et.warn]")
         exit_code = 0
 
     raise typer.Exit(exit_code)
@@ -336,54 +373,16 @@ async def _tunnel_async(
     no_dashboard: bool,
     show_logs: bool = False,
 ) -> int:
-    console.print()
-    async with BootstrapSpinner(console) as spinner:
+    _console.print()
+    async with BootstrapSpinner(_console) as spinner:
         spinner.start_phase("stty")
         return await run_session(
             session_cfg=session_cfg,
             tun_cfg=tun_cfg,
             ws_url=session_cfg.wss_url,
             pod_spec=None,
-            console=console,
+            console=_console,
             no_dashboard=no_dashboard,
             show_logs=show_logs,
             spinner=spinner,
         )
-
-
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-
-def _print_banner() -> None:
-
-    console.print(BANNER.format(version=__version__))
-
-
-def _print_config_error(exc: ConfigurationError) -> None:
-    console.print(
-        f"[et.error]{Icons.CROSS} [{exc.error_code}] {exc.message}[/et.error]"
-    )
-    if exc.hint:
-        console.print(f"  [et.muted]{Icons.BULLET} {exc.hint}[/et.muted]")
-
-
-def _print_tunnel_summary(tun_cfg: TunnelConfig, wss_url: str) -> None:
-    t = Table.grid(padding=(0, 2))
-    t.add_column(style="et.label", min_width=14)
-    t.add_column(style="et.value")
-
-    url_display = wss_url[:80] + "…" if len(wss_url) > 83 else wss_url
-    t.add_row("WSS URL", url_display)
-    t.add_row("SOCKS5", f"{tun_cfg.socks_host}:{tun_cfg.socks_port}")
-    t.add_row(
-        "DNS",
-        f"{tun_cfg.dns_upstream}:{tun_cfg.dns_local_port}"
-        if tun_cfg.dns_upstream
-        else Text("disabled", style="et.muted"),
-    )
-    exclude_count = len(tun_cfg.exclude) if tun_cfg.exclude else 0
-    t.add_row("Excludes", str(exclude_count))
-    t.add_row("Bootstrap", tun_cfg.bootstrap_delivery)
-
-    console.print(f"\n[et.brand]{Icons.TUNNEL} Tunnel Configuration[/et.brand]")
-    console.print(t)

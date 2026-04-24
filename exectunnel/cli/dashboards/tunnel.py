@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
+from typing import Final
 
 from rich import box
 from rich.align import Align
@@ -28,6 +29,9 @@ _REFRESH_HZ: int = 4
 _FRAME_INTERVAL: float = 1.0 / _REFRESH_HZ
 _MAX_VISIBLE_CONNS: int = 18
 _URL_MAX_DISPLAY: int = 72
+_BYTES_UNIT_BASE: float = 1024.0
+_ACK_WARN_THRESHOLD: int = 5
+_LOG_TAIL_LIMIT: int = 50
 
 _ACTIVE_CONN_STATES: frozenset[str] = frozenset({"open", "pending"})
 
@@ -44,6 +48,15 @@ _POD_PHASE_STYLES: dict[str, str] = {
     "Failed": "et.stat.bad",
 }
 
+# Hoisted to module level — avoids re-creating on every render frame.
+_LOG_LEVEL_STYLES: Final[dict[str, str]] = {
+    "DEBUG": "dim cyan",
+    "INFO": "green",
+    "WARNING": "yellow",
+    "ERROR": "bold red",
+    "CRITICAL": "bold red reverse",
+}
+
 
 # ── Pure formatting helpers ───────────────────────────────────────────────────
 
@@ -51,9 +64,9 @@ _POD_PHASE_STYLES: dict[str, str] = {
 def _fmt_bytes(n: int) -> str:
     value = float(n)
     for unit in ("B", "KB", "MB", "GB", "TB"):
-        if value < 1024.0:
+        if value < _BYTES_UNIT_BASE:
             return f"{value:.1f} {unit}"
-        value /= 1024.0
+        value /= _BYTES_UNIT_BASE
     return f"{value:.1f} PB"
 
 
@@ -94,7 +107,6 @@ def _label_col() -> Table:
 
 
 def _err_style(count: int) -> str:
-    """Return a style based on whether the error count is non-zero."""
     return "et.stat.bad" if count else "et.muted"
 
 
@@ -102,17 +114,7 @@ def _err_style(count: int) -> str:
 
 
 class TunnelDashboard:
-    """Full-screen live dashboard for an active tunnel session.
-
-    Lifecycle
-    ---------
-    ``run_until_cancelled()`` enters a ``Rich.Live`` context and refreshes
-    the layout at *_REFRESH_HZ* Hz until the task is cancelled.  The caller
-    cancels the task when the tunnel session ends or a stop signal is received.
-
-    The drift-corrected sleep loop ensures the effective refresh rate stays
-    close to the requested Hz even when rendering takes non-trivial time.
-    """
+    """Full-screen live dashboard for an active tunnel session."""
 
     __slots__ = ("_monitor", "_console", "_ws_url", "_stop_event", "_log_buffer")
 
@@ -327,10 +329,9 @@ class TunnelDashboard:
             Text(_fmt_bytes(h.bytes_down_total), style="et.value"),
         )
 
-        ack_style: str
         if h.ack_failed == 0:
             ack_style = "et.stat.good"
-        elif h.ack_failed < 5:
+        elif h.ack_failed < _ACK_WARN_THRESHOLD:
             ack_style = "et.stat.warn"
         else:
             ack_style = "et.stat.bad"
@@ -471,16 +472,9 @@ class TunnelDashboard:
 
     def _render_logs(self) -> Panel:
         """Render a scrolling log tail panel."""
-        _LOG_LEVEL_STYLES: dict[str, str] = {
-            "DEBUG": "dim cyan",
-            "INFO": "green",
-            "WARNING": "yellow",
-            "ERROR": "bold red",
-            "CRITICAL": "bold red reverse",
-        }
         assert self._log_buffer is not None
         entries = self._log_buffer.entries()
-        tail = entries[-50:] if len(entries) > 50 else entries
+        tail = entries[-_LOG_TAIL_LIMIT:] if len(entries) > _LOG_TAIL_LIMIT else entries
 
         lines: list[Text] = []
         for e in tail:

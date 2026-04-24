@@ -7,16 +7,9 @@ from typing import Annotated
 
 import typer
 
+from ..utils import VALID_LOG_LEVELS, normalize_log_level
+
 __all__ = ["manager"]
-
-_VALID_LOG_LEVELS: frozenset[str] = frozenset({"debug", "info", "warning", "error"})
-
-
-def _normalize_log_level(value: str) -> str:
-    level = value.lower().strip()
-    if level == "warn":
-        level = "warning"
-    return level
 
 
 def manager(
@@ -81,11 +74,11 @@ def manager(
       exectunnel manager --env-file .env
       exectunnel manager --env-file .env --no-tui   # log-only mode
     """
-    normalized_log_level = _normalize_log_level(log_level)
-    if normalized_log_level not in _VALID_LOG_LEVELS:
+    normalized = normalize_log_level(log_level)
+    if normalized not in VALID_LOG_LEVELS:
         raise typer.BadParameter(
             f"Invalid log level {log_level!r}. "
-            f"Choose from: {', '.join(sorted(_VALID_LOG_LEVELS))}",
+            f"Choose from: {', '.join(sorted(VALID_LOG_LEVELS))}",
             param_hint="'--log-level'",
         )
 
@@ -93,7 +86,7 @@ def manager(
 
     run_manager(
         env_file,
-        log_level=normalized_log_level,
+        log_level=normalized,
         tui=tui,
         show_logs=show_logs,
     )
