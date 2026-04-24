@@ -12,7 +12,7 @@ import ipaddress
 import logging
 import os
 import ssl
-from typing import Final
+from typing import Final, Literal
 from urllib.parse import urlparse
 
 from exectunnel.exceptions import ConfigurationError
@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 
 _SESSION_DEFAULTS: Final[SessionConfig] = SessionConfig(wss_url="ws://placeholder")
 _TUNNEL_DEFAULTS: Final[TunnelConfig] = TunnelConfig()
+
+_VALID_BOOTSTRAP_DELIVERIES: Final[frozenset[str]] = frozenset({"upload", "fetch"})
 
 __all__ = [
     "build_session_config",
@@ -86,10 +88,10 @@ def build_session_config(
     """Build a SessionConfig from env + overrides.
 
     Args:
-        wss_url:              WebSocket URL override.  If ``None``, reads from env.
-        ws_headers:           HTTP headers to send during the WS handshake.
-        ssl_context:          Pre-built SSL context (e.g. from kubeconfig).
-        insecure:             Skip TLS certificate verification.
+        wss_url:               WebSocket URL override.  If ``None``, reads from env.
+        ws_headers:            HTTP headers to send during the WS handshake.
+        ssl_context:           Pre-built SSL context (e.g. from kubeconfig).
+        insecure:              Skip TLS certificate verification.
         reconnect_max_retries: Override for max reconnect attempts.
     """
     url = wss_url or get_wss_url()
@@ -127,7 +129,7 @@ def build_session_config(
         ping_interval=parse_float_env(
             "EXECTUNNEL_PING_INTERVAL",
             _SESSION_DEFAULTS.ping_interval,
-            min_value=1,
+            min_value=1.0,
         ),
         send_timeout=parse_float_env(
             "EXECTUNNEL_SEND_TIMEOUT",
@@ -139,19 +141,21 @@ def build_session_config(
             _SESSION_DEFAULTS.send_queue_cap,
             min_value=1,
         ),
-        reconnect_max_retries=reconnect_max_retries
-        if reconnect_max_retries is not None
-        else parse_int_env(
-            "EXECTUNNEL_RECONNECT_MAX_RETRIES",
-            _SESSION_DEFAULTS.reconnect_max_retries,
-            min_value=0,
+        reconnect_max_retries=(
+            reconnect_max_retries
+            if reconnect_max_retries is not None
+            else parse_int_env(
+                "EXECTUNNEL_RECONNECT_MAX_RETRIES",
+                _SESSION_DEFAULTS.reconnect_max_retries,
+                min_value=0,
+            )
         ),
         reconnect_base_delay=reconnect_base_delay,
         reconnect_max_delay=reconnect_max_delay,
     )
 
 
-# ── TunnelConfig factory ────────────────────────────────────────────────────
+# ── TunnelConfig factory ─────────────────────────────────────────────────────
 
 
 def build_tunnel_config(
@@ -183,6 +187,15 @@ def build_tunnel_config(
     dns_query_timeout: float = _TUNNEL_DEFAULTS.dns_query_timeout,
 ) -> TunnelConfig:
     """Build TunnelConfig, merging CLI args with environment overrides."""
+    # Env can override the CLI-supplied delivery mode; validate the result.
+    resolved_delivery = os.getenv("EXECTUNNEL_BOOTSTRAP_DELIVERY", bootstrap_delivery)
+    if resolved_delivery not in _VALID_BOOTSTRAP_DELIVERIES:
+        raise ConfigurationError(
+            f"EXECTUNNEL_BOOTSTRAP_DELIVERY must be one of "
+            f"{sorted(_VALID_BOOTSTRAP_DELIVERIES)}, got: {resolved_delivery!r}"
+        )
+    validated_delivery: Literal["upload", "fetch"] = resolved_delivery  # type: ignore[assignment]
+
     return TunnelConfig(
         socks_host=socks_host,
         socks_port=socks_port,
@@ -221,9 +234,7 @@ def build_tunnel_config(
             _TUNNEL_DEFAULTS.pre_ack_buffer_cap_bytes,
             min_value=1024,
         ),
-        bootstrap_delivery=os.getenv(
-            "EXECTUNNEL_BOOTSTRAP_DELIVERY", bootstrap_delivery
-        ),
+        bootstrap_delivery=validated_delivery,
         bootstrap_fetch_url=os.getenv("EXECTUNNEL_FETCH_AGENT_URL", fetch_agent_url),
         bootstrap_skip_if_present=parse_bool_env(
             "EXECTUNNEL_BOOTSTRAP_SKIP_IF_PRESENT",
@@ -248,7 +259,7 @@ def build_tunnel_config(
         ),
         connect_pace_interval_secs=parse_float_env(
             "EXECTUNNEL_CONNECT_PACE_INTERVAL_SECS",
-            _TUNNEL_DEFAULTS.connect_pace_interval_secs,
+            connect_pace_interval_secs,
             min_value=0.0,
         ),
         socks_handshake_timeout=parse_float_env(
