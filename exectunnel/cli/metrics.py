@@ -641,7 +641,28 @@ class HealthMonitor:
             )
         )
 
-        h = TunnelHealth(
+        pod_name = ""
+        pod_namespace = ""
+        pod_node = ""
+        pod_ip = ""
+        pod_phase = ""
+        pod_conditions: list[dict[str, str]] = []
+
+        if self._pod is not None:
+            pod_name = self._pod.name
+            pod_namespace = self._pod.namespace
+            pod_node = self._pod.node or ""
+            pod_ip = self._pod.ip or ""
+            pod_phase = self._pod.phase or ""
+            pod_conditions = self._pod.conditions
+
+        return TunnelHealth(
+            pod_name=pod_name,
+            pod_namespace=pod_namespace,
+            pod_node=pod_node,
+            pod_ip=pod_ip,
+            pod_phase=pod_phase,
+            pod_conditions=pod_conditions,
             connected=connected,
             ws_url=self._ws_url,
             reconnect_count=reconnect_count,
@@ -735,13 +756,3 @@ class HealthMonitor:
             # Recent connections — shallow copy of deque
             recent_conns=recent_conns,
         )
-
-        if self._pod is not None:
-            h.pod_name = self._pod.name
-            h.pod_namespace = self._pod.namespace
-            h.pod_node = self._pod.node or ""
-            h.pod_ip = self._pod.ip or ""
-            h.pod_phase = self._pod.phase or ""
-            h.pod_conditions = self._pod.conditions
-
-        return h

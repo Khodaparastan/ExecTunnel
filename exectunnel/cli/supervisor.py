@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import dataclasses
 import json
 import logging
 import os
@@ -162,9 +163,9 @@ class TunnelMetrics:
     @classmethod
     def from_dict(cls, d: dict[str, object]) -> TunnelMetrics:
         """Build from a JSON-decoded dict, ignoring unknown keys."""
-        valid = cls.__dataclass_fields__
+        valid_names = {f.name for f in dataclasses.fields(cls)}
         cleaned: dict[str, object] = {}
-        for key in valid:
+        for key in valid_names:
             if key not in d:
                 continue
             value = d[key]
@@ -172,9 +173,9 @@ class TunnelMetrics:
                 if key in _BOOL_METRIC_FIELDS:
                     cleaned[key] = _coerce_bool_metric(value)
                 elif key in _INT_METRIC_FIELDS:
-                    cleaned[key] = int(value)
+                    cleaned[key] = int(value)  # type: ignore[arg-type]
                 elif key in _FLOAT_METRIC_FIELDS:
-                    cleaned[key] = float(value)
+                    cleaned[key] = float(value)  # type: ignore[arg-type]
                 else:
                     cleaned[key] = value
             except (TypeError, ValueError):
@@ -262,7 +263,6 @@ _FLOAT_METRIC_FIELDS: frozenset[str] = frozenset({
     "bootstrap_duration",
 })
 
-
 _DEFAULT_LOG_LINES_CAP = 200
 
 
@@ -271,13 +271,11 @@ class TunnelRuntimeState:
     """Live runtime state for a single managed tunnel."""
 
     spec: TunnelSpec
-    status: str = (
-        "starting"  # starting | running | healthy | unhealthy | restarting | stopped
-    )
+    status: str = "starting"  # starting|running|healthy|unhealthy|restarting|stopped
     pid: int | None = None
     socks_ok: bool = False
     restart_count: int = 0
-    health_failures: int = 0  # total lifetime health failures
+    health_failures: int = 0
     consecutive_health_failures: int = 0
     uptime_secs: float = 0.0
     next_restart_in: float = 0.0
@@ -336,13 +334,17 @@ def _parse_env_file(path: Path) -> dict[str, str]:
             logger.warning("Ignoring empty .env key at line %d in %s", lineno, path)
             continue
         val = val.strip()
-        # Strip surrounding quotes / escapes.
+        # Strip surrounding quotes / escapes; always produce a str value.
         if len(val) >= 2 and val[0] in ('"', "'") and val[-1] == val[0]:
             try:
-                parsed = (
-                    json.loads(val) if val[0] == '"' else val[1:-1].replace("\\'", "'")
-                )
-            except Exception:
+                if val[0] == '"':
+                    parsed = json.loads(val)
+                    # json.loads may return non-string (int, bool, etc.) for
+                    # quoted numeric literals — always stringify.
+                    val = str(parsed) if not isinstance(parsed, str) else parsed
+                else:
+                    val = val[1:-1].replace("\\'", "'")
+            except Exception:  # noqa: BLE001
                 logger.warning(
                     "Ignoring malformed quoted .env value for %s at line %d in %s",
                     key,
@@ -350,7 +352,6 @@ def _parse_env_file(path: Path) -> dict[str, str]:
                     path,
                 )
                 continue
-            val = parsed
         result[key] = val
     return result
 
@@ -435,9 +436,11 @@ def _load_manager_config(
     max_health_failures = _geti("MAX_HEALTH_FAILURES", _DEFAULT_MAX_HEALTH_FAILURES)
     startup_grace_period = _getf("STARTUP_GRACE_PERIOD", _DEFAULT_STARTUP_GRACE_PERIOD)
 
-    # Discover tunnel indices from WSS_URL_<N> keys
+    # Discover tunnel indices from WSS_URL_<N> keys.
     indices: list[int] = sorted(
-        int(m.group(1)) for k in env if (m := re.fullmatch(r"WSS_URL_(\d+)", k))
+        int(m.group(1))
+        for k in env
+        if (m := re.fullmatch(r"WSS_URL_(\d+)", k)) is not None
     )
 
     if not indices:
@@ -516,15 +519,15 @@ def _load_manager_config(
         )
 
     seen_ports: dict[int, str] = {}
-    for tunnel in tunnels:
-        prior = seen_ports.get(tunnel.socks_port)
+    for t in tunnels:
+        prior = seen_ports.get(t.socks_port)
         if prior is not None:
             raise ValueError(
-                f"Duplicate SOCKS port {tunnel.socks_port} configured for "
-                f"{prior!r} and {tunnel.display_name!r}. "
+                f"Duplicate SOCKS port {t.socks_port} configured for "
+                f"{prior!r} and {t.display_name!r}. "
                 "Each managed tunnel must use a unique local SOCKS port."
             )
-        seen_ports[tunnel.socks_port] = tunnel.display_name
+        seen_ports[t.socks_port] = t.display_name
 
     return ManagerConfig(
         tunnels=tunnels,
@@ -552,7 +555,7 @@ async def _check_socks_port(host: str, port: int, timeout: float = 3.0) -> bool:
         writer.close()
         await writer.wait_closed()
         return True
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -561,6 +564,8 @@ async def _check_socks_port(host: str, port: int, timeout: float = 3.0) -> bool:
 
 class TunnelWorker:
     """Manages the lifecycle of a single tunnel subprocess."""
+
+    _METRICS_PREFIX = "__ET_METRICS__:"
 
     def __init__(
         self,
@@ -578,7 +583,6 @@ class TunnelWorker:
 
     @property
     def display_name(self) -> str:
-        """Public accessor for task naming — avoids exposing ``_spec``."""
         return self._spec.display_name
 
     def _emit(self) -> None:
@@ -621,7 +625,6 @@ class TunnelWorker:
             await self._run_once(stop_event)
             if stop_event.is_set():
                 break
-            # Backoff restart
             self._state.restart_count += 1
             self._state.status = "restarting"
             self._state.next_restart_in = self._current_delay
@@ -658,7 +661,7 @@ class TunnelWorker:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.error("[%s] failed to start: %s", self._spec.display_name, exc)
             self._state.status = "unhealthy"
             self._state.exit_code = -1
@@ -675,7 +678,6 @@ class TunnelWorker:
         self._state.exit_code = None
         self._emit()
 
-        # Log stdout/stderr
         log_task = asyncio.create_task(self._drain_output(proc))
         health_task = asyncio.create_task(self._health_loop(stop_event))
         stop_task = asyncio.create_task(stop_event.wait())
@@ -688,7 +690,6 @@ class TunnelWorker:
             )
 
             if stop_task in done:
-                # Graceful shutdown
                 wait_task.cancel()
                 with contextlib.suppress(ProcessLookupError):
                     proc.send_signal(signal.SIGTERM)
@@ -723,8 +724,6 @@ class TunnelWorker:
         self._emit()
         self._proc = None
 
-    _METRICS_PREFIX = "__ET_METRICS__:"
-
     async def _drain_output(self, proc: asyncio.subprocess.Process) -> None:
         if proc.stdout is None:
             return
@@ -738,6 +737,7 @@ class TunnelWorker:
                     self._state.log_lines.append(text)
                     self._emit()
         except asyncio.CancelledError:
+            # Drain any remaining buffered lines before exiting.
             with contextlib.suppress(Exception):
                 while True:
                     line = await asyncio.wait_for(proc.stdout.readline(), timeout=0.05)
@@ -750,7 +750,7 @@ class TunnelWorker:
                         logger.debug("[%s] %s", self._spec.display_name, text)
                         self._state.log_lines.append(text)
                         self._emit()
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
 
     def _parse_metrics(self, payload: str) -> None:
@@ -763,7 +763,6 @@ class TunnelWorker:
             logger.debug("[%s] bad metrics payload", self._spec.display_name)
 
     async def _health_loop(self, stop_event: asyncio.Event) -> None:
-        # Grace period before first check
         try:
             await asyncio.sleep(self._cfg.startup_grace_period)
         except asyncio.CancelledError:
@@ -775,9 +774,7 @@ class TunnelWorker:
             if ok:
                 self._state.status = "healthy"
                 self._state.consecutive_health_failures = 0
-                self._current_delay = (
-                    self._cfg.restart_delay
-                )  # reset backoff on healthy
+                self._current_delay = self._cfg.restart_delay  # reset backoff
             else:
                 self._state.consecutive_health_failures += 1
                 self._state.health_failures += 1
@@ -814,9 +811,9 @@ def run_manager(
     show_logs: bool = False,
 ) -> None:
     """Parse env_file, start all tunnel workers, and supervise them."""
-    from exectunnel.observability.logging import configure_logging
+    from exectunnel.observability.logging import configure_logging  # noqa: PLC0415
 
-    configure_logging(log_level)
+    configure_logging(log_level)  # type: ignore[arg-type]
 
     try:
         cfg = _load_manager_config(
@@ -879,7 +876,7 @@ async def _run_manager_async(cfg: ManagerConfig) -> None:
         )
         stop_watcher = asyncio.create_task(stop_event.wait(), name="stop-watcher")
 
-        done, _ = await asyncio.wait(
+        await asyncio.wait(
             {stop_watcher, *worker_tasks},
             return_when=asyncio.FIRST_COMPLETED,
         )

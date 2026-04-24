@@ -172,7 +172,11 @@ class _JsonLogFormatter(logging.Formatter):
             "trace_id": getattr(record, "trace_id", "-"),
             "span_id": getattr(record, "span_id", "-"),
         }
-        payload.update({key: val for key, val in record.__dict__.items() if key not in _LOG_RECORD_BUILTIN_ATTRS})
+        payload.update({
+            key: val
+            for key, val in record.__dict__.items()
+            if key not in _LOG_RECORD_BUILTIN_ATTRS
+        })
         if record.exc_info:
             payload["exc_info"] = self.formatException(record.exc_info)
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))

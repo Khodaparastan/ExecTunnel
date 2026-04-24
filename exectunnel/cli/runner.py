@@ -21,7 +21,12 @@ from exectunnel.exceptions import (
     ExecTunnelError,
     ReconnectExhaustedError,
 )
-from exectunnel.observability import metrics_inc, metrics_observe
+from exectunnel.observability import (
+    metrics_inc,
+    metrics_observe,
+    register_metric_listener,
+    unregister_metric_listener,
+)
 from exectunnel.observability.logging import install_ring_buffer
 from exectunnel.session import SessionConfig, TunnelConfig
 
@@ -33,30 +38,7 @@ __all__ = ["run_session"]
 
 logger = logging.getLogger(__name__)
 
-# ── Observability listener API ────────────────────────────────────────────────
-#
-# Resolved once at import time.  If the observability module does not expose
-# the listener API (older build / minimal test stub), listener registration
-# degrades gracefully to a no-op.
-
-try:
-    from exectunnel.observability import (
-        register_metric_listener as _register_metric_listener,
-    )
-    from exectunnel.observability import (
-        unregister_metric_listener as _unregister_metric_listener,
-    )
-
-    _HAS_LISTENER_API: bool = True
-except (ImportError, AttributeError):
-    _register_metric_listener = None
-    _unregister_metric_listener = None
-    _HAS_LISTENER_API = False
-
 # ── Spinner ↔ metric mapping ──────────────────────────────────────────────────
-#
-# Maps observability metric names to (spinner_phase, action) pairs.
-# action ∈ {"start", "done", "skip", "fail"}
 
 _PHASE_MAP: dict[str, tuple[str, str]] = {
     # stty
@@ -118,13 +100,6 @@ async def run_session(
     -------
     int
         Exit code — ``0`` on clean exit or graceful shutdown, ``1`` on error.
-
-    Bootstrap timeout
-    -----------------
-    The function waits indefinitely for ``bootstrap.ok`` during Phase 1.
-    If the agent never becomes ready the session task will eventually fail
-    (connection timeout / exec error) and Phase 1 resolves naturally.
-    An explicit bootstrap timeout can be added to ``TunnelConfig`` if needed.
     """
     from exectunnel.session import TunnelSession  # noqa: PLC0415
 
@@ -138,6 +113,7 @@ async def run_session(
         ws_url=ws_url,
         socks_host=tun_cfg.socks_host,
         socks_port=tun_cfg.socks_port,
+        send_queue_cap=session_cfg.send_queue_cap,
     )
     monitor.set_connected(True)
 
@@ -146,8 +122,8 @@ async def run_session(
     registered_listeners: list[Callable[..., None]] = []
 
     def _add_listener(callback: Callable[..., None]) -> None:
-        if _try_register_listener(callback):
-            registered_listeners.append(callback)
+        register_metric_listener(callback)
+        registered_listeners.append(callback)
 
     _add_listener(monitor.on_metric)
 
@@ -155,7 +131,6 @@ async def run_session(
         _add_listener(_make_spinner_listener(spinner, loop))
 
     # ── Bootstrap-done signal ─────────────────────────────────────────────
-    # A separate lightweight listener that gates Phase 1 → Phase 2 transition.
     bootstrap_done = asyncio.Event()
 
     def _on_bootstrap_done(name: str, **_: object) -> None:
@@ -175,10 +150,8 @@ async def run_session(
         stop_event.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
-        try:  # noqa: SIM105
+        with contextlib.suppress(NotImplementedError, RuntimeError):
             loop.add_signal_handler(sig, _handle_signal, sig)
-        except (NotImplementedError, RuntimeError):
-            pass  # Windows / environments that restrict signal handling
 
     # ── Task setup ────────────────────────────────────────────────────────
 
@@ -223,12 +196,7 @@ async def run_session(
             spinner.finalize()
 
         if not no_dashboard:
-            # Install a log ring buffer when the user wants log tail in the dashboard.
-            log_buf = None
-            if show_logs:
-
-                log_buf = install_ring_buffer(maxlen=200)
-
+            log_buf = install_ring_buffer(maxlen=200) if show_logs else None
             dashboard = TunnelDashboard(
                 monitor=monitor,
                 console=console,
@@ -241,8 +209,6 @@ async def run_session(
         else:
             _print_proxy_hint(console, tun_cfg)
 
-        # When running under the manager, start a background task that
-        # periodically dumps metrics as JSON lines on stdout.
         if os.environ.get(_METRICS_REPORT_ENV) == "1":
             metrics_reporter_task = asyncio.create_task(
                 _metrics_reporter(monitor), name="metrics-reporter"
@@ -288,9 +254,9 @@ async def run_session(
             with contextlib.suppress(asyncio.CancelledError):
                 await metrics_reporter_task
 
-        # Unregister all listeners to prevent memory leaks.
         for cb in registered_listeners:
-            _try_unregister_listener(cb)
+            with contextlib.suppress(Exception):
+                unregister_metric_listener(cb)
         registered_listeners.clear()
 
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -299,24 +265,6 @@ async def run_session(
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
-
-
-def _try_register_listener(callback: Callable[..., None]) -> bool:
-    """Register *callback* with the observability layer.
-
-    Returns ``True`` on success, ``False`` if the listener API is unavailable.
-    Uses the module-level resolved reference to avoid repeated import overhead.
-    """
-    if not _HAS_LISTENER_API or _register_metric_listener is None:
-        return False
-    _register_metric_listener(callback)  # type: ignore[arg-type]
-    return True
-
-
-def _try_unregister_listener(callback: Callable[..., None]) -> None:
-    if not _HAS_LISTENER_API or _unregister_metric_listener is None:
-        return
-    _unregister_metric_listener(callback)  # type: ignore[arg-type]
 
 
 def _make_spinner_listener(
@@ -352,8 +300,6 @@ async def _metrics_reporter(monitor: HealthMonitor) -> None:
 
     Designed to run only when the tunnel subprocess is managed by the
     multi-tunnel manager (env ``EXECTUNNEL_METRICS_REPORT=1``).
-    The manager's ``_drain_output`` parser picks up these lines and
-    populates per-tunnel metrics for the manager dashboard.
     """
     try:
         while True:
@@ -366,8 +312,9 @@ async def _metrics_reporter(monitor: HealthMonitor) -> None:
                 )
                 sys.stdout.write(line + "\n")
                 sys.stdout.flush()
-            except Exception:
-                pass  # never crash the tunnel for a reporting glitch
+            except Exception:  # noqa: BLE001
+                # Never crash the tunnel for a reporting glitch.
+                logger.debug("metrics reporter write failed", exc_info=True)
     except asyncio.CancelledError:
         pass
 
@@ -380,11 +327,9 @@ def _cancel_tasks(*tasks: asyncio.Task[Any]) -> None:
 
 async def _drain(task: asyncio.Task[Any]) -> None:
     """Await *task* with a hard timeout; swallow all exceptions."""
-    try:
+    with contextlib.suppress(TimeoutError, asyncio.CancelledError, Exception):
         async with asyncio.timeout(_SHUTDOWN_TIMEOUT_SECS):
             await task
-    except (TimeoutError, asyncio.CancelledError, Exception):
-        pass
 
 
 def _extract_result(
@@ -460,6 +405,5 @@ def _handle_session_error(exc: BaseException, console: Console) -> int:
         return 1
 
     console.print(f"\n[et.error]{Icons.CROSS} Unexpected error: {exc}[/et.error]")
-
     console.print(Traceback.from_exception(type(exc), exc, exc.__traceback__))
     return 1
