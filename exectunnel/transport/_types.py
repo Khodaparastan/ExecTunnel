@@ -1,4 +1,9 @@
-"""Shared types for the ``exectunnel.transport`` package."""
+"""Shared structural types for :mod:`exectunnel.transport`.
+
+These types describe the interface between the transport layer and the
+session layer without creating an import-time dependency on concrete
+handler classes.
+"""
 
 from __future__ import annotations
 
@@ -24,10 +29,13 @@ class WsSendCallable(Protocol):
     Implementations accept a newline-terminated frame string and two
     keyword-only flow-control flags:
 
-    * ``must_queue`` — block until enqueued under backpressure; ignored when
-      ``control=True``.
-    * ``control``    — priority frame that bypasses flow-control ordering;
+    * ``must_queue`` — block until enqueued under backpressure; ignored
+      when ``control=True``.
+    * ``control`` — priority frame that bypasses flow-control ordering;
       when ``True``, ``must_queue`` is ignored.
+
+    ``@runtime_checkable`` is applied so dependency-injection layers may
+    verify conformance in tests via :func:`isinstance`.
     """
 
     def __call__(
@@ -40,19 +48,23 @@ class WsSendCallable(Protocol):
 
 
 class TransportHandler(Protocol):
-    """Structural protocol satisfied by both ``TcpConnection`` and ``UdpFlow``.
+    """Structural protocol satisfied by both :class:`TcpConnection` and :class:`UdpFlow`.
 
-    Provides the ``session`` layer with a uniform interface for typing handler
-    registries without importing concrete classes.
+    Provides the session layer with a uniform interface for typing
+    handler registries without importing concrete classes.
 
     Note:
-        Handler-specific methods (e.g. ``TcpConnection.abort``,
-        ``UdpFlow.send_datagram``) require type-narrowing to the concrete
-        class before use.
+        Handler-specific methods (e.g. :meth:`TcpConnection.abort`,
+        :meth:`UdpFlow.send_datagram`) require type-narrowing to the
+        concrete class before use.
 
-        ``on_remote_closed()`` must remain synchronous on all concrete
-        implementations — the session layer calls it from a synchronous
-        dispatch path and cannot ``await`` it.
+        :meth:`on_remote_closed` must remain synchronous on every
+        concrete implementation — the session layer calls it from a
+        synchronous dispatch path and cannot ``await`` it.
+
+        This protocol is intentionally **not** ``@runtime_checkable``: it
+        is used exclusively for static type-narrowing on the registries;
+        runtime membership checks would hide genuine type errors.
     """
 
     @property
