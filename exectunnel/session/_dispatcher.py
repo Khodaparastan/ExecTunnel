@@ -1,12 +1,13 @@
 """SOCKS5 request dispatcher — CONNECT, UDP_ASSOCIATE, and direct pipe.
 
-``RequestDispatcher`` is called by ``TunnelSession._accept_loop`` for each
-accepted ``Socks5Request``.  It is responsible for:
+:class:`RequestDispatcher` is called by
+:meth:`~exectunnel.session._session.TunnelSession._accept_loop` for each
+accepted :class:`~exectunnel.proxy.TCPRelay`.  It is responsible for:
 
 * Opening tunnel connections / UDP flows.
 * Sending the SOCKS5 reply (success or error) exactly once.
 * Relaying data until one side closes.
-* Sending CONN_CLOSE / UDP_CLOSE on teardown.
+* Sending ``CONN_CLOSE`` / ``UDP_CLOSE`` on teardown.
 """
 
 import asyncio
@@ -38,27 +39,115 @@ from exectunnel.protocol import (
     new_conn_id,
     new_flow_id,
 )
-from exectunnel.proxy import Socks5Request, UdpRelay
+from exectunnel.proxy import TCPRelay, UDPRelay
 from exectunnel.transport import TcpConnection, UdpFlow, WsSendCallable
 
 from ._config import TunnelConfig
+from ._constants import (
+    DIRECT_CONNECT_TIMEOUT_SECS,
+    HOST_SEMAPHORE_CAPACITY,
+    PIPE_WRITER_CLOSE_TIMEOUT_SECS,
+    UDP_ACTIVE_FLOWS_CAP,
+    UDP_MAX_DATAGRAM_SIZE,
+)
 from ._lru import LruDict
 from ._routing import is_host_excluded
 from ._state import AckStatus, PendingConnect
+from ._types import ReconnectCallable
 from ._udp_socket import make_udp_socket
 
 logger = logging.getLogger(__name__)
 
-# Maximum number of distinct hosts tracked in per-host rate-limit structures.
-_HOST_SEMAPHORE_CAPACITY: Final[int] = 4_096
+# Compiled regex for sanitising task-name host components.
+_SAFE_HOST_RE: Final = __import__("re").compile(r"[^a-zA-Z0-9_.\-]")
 
-# Timeout applied to writer.wait_closed() during _pipe cleanup to prevent
-# indefinite hangs when the OS never delivers the FIN ACK.
-_PIPE_WRITER_CLOSE_TIMEOUT_SECS: Final[float] = 5.0
 
-# Timeout for direct (excluded-host) TCP connect attempts.  Prevents a hung
-# DNS lookup or TCP handshake from blocking the dispatch task indefinitely.
-_DIRECT_CONNECT_TIMEOUT_SECS: Final[float] = 15.0
+class _HostGate:
+    """Ref-counted wrapper around an :class:`asyncio.Semaphore` for per-host gating.
+
+    The gate is inserted into :class:`_HostGateRegistry` and removed only when
+    the last holder releases it, guaranteeing that the per-host cap is never
+    breached by eviction races under sustained fan-out.
+
+    Args:
+        limit: Maximum number of concurrent holders of this gate.
+    """
+
+    __slots__ = ("sem", "refs")
+
+    def __init__(self, limit: int) -> None:
+        self.sem: asyncio.Semaphore = asyncio.Semaphore(limit)
+        self.refs: int = 0
+
+
+class _HostGateRegistry:
+    """Registry of ref-counted per-host semaphores.
+
+    Unlike an LRU-bounded mapping, entries here are *pinned* for as long as
+    any coroutine holds the gate — eviction of in-use entries would reset
+    the semaphore's counter and temporarily exceed ``limit``.
+
+    Idle entries (``refs == 0``) are eligible for collection.  To keep the
+    working set bounded in pathological many-host workloads, the caller
+    prunes idle entries when the total size exceeds *max_size*.
+
+    Args:
+        limit:    Per-host concurrency limit (semaphore capacity).
+        max_size: Maximum number of entries before idle pruning is triggered.
+    """
+
+    __slots__ = ("_entries", "_limit", "_max_size")
+
+    def __init__(self, limit: int, max_size: int = HOST_SEMAPHORE_CAPACITY) -> None:
+        self._entries: dict[str, _HostGate] = {}
+        self._limit = limit
+        self._max_size = max_size
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def _prune_idle(self) -> None:
+        """Drop idle entries (``refs == 0``) in insertion order until under cap."""
+        if len(self._entries) <= self._max_size:
+            return
+        for key in list(self._entries.keys()):
+            if len(self._entries) <= self._max_size:
+                return
+            entry = self._entries[key]
+            if entry.refs == 0:
+                del self._entries[key]
+
+    def acquire_gate(self, key: str) -> _HostGate:
+        """Return the gate for *key*, creating it if absent, and increment its refcount.
+
+        Args:
+            key: Normalised host key (see :func:`_normalise_host_key`).
+
+        Returns:
+            The :class:`_HostGate` for *key* with its refcount incremented.
+        """
+        entry = self._entries.get(key)
+        if entry is None:
+            entry = _HostGate(self._limit)
+            self._entries[key] = entry
+            self._prune_idle()
+        entry.refs += 1
+        return entry
+
+    def release_gate(self, key: str) -> None:
+        """Decrement the refcount for *key* and delete the entry when idle.
+
+        Args:
+            key: Normalised host key previously passed to :meth:`acquire_gate`.
+        """
+        entry = self._entries.get(key)
+        if entry is None:
+            return
+        entry.refs -= 1
+        if entry.refs <= 0:
+            # Only safe to drop when nobody holds or waits — refs covers both,
+            # since callers increment before awaiting ``sem.acquire()``.
+            del self._entries[key]
 
 
 class RequestDispatcher:
@@ -74,7 +163,9 @@ class RequestDispatcher:
         tcp_registry:             Shared TCP connection registry.
         pending_connects:         Shared pending-connect registry.
         udp_registry:             Shared UDP flow registry.
-        pre_ack_buffer_cap_bytes: Pre-ACK buffer cap forwarded to TcpConnection.
+        pre_ack_buffer_cap_bytes: Pre-ACK buffer cap forwarded to
+                                  :class:`~exectunnel.transport.TcpConnection`.
+        request_reconnect:        Optional callback to force a session reconnect.
     """
 
     __slots__ = (
@@ -110,7 +201,7 @@ class RequestDispatcher:
         pending_connects: dict[str, PendingConnect],
         udp_registry: dict[str, UdpFlow],
         pre_ack_buffer_cap_bytes: int,
-        request_reconnect: Callable[[str], Awaitable[None]] | None = None,
+        request_reconnect: ReconnectCallable | None = None,
     ) -> None:
         self._tun = tun_cfg
         self._ws_send = ws_send
@@ -121,20 +212,22 @@ class RequestDispatcher:
         self._pre_ack_buffer_cap_bytes = pre_ack_buffer_cap_bytes
 
         self._connect_gate = asyncio.Semaphore(tun_cfg.connect_max_pending)
-        self._host_semaphores: LruDict[str, asyncio.Semaphore] = LruDict(
-            _HOST_SEMAPHORE_CAPACITY,
+        # Ref-counted per-host gates: entries are pinned while any holder or
+        # waiter exists, guaranteeing strict ``connect_max_pending_per_host``
+        # enforcement even under pathological host cardinality.
+        self._host_semaphores: _HostGateRegistry = _HostGateRegistry(
+            tun_cfg.connect_max_pending_per_host
         )
         self._host_connect_open_locks: LruDict[str, asyncio.Lock] = LruDict(
-            _HOST_SEMAPHORE_CAPACITY,
+            HOST_SEMAPHORE_CAPACITY
         )
         self._host_connect_last_open_at: LruDict[str, float] = LruDict(
-            _HOST_SEMAPHORE_CAPACITY,
+            HOST_SEMAPHORE_CAPACITY
         )
         self._connect_failures_by_host: LruDict[str, int] = LruDict(
-            _HOST_SEMAPHORE_CAPACITY,
+            HOST_SEMAPHORE_CAPACITY
         )
 
-        # ACK failure tracking.
         self._ack_failure_count: int = 0
         self._ack_failure_suppressed: int = 0
         self._ack_timeout_window_start: float | None = None
@@ -144,30 +237,51 @@ class RequestDispatcher:
         self._ack_reconnect_requested: bool = False
         self._request_reconnect = request_reconnect
 
-        # Shared task that resolves when the WebSocket closes.  Created once
-        # and reused by all concurrent _await_conn_ack calls.
-        self._ws_closed_task: asyncio.Task[bool] = (
-            asyncio.get_running_loop().create_task(
-                ws_closed.wait(),
-                name="ws-closed-sentinel",
-            )
-        )
+        # Created lazily on first use by :meth:`_get_ws_closed_task` so that
+        # ``__init__`` can be called outside a running event loop.
+        self._ws_closed_task: asyncio.Task[bool] | None = None
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
+    def _get_ws_closed_task(self) -> asyncio.Task[bool]:
+        """Lazily create the shared ``ws_closed.wait()`` sentinel task.
+
+        Creating it on first use (inside :meth:`_await_conn_ack`) guarantees
+        an event loop is running, avoiding the ``RuntimeError`` that would
+        otherwise be raised if :class:`RequestDispatcher` is constructed
+        before the loop starts.
+
+        Returns:
+            A running :class:`asyncio.Task` that resolves when ``ws_closed``
+            is set.
+        """
+        task = self._ws_closed_task
+        if task is None or task.done():
+            task = asyncio.get_running_loop().create_task(
+                self._ws_closed.wait(),
+                name="ws-closed-sentinel",
+            )
+            self._ws_closed_task = task
+        return task
+
     def close(self) -> None:
-        """Cancel the shared ``_ws_closed_task`` sentinel.
+        """Cancel the shared ``_ws_closed_task`` sentinel, if it was created.
 
         Must be called when the session is torn down to prevent the sentinel
         task from leaking.  Safe to call multiple times.
         """
-        if not self._ws_closed_task.done():
-            self._ws_closed_task.cancel()
+        task = self._ws_closed_task
+        if task is not None and not task.done():
+            task.cancel()
 
     # ── Public dispatch ───────────────────────────────────────────────────────
 
-    async def dispatch(self, req: Socks5Request) -> None:
-        """Dispatch a SOCKS5 request to the appropriate handler."""
+    async def dispatch(self, req: TCPRelay) -> None:
+        """Dispatch a SOCKS5 request to the appropriate handler.
+
+        Args:
+            req: Completed SOCKS5 handshake to dispatch.
+        """
         if req.is_connect:
             async with aspan("socks.connect", host=req.host, port=req.port):
                 await self._handle_connect(req)
@@ -179,32 +293,37 @@ class RequestDispatcher:
 
     # ── CONNECT ───────────────────────────────────────────────────────────────
 
-    async def _handle_connect(self, req: Socks5Request) -> None:
-        """Handle a SOCKS5 CONNECT request."""
+    async def _handle_connect(self, req: TCPRelay) -> None:
+        """Handle a SOCKS5 CONNECT request.
+
+        Args:
+            req: Completed SOCKS5 handshake with CONNECT command.
+        """
         async with req:
             host, port = req.host, req.port
-
             if is_host_excluded(host, self._tun.exclude):
                 await self._handle_direct_connect(req, host, port)
                 return
-
             await self._handle_tunnel_connect(req, host, port)
 
     @staticmethod
     async def _handle_direct_connect(
-        req: Socks5Request,
+        req: TCPRelay,
         host: str,
         port: int,
     ) -> None:
-        """Open a direct TCP connection for excluded hosts."""
+        """Open a direct TCP connection for excluded hosts.
+
+        Args:
+            req:  Completed SOCKS5 handshake (lifecycle owned by caller).
+            host: Destination hostname or IP.
+            port: Destination port.
+        """
         async with aspan("socks.connect.direct", host=host, port=port):
             logger.debug("direct connect %s:%d (excluded)", host, port)
             try:
-                async with asyncio.timeout(_DIRECT_CONNECT_TIMEOUT_SECS):
-                    rem_reader, rem_writer = await asyncio.open_connection(
-                        host,
-                        port,
-                    )
+                async with asyncio.timeout(DIRECT_CONNECT_TIMEOUT_SECS):
+                    rem_reader, rem_writer = await asyncio.open_connection(host, port)
             except (OSError, TimeoutError) as exc:
                 logger.debug("direct connect failed: %s", exc)
                 metrics_inc("socks.reply", code=int(Reply.HOST_UNREACHABLE))
@@ -232,12 +351,33 @@ class RequestDispatcher:
 
     async def _handle_tunnel_connect(
         self,
-        req: Socks5Request,
+        req: TCPRelay,
         host: str,
         port: int,
     ) -> None:
-        """Open a tunnel CONNECT and relay data."""
-        host_gate = self._get_host_semaphore(host)
+        """Open a tunnel CONNECT and relay data.
+
+        The request lifecycle (``async with req:``) is owned by the caller
+        :meth:`_handle_connect`.  This method must not re-enter the context manager.
+
+        ``CONN_OPEN`` is sent as a control frame (``control=True``) to guarantee
+        it is never dropped by the bounded data queue under backpressure.  The
+        send enqueues synchronously to the unbounded control queue and never
+        raises :exc:`~exectunnel.exceptions.WebSocketSendTimeoutError` or
+        :exc:`~exectunnel.exceptions.ConnectionClosedError` at the call site —
+        those failures surface through ``_ws_closed_task`` resolving in
+        :meth:`_await_conn_ack`.
+
+        The ``session.active.tcp_connections`` gauge is incremented here on
+        registration and decremented by the transport layer on registry eviction.
+
+        Args:
+            req:  Completed SOCKS5 handshake (lifecycle owned by caller).
+            host: Destination hostname or IP.
+            port: Destination port.
+        """
+        host_key, host_gate_entry = self._acquire_host_gate(host)
+        host_gate = host_gate_entry.sem
         conn_id = new_conn_id()
         loop = asyncio.get_running_loop()
         ack_future: asyncio.Future[AckStatus] = loop.create_future()
@@ -252,8 +392,8 @@ class RequestDispatcher:
         )
         pending = PendingConnect(host=host, port=port, ack_future=ack_future)
 
-        # Insert into registry BEFORE sending CONN_OPEN — agent may reply
-        # before the await returns.
+        # Register BEFORE sending CONN_OPEN — the agent may reply before the
+        # await returns.
         self._tcp_registry[conn_id] = handler
         metrics_gauge_inc("session.active.tcp_connections")
         self._pending_connects[conn_id] = pending
@@ -261,92 +401,48 @@ class RequestDispatcher:
 
         ack_wait_start = loop.time()
         ack_status: AckStatus = AckStatus.OK
-        reply = Reply.HOST_UNREACHABLE
         failure_reason: AckStatus | None = None
+        reply = Reply.HOST_UNREACHABLE
 
         try:
             async with aspan("tunnel.conn_open", conn_id=conn_id, host=host, port=port):
                 async with self._connect_gate, host_gate:
-                    host_key = _normalise_host_key(host)
                     await self._pace_connection(host_key)
 
-                    try:
-                        await self._ws_send(
-                            encode_conn_open_frame(conn_id, host, port),
-                        )
-                    except WebSocketSendTimeoutError as exc:
-                        failure_reason = AckStatus.WS_SEND_TIMEOUT
-                        ack_status = AckStatus.WS_SEND_TIMEOUT
-                        reply = Reply.GENERAL_FAILURE
-                        metrics_inc(
-                            "tunnel.conn_open.error",
-                            error="ws_send_timeout",
-                        )
-                        logger.warning(
-                            "conn %s: CONN_OPEN send timed out [%s] (error_id=%s)",
-                            conn_id,
-                            exc.error_code,
-                            exc.error_id,
-                            extra={
-                                "conn_id": conn_id,
-                                "error_code": exc.error_code,
-                                "error_id": exc.error_id,
-                            },
-                        )
-                    except ConnectionClosedError as exc:
-                        failure_reason = AckStatus.WS_CLOSED
-                        ack_status = AckStatus.WS_CLOSED
-                        reply = Reply.NET_UNREACHABLE
-                        metrics_inc(
-                            "tunnel.conn_open.error",
-                            error="connection_closed",
-                        )
-                        logger.warning(
-                            "conn %s: CONN_OPEN failed — connection closed [%s] "
-                            "(error_id=%s)",
-                            conn_id,
-                            exc.error_code,
-                            exc.error_id,
-                            extra={
-                                "conn_id": conn_id,
-                                "error_code": exc.error_code,
-                                "error_id": exc.error_id,
-                            },
-                        )
-                    else:
-                        metrics_inc(
-                            "tunnel.conn_open",
-                            conn_id=conn_id,
-                            host=host,
-                            port=port,
-                        )
-                        logger.debug(
-                            "tunnel CONNECT %s:%d conn=%s",
-                            host,
-                            port,
-                            conn_id,
-                            extra={
-                                "conn_id": conn_id,
-                                "host": host,
-                                "port": port,
-                            },
-                        )
-
-                # Semaphores released after CONN_OPEN is sent — ACK wait
-                # happens outside the semaphore scope so a slow agent ACK
-                # does not block new connections.
-                if failure_reason is None:
-                    async with aspan(
-                        "tunnel.conn_ack.wait",
+                    # control=True: enqueues to the unbounded priority queue —
+                    # never dropped, never raises a send-level exception.
+                    await self._ws_send(
+                        encode_conn_open_frame(conn_id, host, port),
+                        control=True,
+                    )
+                    metrics_inc(
+                        "tunnel.conn_open",
                         conn_id=conn_id,
-                    ):
-                        failure_reason, reply = await self._await_conn_ack(
-                            conn_id,
-                            pending,
-                            ack_future,
-                        )
-                    if failure_reason is not None:
-                        ack_status = failure_reason
+                        host=host,
+                        port=port,
+                    )
+                    logger.debug(
+                        "tunnel CONNECT %s:%d conn=%s",
+                        host,
+                        port,
+                        conn_id,
+                        extra={
+                            "conn_id": conn_id,
+                            "host": host,
+                            "port": port,
+                        },
+                    )
+
+                # Semaphores released after CONN_OPEN is sent — the ACK wait
+                # runs outside the semaphore scope so a slow agent ACK does not
+                # block new connections.
+                async with aspan("tunnel.conn_ack.wait", conn_id=conn_id):
+                    failure_reason, reply = await self._await_conn_ack(
+                        conn_id, pending, ack_future
+                    )
+
+                if failure_reason is not None:
+                    ack_status = failure_reason
 
             if failure_reason is not None:
                 self._record_ack_failure(conn_id, failure_reason, host=host, port=port)
@@ -358,13 +454,11 @@ class RequestDispatcher:
 
             metrics_inc("tunnel.conn_ack.ok", conn_id=conn_id, host=host, port=port)
 
-            # send_reply_success() can raise OSError when the SOCKS5 client
-            # closes its socket before we send the reply — normal race.
             try:
                 await req.send_reply_success()
             except OSError as exc:
                 logger.debug(
-                    "conn %s: SOCKS5 client closed before reply could be sent: %s",
+                    "conn %s: SOCKS5 client closed before reply: %s",
                     conn_id,
                     exc,
                     extra={"conn_id": conn_id},
@@ -450,10 +544,6 @@ class RequestDispatcher:
 
         finally:
             self._pending_connects.pop(conn_id, None)
-            if conn_id not in self._tcp_registry:
-                # Handler was removed from registry (closed or aborted) →
-                # decrement the gauge that was incremented on insertion.
-                metrics_gauge_dec("session.active.tcp_connections")
             if not ack_future.done():
                 ack_future.cancel()
             self._emit_pending_gauge()
@@ -461,7 +551,12 @@ class RequestDispatcher:
                 "tunnel.conn_ack.wait_sec",
                 loop.time() - ack_wait_start,
                 status=ack_status.value,
+                host=host_key,
             )
+            # Release the per-host gate reference acquired at the top of the
+            # method.  Must happen after every code path — success, ACK failure,
+            # exceptions, cancellation — to keep refcount balance exact.
+            self._release_host_gate(host_key)
 
     async def _await_conn_ack(
         self,
@@ -469,13 +564,24 @@ class RequestDispatcher:
         pending: PendingConnect,
         ack_future: asyncio.Future[AckStatus],
     ) -> tuple[AckStatus | None, Reply]:
-        """Wait for CONN_ACK, WS close, or timeout.
+        """Wait for ``CONN_ACK``, WebSocket close, or timeout.
+
+        ``ack_future`` is checked before ``ws_closed_task`` when both resolve
+        in the same event-loop iteration so a valid ACK is never discarded due
+        to a concurrent close signal.
+
+        Args:
+            conn_id:    Connection ID for metrics tags.
+            pending:    Pending connect record for metrics tags.
+            ack_future: Future resolved by :class:`~exectunnel.session._receiver.FrameReceiver`
+                        on ACK or error.
 
         Returns:
-            ``(failure_reason, reply)`` where ``failure_reason`` is ``None``
-            on success or an ``AckStatus`` member on failure.
+            A ``(failure_reason, reply)`` tuple where *failure_reason* is
+            ``None`` on success or an :class:`~exectunnel.session._state.AckStatus`
+            member on failure.
         """
-        ws_closed_task = self._ws_closed_task
+        ws_closed_task = self._get_ws_closed_task()
         try:
             async with asyncio.timeout(self._tun.conn_ack_timeout):
                 done, _ = await asyncio.wait(
@@ -491,21 +597,30 @@ class RequestDispatcher:
             )
             return AckStatus.TIMEOUT, Reply.HOST_UNREACHABLE
 
-        if ws_closed_task in done:
-            return AckStatus.WS_CLOSED, Reply.NET_UNREACHABLE
+        # Check ack_future FIRST: when both futures resolve in the same
+        # event-loop tick a valid ACK must take precedence over ws_closed.
+        if ack_future in done:
+            try:
+                ack_result = ack_future.result()
+            except asyncio.CancelledError:
+                return AckStatus.WS_CLOSED, Reply.NET_UNREACHABLE
+            if ack_result == AckStatus.OK:
+                return None, Reply.SUCCESS
+            return ack_result, Reply.HOST_UNREACHABLE
 
-        ack_result = ack_future.result()
-        if ack_result == AckStatus.OK:
-            return None, Reply.SUCCESS
-
-        return ack_result, Reply.HOST_UNREACHABLE
+        return AckStatus.WS_CLOSED, Reply.NET_UNREACHABLE
 
     async def _teardown_failed_connection(
         self,
         conn_id: str,
         handler: TcpConnection,
     ) -> None:
-        """Tear down a handler that never reached the RUNNING state."""
+        """Tear down a handler that never reached the running state.
+
+        Args:
+            conn_id: Connection ID for log context.
+            handler: The :class:`~exectunnel.transport.TcpConnection` to tear down.
+        """
         if not handler.is_started:
             try:
                 await handler.close_unstarted()
@@ -524,13 +639,16 @@ class RequestDispatcher:
 
     # ── UDP ASSOCIATE ─────────────────────────────────────────────────────────
 
-    async def _handle_udp_associate(self, req: Socks5Request) -> None:
-        """Handle a SOCKS5 UDP_ASSOCIATE request."""
+    async def _handle_udp_associate(self, req: TCPRelay) -> None:
+        """Handle a SOCKS5 UDP_ASSOCIATE request.
+
+        Args:
+            req: Completed SOCKS5 handshake with UDP_ASSOCIATE command.
+        """
         async with req:
             if req.udp_relay is None:
                 logger.error(
-                    "UDP ASSOCIATE request has no relay — this is a bug in "
-                    "_negotiate()",
+                    "UDP ASSOCIATE request has no relay — this is a bug in _negotiate()"
                 )
                 if not req.replied:
                     await req.send_reply_error(Reply.GENERAL_FAILURE)
@@ -538,169 +656,247 @@ class RequestDispatcher:
 
             relay = req.udp_relay
 
-            await req.send_reply_success(
-                bind_host="127.0.0.1",
-                bind_port=relay.local_port,
-            )
+            try:
+                await req.send_reply_success(
+                    bind_host="127.0.0.1",
+                    bind_port=relay.local_port,
+                )
+            except OSError as exc:
+                logger.debug(
+                    "UDP ASSOCIATE: SOCKS5 client closed before reply: %s", exc
+                )
+                relay.close()
+                return
+
             logger.debug("UDP ASSOCIATE local port %d", relay.local_port)
 
             # Maps (dst_host, dst_port) → (UdpFlow, resolved_src_ip).
             active_flows: dict[tuple[str, int], tuple[UdpFlow, str]] = {}
             drain_tasks: set[asyncio.Task[None]] = set()
 
-            async def _drain_flow(
-                flow_handler: UdpFlow,
-                src_ip: str,
-                dst_port: int,
-                flow_key: tuple[str, int],
-            ) -> None:
-                """Drain inbound datagrams from a UdpFlow to the relay client."""
+            await self._run_udp_pump(relay, req, active_flows, drain_tasks)
+
+    async def _drain_udp_flow(
+        self,
+        flow_handler: UdpFlow,
+        relay: UDPRelay,
+        src_ip: str,
+        dst_port: int,
+        flow_key: tuple[str, int],
+        active_flows: dict[tuple[str, int], tuple[UdpFlow, str]],
+    ) -> None:
+        """Drain inbound datagrams from a :class:`~exectunnel.transport.UdpFlow` to the relay client.
+
+        Args:
+            flow_handler: The UDP flow to drain.
+            relay:        The SOCKS5 UDP relay to forward responses to.
+            src_ip:       Source IP to report to the relay client.
+            dst_port:     Destination port for the relay client header.
+            flow_key:     Key to remove from *active_flows* on exit.
+            active_flows: Shared mapping of active flows for this session.
+        """
+        try:
+            while (data := await flow_handler.recv_datagram()) is not None:
+                relay.send_to_client(data, src_ip, dst_port)
+        except OSError:
+            metrics_inc("udp.drain.error", error="os_error")
+        except (TransportError, ExecTunnelError) as exc:
+            err = getattr(exc, "error_code", type(exc).__name__).replace(".", "_")
+            metrics_inc("udp.drain.error", error=err)
+            logger.debug(
+                "udp drain flow=%s [%s]: %s",
+                flow_handler.flow_id,
+                err,
+                exc,
+            )
+        except asyncio.CancelledError:
+            raise
+        finally:
+            active_flows.pop(flow_key, None)
+            with contextlib.suppress(ExecTunnelError, OSError):
+                await flow_handler.close()
+
+    async def _run_udp_pump(
+        self,
+        relay: UDPRelay,
+        req: TCPRelay,
+        active_flows: dict[tuple[str, int], tuple[UdpFlow, str]],
+        drain_tasks: set[asyncio.Task[None]],
+    ) -> None:
+        """Read datagrams from the SOCKS5 relay and forward via tunnel.
+
+        Args:
+            relay:        The SOCKS5 UDP relay to read from.
+            req:          The originating TCP relay (used for EOF detection).
+            active_flows: Shared mapping of active flows for this session.
+            drain_tasks:  Set of active drain tasks for cleanup.
+        """
+        try:
+            while True:
                 try:
-                    while (data := await flow_handler.recv_datagram()) is not None:
-                        relay.send_to_client(data, src_ip, dst_port)
-                except OSError:
-                    metrics_inc("udp.drain.error", error="os_error")
-                except (TransportError, ExecTunnelError) as exc:
-                    err = getattr(
-                        exc,
-                        "error_code",
-                        type(exc).__name__,
-                    ).replace(".", "_")
-                    metrics_inc("udp.drain.error", error=err)
-                    logger.debug(
-                        "udp drain flow=%s [%s]: %s",
+                    async with asyncio.timeout(self._tun.udp_pump_poll_timeout):
+                        result = await relay.recv()
+                except TimeoutError:
+                    if req.reader.at_eof():
+                        break
+                    continue
+
+                if result is None:
+                    break
+
+                payload, dst_host, dst_port = result
+
+                if is_host_excluded(dst_host, self._tun.exclude):
+                    await _direct_udp_relay(
+                        relay,
+                        payload,
+                        dst_host,
+                        dst_port,
+                        recv_timeout=self._tun.udp_direct_recv_timeout,
+                    )
+                    continue
+
+                key = (dst_host, dst_port)
+                flow_entry = active_flows.get(key)
+
+                if flow_entry is None:
+                    flow_handler, src_ip = await self._open_udp_flow(
+                        dst_host, dst_port, key, active_flows, drain_tasks, relay
+                    )
+                    if flow_handler is None:
+                        continue
+                else:
+                    flow_handler, src_ip = flow_entry
+
+                try:
+                    await flow_handler.send_datagram(payload)
+                except (
+                    WebSocketSendTimeoutError,
+                    ConnectionClosedError,
+                    TransportError,
+                ) as exc:
+                    err = getattr(exc, "error_code", type(exc).__name__).replace(
+                        ".", "_"
+                    )
+                    metrics_inc("udp.datagram.send.error", error=err)
+                    logger.warning(
+                        "udp flow %s send error [%s] — datagram dropped",
                         flow_handler.flow_id,
                         err,
-                        exc,
                     )
-                except asyncio.CancelledError:
-                    raise
-                finally:
-                    active_flows.pop(flow_key, None)
-                    metrics_gauge_dec("session.active.udp_flows")
 
-            async def _pump_inbound() -> None:
-                """Read datagrams from the SOCKS5 relay and forward via tunnel."""
-                while True:
-                    try:
-                        async with asyncio.timeout(
-                            self._tun.udp_pump_poll_timeout,
-                        ):
-                            result = await relay.recv()
-                    except TimeoutError:
-                        if req.reader.at_eof():
-                            break
-                        continue
+        finally:
+            for entry in list(active_flows.values()):
+                h, _ = entry
+                with contextlib.suppress(
+                    WebSocketSendTimeoutError,
+                    TransportError,
+                    ExecTunnelError,
+                    OSError,
+                ):
+                    await h.close()
+            for task in list(drain_tasks):
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            relay.close()
 
-                    if result is None:
-                        break
+    async def _open_udp_flow(
+        self,
+        dst_host: str,
+        dst_port: int,
+        key: tuple[str, int],
+        active_flows: dict[tuple[str, int], tuple[UdpFlow, str]],
+        drain_tasks: set[asyncio.Task[None]],
+        relay: UDPRelay,
+    ) -> tuple[UdpFlow | None, str]:
+        """Open a new :class:`~exectunnel.transport.UdpFlow` for a UDP destination.
 
-                    payload, dst_host, dst_port = result
+        Enforces the per-session active-flows cap by evicting the oldest flow
+        when the cap is reached.
 
-                    if is_host_excluded(dst_host, self._tun.exclude):
-                        await _direct_udp_relay(
-                            relay,
-                            payload,
-                            dst_host,
-                            dst_port,
-                            recv_timeout=self._tun.udp_direct_recv_timeout,
-                        )
-                        continue
+        Args:
+            dst_host:     Destination hostname or IP.
+            dst_port:     Destination UDP port.
+            key:          ``(dst_host, dst_port)`` tuple used as the flow key.
+            active_flows: Shared mapping of active flows for this session.
+            drain_tasks:  Set of active drain tasks for cleanup.
+            relay:        The SOCKS5 UDP relay (used for drain task creation).
 
-                    key = (dst_host, dst_port)
-                    flow_entry = active_flows.get(key)
+        Returns:
+            A ``(flow_handler, src_ip)`` tuple on success, or ``(None, "")``
+            if the flow could not be opened.
+        """
+        # Enforce a per-session cap on concurrent UDP flows by evicting the
+        # oldest flow (insertion order) when at the cap.
+        if len(active_flows) >= UDP_ACTIVE_FLOWS_CAP:
+            oldest_key = next(iter(active_flows))
+            oldest_handler, _oldest_src = active_flows.pop(oldest_key)
+            metrics_inc("udp.flow.evicted_over_cap")
+            logger.info(
+                "udp flows at cap=%d — evicting oldest %s:%d",
+                UDP_ACTIVE_FLOWS_CAP,
+                oldest_key[0],
+                oldest_key[1],
+            )
+            with contextlib.suppress(
+                WebSocketSendTimeoutError,
+                TransportError,
+                ExecTunnelError,
+                OSError,
+            ):
+                await oldest_handler.close()
 
-                    if flow_entry is None:
-                        try:
-                            src_ip = _require_ip_literal(dst_host)
-                        except ValueError:
-                            logger.debug(
-                                "udp flow %s:%d — dst_host is a domain name; "
-                                "send_to_client will drop responses silently",
-                                dst_host,
-                                dst_port,
-                            )
-                            src_ip = dst_host
+        try:
+            src_ip = _require_ip_literal(dst_host)
+        except ValueError:
+            logger.debug(
+                "udp flow %s:%d — dst_host is a domain name; "
+                "send_to_client will drop responses silently",
+                dst_host,
+                dst_port,
+            )
+            src_ip = dst_host
 
-                        flow_id = new_flow_id()
-                        flow_handler = UdpFlow(
-                            flow_id,
-                            dst_host,
-                            dst_port,
-                            self._ws_send,
-                            self._udp_registry,
-                        )
-                        self._udp_registry[flow_id] = flow_handler
-                        metrics_gauge_inc("session.active.udp_flows")
-                        try:
-                            await flow_handler.open()
-                        except (
-                            WebSocketSendTimeoutError,
-                            ConnectionClosedError,
-                            TransportError,
-                            ExecTunnelError,
-                        ) as exc:
-                            err = getattr(
-                                exc,
-                                "error_code",
-                                type(exc).__name__,
-                            ).replace(".", "_")
-                            metrics_inc("udp.flow.open.error", error=err)
-                            logger.warning(
-                                "udp flow %s open error [%s] — dropping datagram",
-                                flow_id,
-                                err,
-                            )
-                            flow_handler.on_remote_closed()
-                            metrics_gauge_dec("session.active.udp_flows")
-                            continue
+        flow_id = new_flow_id()
+        flow_handler = UdpFlow(
+            flow_id,
+            dst_host,
+            dst_port,
+            self._ws_send,
+            self._udp_registry,
+        )
+        self._udp_registry[flow_id] = flow_handler
+        metrics_gauge_inc("session.active.udp_flows")
+        try:
+            await flow_handler.open()
+        except (
+            WebSocketSendTimeoutError,
+            ConnectionClosedError,
+            TransportError,
+            ExecTunnelError,
+        ) as exc:
+            err = getattr(exc, "error_code", type(exc).__name__).replace(".", "_")
+            metrics_inc("udp.flow.open.error", error=err)
+            logger.warning(
+                "udp flow %s open error [%s] — dropping datagram",
+                flow_id,
+                err,
+            )
+            with contextlib.suppress(ExecTunnelError, OSError):
+                await flow_handler.close()
+            return None, ""
 
-                        active_flows[key] = (flow_handler, src_ip)
-                        task = asyncio.create_task(
-                            _drain_flow(flow_handler, src_ip, dst_port, key),
-                            name=f"udp-drain-{flow_id}",
-                        )
-                        drain_tasks.add(task)
-                        task.add_done_callback(drain_tasks.discard)
-                    else:
-                        flow_handler, src_ip = flow_entry
-
-                    try:
-                        await flow_handler.send_datagram(payload)
-                    except (
-                        WebSocketSendTimeoutError,
-                        ConnectionClosedError,
-                        TransportError,
-                    ) as exc:
-                        err = getattr(
-                            exc,
-                            "error_code",
-                            type(exc).__name__,
-                        ).replace(".", "_")
-                        metrics_inc("udp.datagram.send.error", error=err)
-                        logger.warning(
-                            "udp flow %s send error [%s] — datagram dropped",
-                            flow_handler.flow_id,
-                            err,
-                        )
-
-            try:
-                await _pump_inbound()
-            finally:
-                for entry in list(active_flows.values()):
-                    h, _ = entry
-                    with contextlib.suppress(
-                        WebSocketSendTimeoutError,
-                        TransportError,
-                        ExecTunnelError,
-                        OSError,
-                    ):
-                        await h.close()
-                for task in list(drain_tasks):
-                    task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await task
-                relay.close()
+        active_flows[key] = (flow_handler, src_ip)
+        task = asyncio.create_task(
+            self._drain_udp_flow(
+                flow_handler, relay, src_ip, dst_port, key, active_flows
+            ),
+            name=f"udp-drain-{flow_id}",
+        )
+        drain_tasks.add(task)
+        task.add_done_callback(drain_tasks.discard)
+        return flow_handler, src_ip
 
     # ── ACK failure tracking ──────────────────────────────────────────────────
 
@@ -712,7 +908,14 @@ class RequestDispatcher:
         host: str = "",
         port: int = 0,
     ) -> None:
-        """Record an ACK failure and trigger reconnect if threshold exceeded."""
+        """Record an ACK failure and trigger reconnect if the threshold is exceeded.
+
+        Args:
+            conn_id: Connection ID for metrics tags.
+            reason:  The failure reason.
+            host:    Destination host for metrics tags.
+            port:    Destination port for metrics tags.
+        """
         self._ack_failure_count += 1
         metrics_inc(
             "tunnel.conn_ack.failed",
@@ -806,17 +1009,37 @@ class RequestDispatcher:
 
     # ── Connection hardening helpers ──────────────────────────────────────────
 
-    def _get_host_semaphore(self, host: str) -> asyncio.Semaphore:
-        """Return (or create) the per-host concurrency semaphore."""
+    def _acquire_host_gate(self, host: str) -> tuple[str, _HostGate]:
+        """Ref-count and return the per-host concurrency gate.
+
+        The caller **must** pair this with :meth:`_release_host_gate` in a
+        ``try/finally`` to guarantee refcount balance even on cancellation.
+
+        Args:
+            host: Destination hostname or IP.
+
+        Returns:
+            A ``(host_key, gate)`` tuple where *host_key* is the normalised
+            host string and *gate* is the pinned :class:`_HostGate`.
+        """
         key = _normalise_host_key(host)
-        gate = self._host_semaphores.get(key)
-        if gate is None:
-            gate = asyncio.Semaphore(self._tun.connect_max_pending_per_host)
-            self._host_semaphores[key] = gate
-        return gate
+        gate = self._host_semaphores.acquire_gate(key)
+        return key, gate
+
+    def _release_host_gate(self, key: str) -> None:
+        """Release the per-host gate reference acquired by :meth:`_acquire_host_gate`.
+
+        Args:
+            key: Normalised host key returned by :meth:`_acquire_host_gate`.
+        """
+        self._host_semaphores.release_gate(key)
 
     async def _pace_connection(self, host_key: str) -> None:
-        """Enforce per-host connection pacing with jitter."""
+        """Enforce per-host connection pacing with jitter.
+
+        Args:
+            host_key: Normalised host key from :func:`_normalise_host_key`.
+        """
         interval = self._tun.connect_pace_interval_secs
         if interval <= 0:
             return
@@ -838,7 +1061,7 @@ class RequestDispatcher:
                                 Defaults.CONNECT_PACE_JITTER_CAP_SECS,
                                 interval / 2.0,
                             ),
-                        ),
+                        )
                     )
             self._host_connect_last_open_at[host_key] = (
                 asyncio.get_running_loop().time()
@@ -847,8 +1070,7 @@ class RequestDispatcher:
     def _emit_pending_gauge(self) -> None:
         """Emit the current pending-connect count as a gauge metric."""
         metrics_gauge_set(
-            "session.pending_connects",
-            float(len(self._pending_connects)),
+            "session.pending_connects", float(len(self._pending_connects))
         )
 
     def _record_connect_failure(
@@ -857,7 +1079,13 @@ class RequestDispatcher:
         reason: AckStatus,
         reply: Reply,
     ) -> None:
-        """Increment per-host failure counter and emit metrics."""
+        """Increment the per-host failure counter and emit metrics.
+
+        Args:
+            host:   Destination hostname or IP.
+            reason: The failure reason.
+            reply:  The SOCKS5 reply code sent to the client.
+        """
         host_key = _normalise_host_key(host)
         self._connect_failures_by_host[host_key] = (
             self._connect_failures_by_host.get(host_key, 0) + 1
@@ -868,8 +1096,6 @@ class RequestDispatcher:
             reason=reason.value,
         )
         metrics_inc("socks.reply", code=int(reply))
-
-    # ── Debug ─────────────────────────────────────────────────────────────────
 
     def __repr__(self) -> str:
         return (
@@ -886,7 +1112,14 @@ class RequestDispatcher:
 
 
 def _normalise_host_key(host: str) -> str:
-    """Normalise a host string for use as a dict / metrics key."""
+    """Normalise a host string for use as a dict or metrics key.
+
+    Args:
+        host: An IPv4/IPv6 address string or domain name.
+
+    Returns:
+        Compressed IP notation for addresses, or lowercased and stripped domain.
+    """
     try:
         return ipaddress.ip_address(host).compressed
     except ValueError:
@@ -894,8 +1127,18 @@ def _normalise_host_key(host: str) -> str:
 
 
 def _require_ip_literal(host: str) -> str:
-    """Return *host* unchanged if it is an IP literal, else raise ValueError."""
-    ipaddress.ip_address(host)  # raises ValueError for non-IP
+    """Return *host* unchanged if it is an IP literal, else raise ``ValueError``.
+
+    Args:
+        host: String to validate as an IP address.
+
+    Returns:
+        The original *host* string.
+
+    Raises:
+        ValueError: If *host* is not a valid IP address.
+    """
+    ipaddress.ip_address(host)
     return host
 
 
@@ -908,8 +1151,13 @@ async def _pipe(
     """Bidirectional byte copy for directly-connected (excluded) hosts.
 
     Uses :class:`asyncio.TaskGroup` for half-close semantics: when one
-    direction hits EOF and returns normally, the other continues until it
-    also finishes.
+    direction hits EOF the other continues until it also finishes.
+
+    Args:
+        client_reader: Stream from the local SOCKS5 client.
+        client_writer: Stream to the local SOCKS5 client.
+        remote_reader: Stream from the remote host.
+        remote_writer: Stream to the remote host.
     """
 
     async def copy(
@@ -930,9 +1178,6 @@ async def _pipe(
         except OSError:
             metrics_inc("pipe.copy.os_error")
         except Exception:
-            # Defensive: catch non-OSError exceptions (e.g. RuntimeError from
-            # drain() on a closing transport) to prevent TaskGroup from
-            # wrapping them in an ExceptionGroup.
             metrics_inc("pipe.copy.unexpected_error")
             logger.debug("pipe copy unexpected error", exc_info=True)
 
@@ -945,12 +1190,12 @@ async def _pipe(
             with contextlib.suppress(OSError, RuntimeError):
                 writer.close()
             with contextlib.suppress(OSError, RuntimeError, asyncio.TimeoutError):
-                async with asyncio.timeout(_PIPE_WRITER_CLOSE_TIMEOUT_SECS):
+                async with asyncio.timeout(PIPE_WRITER_CLOSE_TIMEOUT_SECS):
                     await writer.wait_closed()
 
 
 async def _direct_udp_relay(
-    relay: UdpRelay,
+    relay: UDPRelay,
     payload: bytes,
     dst_host: str,
     dst_port: int,
@@ -958,11 +1203,17 @@ async def _direct_udp_relay(
 ) -> None:
     """Send a single UDP datagram directly (excluded host) and relay the response.
 
-    ``dst_host`` is guaranteed to be an IP literal here — ``is_host_excluded``
+    ``dst_host`` is guaranteed to be an IP literal — :func:`~exectunnel.session._routing.is_host_excluded`
     only returns ``True`` for IP addresses, never for domain names.
 
-    .. note::
-        Only the **first** response datagram is relayed back to the client.
+    Only the first response datagram is relayed back to the client.
+
+    Args:
+        relay:        The SOCKS5 UDP relay to send the response to.
+        payload:      The UDP datagram payload to forward.
+        dst_host:     Destination IP address (guaranteed IP literal).
+        dst_port:     Destination UDP port.
+        recv_timeout: Seconds to wait for a response before giving up.
     """
     try:
         ipaddress.ip_address(dst_host)
@@ -981,7 +1232,7 @@ async def _direct_udp_relay(
         await loop.sock_sendall(sock, payload)
         try:
             async with asyncio.timeout(recv_timeout):
-                response = await loop.sock_recv(sock, 65_535)
+                response = await loop.sock_recv(sock, UDP_MAX_DATAGRAM_SIZE)
             relay.send_to_client(response, dst_host, dst_port)
         except TimeoutError:
             pass
