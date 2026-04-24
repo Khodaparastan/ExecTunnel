@@ -179,7 +179,7 @@ class Defaults:
     # Default fetch raw URL used to fetch the agent when bootstrap_delivery="fetch".
     # Points to the main branch of the canonical repository.  Override via
     # EXECTUNNEL_FETCH_AGENT_URL to pin a specific commit or use a fork.
-    BOOTSTRAP_FETCH_AGENT_URL: str = "https://raw.githubusercontent.com/Khodaparastan/ExecTunnel/refs/heads/main/exectunnel/payload/agent.py"
+    BOOTSTRAP_FETCH_AGENT_URL: str = "https://raw.githubusercontent.com/Khodaparastan/ExecTunnel/refs/heads/develop/exectunnel/payload/agent.py"
 
     # Maximum time to wait for the curl/wget fetch to complete before proceeding.
     # The bootstrapper polls for file existence every BOOTSTRAP_FETCH_FETCH_POLL_SECS
@@ -219,7 +219,7 @@ class Defaults:
     # Worst-case memory: 32 × 8,192 B ≈ 256 KiB per flow.
     UDP_INBOUND_QUEUE_CAP: int = 32
 
-    # asyncio.Queue capacity for parsed (payload, host, port) tuples in UdpRelay.
+    # asyncio.Queue capacity for parsed (payload, host, port) tuples in UDPRelay.
     # The consumer (UDP ASSOCIATE handler) is blocked on tunnel I/O (50–500 ms).
     # At 100 datagrams/s and 500 ms RTT, steady-state depth ≈ 50 items.
     # 64 provides headroom above the 50-item steady-state for QUIC bursts.
