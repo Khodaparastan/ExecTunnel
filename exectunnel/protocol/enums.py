@@ -1,12 +1,12 @@
 """SOCKS5 protocol enumerations (RFC 1928 / RFC 1929).
 
-All enums except ``UserPassStatus`` inherit from ``_StrictIntEnum``, which
-raises an informative ``ValueError`` on unknown wire values rather than
-silently returning ``None``.  This surfaces protocol violations at the
-earliest possible point — the moment the byte is read off the wire.
+All enums except :class:`UserPassStatus` inherit from
+``_StrictIntEnum``, which raises :exc:`ValueError` on unknown wire values
+at the earliest possible point — the moment the byte is read off the wire.
 
-``UserPassStatus`` uses a custom ``_missing_`` that maps any non-zero byte
-to ``FAILURE`` per RFC 1929 §2, so it cannot share the strict base.
+:class:`UserPassStatus` uses a permissive ``_missing_`` that maps any
+non-zero byte to :attr:`UserPassStatus.FAILURE` per RFC 1929 §2, so it
+cannot share the strict base.
 """
 
 from __future__ import annotations
@@ -22,40 +22,38 @@ __all__ = [
     "UserPassStatus",
 ]
 
+# ── Internal range constants for RFC 1929 §2 permissive mapping ───────────────
 
-# ── Base mixin ────────────────────────────────────────────────────────────────
+_USERPASS_FAILURE_MIN: Final[int] = 0x01
+_USERPASS_FAILURE_MAX: Final[int] = 0xFE
 
 
 class _StrictIntEnum(IntEnum):
-    """``IntEnum`` that raises ``ValueError`` immediately on unknown wire values.
+    """``IntEnum`` that raises :exc:`ValueError` on unknown wire values.
 
-    Subclasses inherit this ``_missing_`` automatically.  Do **not** override
-    ``_missing_`` in a subclass unless the RFC explicitly requires a different
-    mapping for unknown values (see ``UserPassStatus`` for the one exception).
+    Subclasses inherit this behaviour automatically. Do not override
+    ``_missing_`` unless the RFC explicitly requires a different mapping —
+    :class:`UserPassStatus` is the sole exception in this package.
     """
 
     @classmethod
-    def _missing_(cls, value: object) -> Never:
+    def _missing_(cls, value: object) -> Never:  # type: ignore[override]
         raise ValueError(
             f"{value!r} is not a valid {cls.__name__} "
             f"(expected one of {[m.value for m in cls]})"
         )
 
 
-# ── Enumerations ──────────────────────────────────────────────────────────────
-
-
 class AuthMethod(_StrictIntEnum):
     """SOCKS5 authentication method codes (RFC 1928 §3).
 
-    Note:
-        ``GSSAPI`` and ``USERNAME_PASSWORD`` are defined for wire-format
-        completeness only.  This tunnel implementation accepts **only**
-        ``NO_AUTH``; peers advertising only unsupported methods will receive
-        ``NO_ACCEPT``.
+    Only :attr:`NO_AUTH` is negotiated by this tunnel. :attr:`GSSAPI` and
+    :attr:`USERNAME_PASSWORD` are defined for wire-format completeness.
+    :attr:`NO_ACCEPT` is the server-side rejection sentinel returned when
+    no proposed method is acceptable — it is **not** a negotiable method.
 
-    Use :meth:`is_supported` to programmatically check whether a method is
-    negotiated by this tunnel before attempting negotiation.
+    Use :meth:`is_supported` to check whether a method is accepted before
+    attempting negotiation.
     """
 
     NO_AUTH = 0x00
@@ -64,11 +62,12 @@ class AuthMethod(_StrictIntEnum):
     NO_ACCEPT = 0xFF
 
     def is_supported(self) -> bool:
-        """Return ``True`` if this method is negotiated by this tunnel.
+        """Check whether this method is negotiated by this tunnel.
 
-        Only ``NO_AUTH`` is negotiated.  ``GSSAPI`` and ``USERNAME_PASSWORD``
-        are defined for wire-format completeness only and are **not** accepted
-        by the server.  Callers should check this before attempting negotiation.
+        Returns:
+            ``True`` for :attr:`NO_AUTH` only. :attr:`GSSAPI`,
+            :attr:`USERNAME_PASSWORD`, and :attr:`NO_ACCEPT` all return
+            ``False``.
         """
         return self not in _AUTH_METHOD_UNSUPPORTED
 
@@ -76,19 +75,18 @@ class AuthMethod(_StrictIntEnum):
 _AUTH_METHOD_UNSUPPORTED: Final[frozenset[AuthMethod]] = frozenset({
     AuthMethod.GSSAPI,
     AuthMethod.USERNAME_PASSWORD,
+    AuthMethod.NO_ACCEPT,
 })
 
 
 class Cmd(_StrictIntEnum):
     """SOCKS5 command codes (RFC 1928 §4).
 
-    Note:
-        ``BIND`` is defined for wire-format completeness only.
-        This tunnel implementation does **not** support the BIND command;
-        clients requesting BIND will receive a ``CMD_NOT_SUPPORTED`` reply.
+    :attr:`BIND` is defined for wire-format completeness only. Clients
+    requesting :attr:`BIND` receive a ``CMD_NOT_SUPPORTED`` reply.
 
-    Use :meth:`is_supported` to programmatically check whether a command is
-    implemented before dispatching.
+    Use :meth:`is_supported` to check whether a command is implemented
+    before dispatching.
     """
 
     CONNECT = 0x01
@@ -96,10 +94,11 @@ class Cmd(_StrictIntEnum):
     UDP_ASSOCIATE = 0x03
 
     def is_supported(self) -> bool:
-        """Return ``True`` if this command is implemented by this tunnel.
+        """Check whether this command is implemented by this tunnel.
 
-        ``BIND`` is defined for wire-format completeness only and is **not**
-        supported.  Callers should check this before dispatching.
+        Returns:
+            ``True`` for :attr:`CONNECT` and :attr:`UDP_ASSOCIATE`.
+            :attr:`BIND` returns ``False``.
         """
         return self not in _CMD_UNSUPPORTED
 
@@ -132,10 +131,9 @@ class Reply(_StrictIntEnum):
 class UserPassStatus(IntEnum):
     """RFC 1929 §2 username/password sub-negotiation reply codes.
 
-    Inherits directly from ``IntEnum`` rather than ``_StrictIntEnum`` because
-    RFC 1929 §2 requires that any non-zero status byte be treated as failure,
-    not rejected.  This is the only enum in this module with a permissive
-    ``_missing_``.
+    Inherits from plain :class:`IntEnum` rather than ``_StrictIntEnum``
+    because RFC 1929 §2 requires any non-zero status byte to be treated as
+    failure, not rejected outright.
     """
 
     SUCCESS = 0x00
@@ -143,10 +141,12 @@ class UserPassStatus(IntEnum):
 
     @classmethod
     def _missing_(cls, value: object) -> UserPassStatus:
-        # RFC 1929 §2: any non-zero value means failure.
-        if isinstance(value, int) and 0x01 <= value <= 0xFE:
+        if (
+            isinstance(value, int)
+            and _USERPASS_FAILURE_MIN <= value <= _USERPASS_FAILURE_MAX
+        ):
             return cls.FAILURE
         raise ValueError(
             f"{value!r} is not a valid {cls.__name__} "
-            f"(expected 0x00 for success or any non-zero byte for failure)"
+            "(expected 0x00 for success or any non-zero byte for failure)"
         )
