@@ -99,6 +99,21 @@ import time
 from collections import deque
 from collections.abc import Callable
 from datetime import UTC, datetime
+from typing import Protocol
+
+
+class _WritableStream(Protocol):
+    """Minimal protocol for the object wrapped by :class:`_FaultTolerantStdout`.
+
+    Only the two methods actually invoked by the writer are declared, keeping
+    the surface area small and the static type-checker happy without forcing
+    a concrete ``TextIO`` dependency (``sys.stdout`` is reassignable in tests).
+    """
+
+    def write(self, s: str, /) -> int: ...
+
+    def flush(self) -> None: ...
+
 
 _FRAME_PREFIX: str = "<<<EXECTUNNEL:"
 _FRAME_SUFFIX: str = ">>>"
@@ -158,7 +173,7 @@ _TCP_RECV_CHUNK_BYTES: int = 4_096
 
 # Maximum UDP datagram size (theoretical IPv4/IPv6 maximum).
 _MAX_UDP_DGRAM_BYTES: int = 65_535
-_MAX_PORT: int = 65_535
+_MAX_TCP_UDP_PORT: int = 65_535
 
 # Log a UDP drop warning every N drops.
 _UDP_DROP_WARN_EVERY: int = 1_000
@@ -228,7 +243,16 @@ _STATS_ENABLED: bool = os.getenv("EXECTUNNEL_AGENT_STATS_ENABLED", "1") != "0"
 
 
 def _record_dispatch_sample(seconds: float) -> None:
-    """Append one dispatch-latency sample (bounded, thread-safe)."""
+    """Record one dispatch latency observation for the stats sampler.
+
+    Samples are stored in a bounded :class:`collections.deque` and protected
+    by a lock so concurrent dispatches and the sampler thread see consistent
+    snapshots. When the deque is full the oldest sample is discarded.
+
+    Args:
+        seconds: Wall-clock duration spent inside
+            :meth:`_Dispatcher._dispatch_inner` for a single frame.
+    """
     with _DISPATCH_SAMPLES_LOCK:
         _DISPATCH_SAMPLES.append(seconds)
 
@@ -274,6 +298,26 @@ class _DnsCache:
         *,
         socktype: int = 0,
     ) -> list[tuple]:
+        """Return cached :func:`socket.getaddrinfo` results for ``(host, port, socktype)``.
+
+        On cache miss exactly one caller performs the real lookup while
+        concurrent callers wait on a per-key lock, avoiding a thundering
+        herd of parallel ``getaddrinfo`` syscalls for the same destination.
+
+        Args:
+            host: Hostname or literal IP address.
+            port: Destination port number.
+            socktype: Socket type filter passed through to
+                :func:`socket.getaddrinfo` (``0`` means "any").
+
+        Returns:
+            A list of ``(family, type, proto, canonname, sockaddr)`` tuples
+            exactly as returned by :func:`socket.getaddrinfo`.
+
+        Raises:
+            socket.gaierror: Propagated from the underlying lookup when
+                resolution fails.
+        """
         key = (host, port, socktype)
 
         with self._mu:
@@ -307,7 +351,27 @@ def _create_connection_cached(
     port: int,
     timeout: float,
 ) -> socket.socket:
-    """Like ``socket.create_connection`` but uses the shared DNS cache."""
+    """Open a TCP connection to ``host:port`` using *dns_cache* for resolution.
+
+    Functionally equivalent to :func:`socket.create_connection` but with two
+    differences: address resolution is served from :class:`_DnsCache` so
+    repeated opens for the same target avoid redundant ``getaddrinfo``
+    syscalls, and each candidate address is tried in turn with the supplied
+    *timeout* applied per attempt.
+
+    Args:
+        dns_cache: Shared DNS cache used for the initial ``getaddrinfo``.
+        host: Destination hostname or literal IP address.
+        port: Destination port number.
+        timeout: Per-attempt connect timeout in seconds.
+
+    Returns:
+        A connected, blocking :class:`socket.socket` instance.
+
+    Raises:
+        OSError: When resolution yields no candidates or every candidate
+            fails to connect — the last underlying error is chained.
+    """
     infos = dns_cache.getaddrinfo(host, port, socktype=socket.SOCK_STREAM)
     if not infos:
         raise OSError(f"getaddrinfo returned no results for {host!r}:{port}")
@@ -328,12 +392,39 @@ def _create_connection_cached(
 
 
 def _install_sigpipe_handler() -> None:
+    """Ignore ``SIGPIPE`` so writes to a closed stdout do not kill the process.
+
+    The agent's stdout is the kubectl-exec channel; when the client tears it
+    down the kernel would otherwise deliver ``SIGPIPE`` mid-write and abort
+    the process before the fault-tolerant stdout wrapper has a chance to
+    observe the ``EPIPE`` at the Python layer.
+
+    Failures to install the handler (unusual signal environments, restricted
+    sandboxes) are silently tolerated.
+    """
     with contextlib.suppress(OSError, ValueError):
         signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
 
 def _install_termination_handlers() -> None:
+    """Install ``SIGTERM`` / ``SIGINT`` handlers for prompt, ordered shutdown.
+
+    The handler sets the module-level ``_TERMINATE`` flag and closes the
+    stdin file descriptor, which unblocks the stdin-reader loop stuck inside
+    a C-level ``read()`` call and lets :func:`main` proceed to ordered
+    teardown (dispatcher → stats sampler → writer).
+
+    Handler installation failures are silently ignored to keep the agent
+    usable in restricted environments where signal setup is disallowed.
+    """
+
     def _handle(_signum: int, _frame: object | None) -> None:
+        """Signal handler: request termination and unblock the stdin reader.
+
+        Args:
+            _signum: Signal number (unused).
+            _frame: Current stack frame at interruption (unused).
+        """
         global _TERMINATE  # noqa: PLW0603
         _TERMINATE = True
         # The stdin reader loop iterates ``for raw_line in sys.stdin`` which
@@ -353,24 +444,60 @@ def _install_termination_handlers() -> None:
 
 
 class _FaultTolerantStdout:
+    """Write wrapper that latches into a "dead" state on the first ``OSError``.
+
+    Protects the writer thread from the C-level ``"socket.send() raised
+    exception."`` stderr noise that CPython prints when stdout is a broken
+    pipe. Once latched dead, subsequent writes and flushes become no-ops so
+    callers observe a uniform terminal state rather than sporadic errors.
+
+    Thread-safety: backed by :class:`threading.Event` for the dead flag,
+    giving cross-thread visibility without explicit locks. Concurrent writes
+    on the wrapped stream are not serialised by this class — the agent's
+    :class:`_FrameWriter` is the sole producer.
+
+    Attributes:
+        _inner: The underlying writable stream (typically ``sys.stdout``).
+        _dead: Event set the first time a write or flush raised ``OSError``.
+    """
+
     __slots__ = ("_inner", "_dead")
 
-    def __init__(self, inner: object) -> None:
-        self._inner = inner
+    def __init__(self, inner: _WritableStream) -> None:
+        """Wrap *inner* with fault-tolerant write semantics.
+
+        Args:
+            inner: Object implementing :class:`_WritableStream` (typically
+                ``sys.stdout``) that receives the actual writes.
+        """
+        self._inner: _WritableStream = inner
         # ``threading.Event`` rather than plain bool — gives cross-thread
         # ordering guarantees (and a cheap wait primitive if ever needed).
         self._dead = threading.Event()
 
     def write(self, s: str) -> int:
+        """Write *s* to the wrapped stream or become dead on first ``OSError``.
+
+        Args:
+            s: String to write; must already include any required newline.
+
+        Returns:
+            Number of characters written as reported by the underlying
+            stream, or ``0`` when the wrapper is (or has just become) dead.
+        """
         if self._dead.is_set():
             return 0
         try:
-            return self._inner.write(s)  # type: ignore[union-attr]
+            return self._inner.write(s)
         except OSError:
             self._dead.set()
             return 0
 
     def flush(self) -> None:
+        """Flush the wrapped stream, latching dead on ``OSError``.
+
+        A no-op once the wrapper has already been marked dead.
+        """
         if self._dead.is_set():
             return
         try:
@@ -384,20 +511,44 @@ class _FaultTolerantStdout:
         return self._dead.is_set()
 
     def mark_dead(self) -> None:
-        """Force the stdout into the dead state (e.g. on hard deadline)."""
+        """Force the wrapper into the dead state.
+
+        Used by :meth:`_FrameWriter.emit_data` when the per-call hard
+        deadline elapses so that every worker blocked on the full data queue
+        observes ``is_dead`` and unwinds cleanly, even though no ``OSError``
+        has yet been raised by the underlying stream.
+        """
         self._dead.set()
 
 
 def _b64encode(data: bytes) -> str:
-    """URL-safe base64 encode with no padding."""
+    """URL-safe base64-encode *data* with trailing ``=`` padding stripped.
+
+    Mirrors the client-side ``encode_data_frame`` / ``decode_binary_payload``
+    helpers so the agent and the session layer remain byte-compatible.
+
+    Args:
+        data: Raw bytes to encode.
+
+    Returns:
+        ASCII string containing the URL-safe base64 representation of
+        *data* without any ``=`` padding characters.
+    """
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
 
 def _b64decode(s: str) -> bytes:
-    """URL-safe base64 decode — re-adds padding stripped by :func:`_b64encode`.
+    """URL-safe base64-decode *s*, re-adding padding stripped by :func:`_b64encode`.
+
+    Args:
+        s: Unpadded URL-safe base64 string produced by :func:`_b64encode`
+            or any compatible encoder.
+
+    Returns:
+        The decoded raw bytes.
 
     Raises:
-        ValueError: If *s* is not valid base64url.
+        ValueError: If *s* is not a valid URL-safe base64 string.
     """
     padding = (4 - len(s) % 4) % 4
     try:
@@ -407,7 +558,19 @@ def _b64decode(s: str) -> bytes:
 
 
 def _log(level: str, msg: str, *args: object) -> None:
-    """Write agent diagnostics to stderr without polluting the frame channel."""
+    """Write agent diagnostics to stderr without polluting the frame channel.
+
+    The stdout channel is reserved for the frame protocol; all operational
+    logging (warnings, debug traces, errors) is emitted to stderr, prefixed
+    with an ISO-8601 UTC timestamp and the severity label.
+
+    Args:
+        level: Severity name — one of ``"debug"``, ``"info"``, ``"warning"``
+            or ``"error"`` (case-insensitive). Unknown levels default to
+            ``warning`` priority.
+        msg: ``%``-style format string.
+        *args: Arguments interpolated into *msg* when non-empty.
+    """
     lvl = _LOG_LEVELS.get(level.lower(), 30)
     if lvl < _LOG_LEVEL:
         return
@@ -418,12 +581,30 @@ def _log(level: str, msg: str, *args: object) -> None:
 
 
 def _make_frame(*parts: str) -> str:
-    """Construct a frame string from its colon-separated parts."""
+    """Build a protocol frame line from its colon-separated *parts*.
+
+    Args:
+        *parts: Frame type followed by each field value, already encoded as
+            text (IDs, base64url payloads, etc.).
+
+    Returns:
+        A single string of the form ``<<<EXECTUNNEL:p1:p2:...>>>`` — ready
+        to be written to stdout followed by a newline.
+    """
     return f"{_FRAME_PREFIX}{':'.join(parts)}{_FRAME_SUFFIX}"
 
 
 def _make_error_frame(conn_id: str, reason: str) -> str:
-    """Construct an ERROR frame with a base64url-encoded reason string."""
+    """Build an ``ERROR`` frame carrying a human-readable *reason*.
+
+    Args:
+        conn_id: Connection or flow identifier the error refers to.
+        reason: Free-form explanation; encoded as UTF-8 and then base64url
+            with padding stripped to satisfy the frame grammar.
+
+    Returns:
+        A fully-formatted ``ERROR`` frame ready to be emitted.
+    """
     return _make_frame("ERROR", conn_id, _b64encode(reason.encode()))
 
 
@@ -432,7 +613,25 @@ def _parse_host_port(
     frame_id: str,
     frame_type: str,
 ) -> tuple[str, int] | None:
-    """Parse a ``[host]:port`` or ``host:port`` string into ``(host, port)``."""
+    """Parse a ``host:port`` (or bracketed ``[host]:port``) target string.
+
+    Accepts both bare-host and bracketed forms, the latter required for
+    literal IPv6 addresses. On failure the reason is logged at DEBUG level
+    with the originating frame identifier so operators can correlate malformed
+    input with its client-side emitter.
+
+    Args:
+        raw: Target field as received from the client.
+        frame_id: Connection or flow ID the raw target belongs to — used
+            only for diagnostic logging.
+        frame_type: Frame type name (e.g. ``"CONN_OPEN"``) used only for
+            diagnostic logging.
+
+    Returns:
+        A ``(host, port)`` tuple on success, or ``None`` when *raw* is
+        malformed, the port is non-numeric, or the port is outside the
+        ``1..65535`` range.
+    """
     if raw.startswith("["):
         bracket_end = raw.find("]")
         if bracket_end == -1 or raw[bracket_end + 1 : bracket_end + 2] != ":":
@@ -479,7 +678,7 @@ def _parse_host_port(
             port_str,
         )
         return None
-    if port <= 0 or port > 65_535:
+    if port <= 0 or port > _MAX_TCP_UDP_PORT:
         _log(
             "debug",
             "out-of-range %s port for %s: %d",
@@ -492,9 +691,30 @@ def _parse_host_port(
 
 
 class _FrameWriter:
+    """Serialise all frames onto stdout from a single daemon thread.
+
+    The writer owns a :class:`_FaultTolerantStdout` wrapper and two internal
+    queues:
+
+    * Control queue (unbounded :class:`queue.SimpleQueue`) for frames that
+      must not be dropped or reordered relative to their logical event
+      (``CONN_ACK``, ``CONN_CLOSE``, ``ERROR``, ``UDP_CLOSE``, ``STATS``).
+      These are always drained *before* data frames within an iteration.
+    * Data queue (bounded :class:`queue.Queue`) for ``DATA`` / ``UDP_DATA``
+      payloads. The bound is :data:`_STDOUT_DATA_QUEUE_CAP`; workers use it
+      for backpressure (see module docstring, "Backpressure model").
+
+    The writer exits cleanly when :meth:`stop` is called or when
+    :class:`_FaultTolerantStdout` latches dead after an ``OSError``.
+
+    Attributes:
+        _STOP: Sentinel object enqueued to signal "drain and exit".
+    """
+
     _STOP: object = object()
 
     def __init__(self) -> None:
+        """Create the queues and immediately start the writer daemon thread."""
         self._out = _FaultTolerantStdout(sys.stdout)
         self._ctrl: queue.SimpleQueue[str | object] = queue.SimpleQueue()
         self._data: queue.Queue[str | object] = queue.Queue(
@@ -509,24 +729,40 @@ class _FrameWriter:
         self._thread.start()
 
     def emit_ctrl(self, line: str) -> None:
-        """Enqueue a control frame — never blocks, never drops."""
+        """Enqueue a control frame; never blocks and never drops.
+
+        Control frames are written onto the unbounded control queue so that
+        protocol-critical events (``CONN_ACK`` / ``CONN_CLOSE`` / ``ERROR``
+        / ``UDP_CLOSE`` / ``STATS``) are never lost even under backpressure.
+        Calls made after :meth:`stop` or once stdout is dead are silently
+        dropped — no downstream consumer can possibly observe them.
+
+        Args:
+            line: Fully-formatted frame string without trailing newline.
+        """
         if self._stopping or self._out.is_dead:
             return
         self._ctrl.put(line)
 
     def emit_data(self, line: str) -> None:
-        """Enqueue a data frame with periodic liveness and shutdown checks.
+        """Enqueue a data frame, respecting liveness and a hard deadline.
 
-        Observes the module-level ``_TERMINATE`` flag so signal handlers can
-        unblock workers stuck on a full queue even if ``is_dead`` has not yet
-        flipped (e.g. before the first blocked write discovers the closed
-        kubectl channel).
+        Polls the bounded data queue with :data:`_EMIT_DATA_PUT_TIMEOUT_SECS`
+        per attempt so the calling worker observes shutdown signals promptly:
 
-        Applies a hard deadline (``_EMIT_DATA_HARD_DEADLINE_SECS``) after
-        which stdout is force-marked dead so this worker — and all other
-        workers blocked on a full data queue — can unblock.  Protects
-        against silently-wedged writer channels (e.g. half-dead TCP) where
-        neither an OSError nor a signal ever arrives.
+        * ``_TERMINATE`` — set by the SIGTERM/SIGINT handler.
+        * ``self._stopping`` — set by :meth:`stop`.
+        * ``self._out.is_dead`` — set once stdout has raised ``OSError``.
+
+        If none of those fire but the queue stays full for the entire
+        :data:`_EMIT_DATA_HARD_DEADLINE_SECS` window, the writer is
+        force-marked dead. This guards against a silently half-dead TCP
+        channel where no error and no signal ever arrive but the consumer
+        has stopped reading.
+
+        Args:
+            line: Fully-formatted ``DATA`` / ``UDP_DATA`` frame string
+                without trailing newline.
         """
         deadline = time.monotonic() + _EMIT_DATA_HARD_DEADLINE_SECS
         while not self._out.is_dead and not self._stopping and not _TERMINATE:
@@ -545,7 +781,12 @@ class _FrameWriter:
                 continue
 
     def stop(self) -> None:
-        """Signal the writer thread to flush remaining frames and exit."""
+        """Request an ordered shutdown of the writer thread.
+
+        Enqueues the stop sentinel on both queues so whichever loop the
+        writer is currently servicing can observe it, then joins the thread
+        with :data:`_WRITER_JOIN_TIMEOUT_SECS` as an upper bound. Idempotent.
+        """
         if self._stopping:
             return
         self._stopping = True
@@ -556,13 +797,24 @@ class _FrameWriter:
 
     @property
     def data_queue_size(self) -> int:
+        """Current depth of the bounded data queue (sampled, may race)."""
         return self._data.qsize()
 
     @property
     def is_dead(self) -> bool:
+        """``True`` once the underlying stdout wrapper has latched dead."""
         return self._out.is_dead
 
     def _run(self) -> None:
+        """Writer-thread main loop: drain control then data queues in turn.
+
+        The loop prioritises control frames — on every iteration it waits up
+        to :data:`_WRITER_CTRL_POLL_SECS` for a control item, flushes any
+        immediately-available follow-up control frames, and only then drains
+        up to :data:`_WRITER_DATA_BATCH_SIZE` data frames to keep latency
+        bounded for both classes. Exits on the stop sentinel or once stdout
+        becomes dead.
+        """
         out = self._out
         ctrl = self._ctrl
         data = self._data
@@ -625,6 +877,18 @@ class _FrameWriter:
         data: queue.Queue[str | object],
         stop: object,
     ) -> None:
+        """Best-effort flush of both queues after the stop sentinel is seen.
+
+        Non-blocking: drains whatever is already queued and returns. Any
+        stop sentinels encountered mid-drain are skipped so remaining real
+        frames still reach stdout before the writer exits.
+
+        Args:
+            out: Fault-tolerant stdout wrapper.
+            ctrl: Control-frame queue.
+            data: Data-frame queue.
+            stop: Sentinel object identifying "exit" entries in the queues.
+        """
         while True:
             if out.is_dead:
                 return
@@ -680,6 +944,14 @@ class _StatsSampler:
         dispatcher: _Dispatcher,
         interval_secs: float = _STATS_SAMPLE_INTERVAL_SECS,
     ) -> None:
+        """Create the sampler (thread is not started until :meth:`start`).
+
+        Args:
+            dispatcher: Dispatcher instance queried each tick for worker
+                counts included in the snapshot payload.
+            interval_secs: Interval in seconds between consecutive STATS
+                emissions; defaults to :data:`_STATS_SAMPLE_INTERVAL_SECS`.
+        """
         self._dispatcher = dispatcher
         self._interval = interval_secs
         self._stop = threading.Event()
@@ -688,14 +960,31 @@ class _StatsSampler:
         )
 
     def start(self) -> None:
+        """Start the sampler daemon thread."""
         self._thread.start()
 
     def stop(self) -> None:
+        """Request sampler shutdown and best-effort join.
+
+        The sampler thread is a daemon, so process exit is not gated on it;
+        the short join timeout merely gives it a chance to emit a final
+        snapshot cleanly before the writer is stopped.
+        """
         self._stop.set()
         # Daemon thread — best effort join; do not block shutdown.
         self._thread.join(timeout=0.5)
 
     def _snapshot(self) -> dict[str, object]:
+        """Build a single JSON-serialisable snapshot of current counters.
+
+        Latency percentiles are derived from a sorted copy of the bounded
+        dispatch-sample ring. ``data_queue_depth`` reflects the writer's
+        queue size at the instant of the call (sampled, may race).
+
+        Returns:
+            A ``dict`` ready to be serialised by :func:`json.dumps` and
+            base64url-encoded into the payload of a ``STATS`` frame.
+        """
         with _DISPATCH_SAMPLES_LOCK:
             samples = list(_DISPATCH_SAMPLES)
         samples.sort()
@@ -727,6 +1016,14 @@ class _StatsSampler:
         }
 
     def _run(self) -> None:
+        """Sampler-thread main loop.
+
+        Waits one interval before the first emission so the leading
+        ``STATS`` frame does not race with ``AGENT_READY`` on session
+        bring-up; thereafter emits once per interval until stop is
+        requested or ``_TERMINATE`` is set. Exceptions inside the loop are
+        captured and logged so the sampler never crashes the agent.
+        """
         # Stagger the first emission so it does not race with AGENT_READY.
         if self._stop.wait(timeout=self._interval):
             return
@@ -745,7 +1042,15 @@ _stats_sampler: _StatsSampler | None = None
 
 
 def _emit_ctrl(line: str) -> None:
-    """Emit a control frame — always delivered before any pending data frame."""
+    """Emit a control frame through the shared :class:`_FrameWriter`.
+
+    If the writer has not yet been initialised (e.g. during early startup
+    before :func:`main` installs it) the frame is written directly to
+    stdout so boot-time diagnostics are not lost.
+
+    Args:
+        line: Fully-formatted frame string without trailing newline.
+    """
     if _writer is not None:
         _writer.emit_ctrl(line)
     else:
@@ -754,7 +1059,15 @@ def _emit_ctrl(line: str) -> None:
 
 
 def _emit_data(line: str) -> None:
-    """Emit a data frame — blocks the calling thread when the stdout queue is full."""
+    """Emit a data frame, blocking the caller when the data queue is full.
+
+    Also bumps the module-level byte and frame counters used by the stats
+    sampler; the byte total includes the trailing newline so it reflects
+    actual stdout traffic, not just payload size.
+
+    Args:
+        line: Fully-formatted ``DATA`` / ``UDP_DATA`` frame string.
+    """
     # Count bytes before the frame is enqueued. We count the wire-level
     # frame length (including marker + base64 overhead) so the number
     # reflects real stdout traffic, not raw payload.
@@ -769,13 +1082,28 @@ def _emit_data(line: str) -> None:
 
 
 def _stdout_backpressure_active() -> bool:
+    """Return whether TCP workers should pause ``recv()`` this iteration.
+
+    Returns:
+        ``True`` when the writer's data queue is at or above the
+        :data:`_STDOUT_DATA_QUEUE_BACKPRESSURE_THRESHOLD` watermark, in
+        which case TCP workers leave their remote sockets out of the
+        ``select()`` readable set so kernel receive buffers absorb the
+        backpressure all the way to the remote sender.
+    """
     if _writer is None:
         return False
     return _writer.data_queue_size >= _STDOUT_DATA_QUEUE_BACKPRESSURE_THRESHOLD
 
 
 def _disable_echo() -> None:
-    """Disable terminal echo on stdin so shell output does not pollute the channel."""
+    """Disable terminal echo on stdin so shell output does not pollute stdout.
+
+    When the agent is launched through ``kubectl exec`` with a TTY allocated,
+    the pseudo-terminal would otherwise echo every incoming frame back out
+    on stdout, corrupting the frame channel. Non-TTY stdin (e.g. when run
+    via a pipe in tests) is detected via ``termios.error`` and skipped.
+    """
     try:
         fd = sys.stdin.fileno()
         attrs = termios.tcgetattr(fd)
@@ -786,6 +1114,23 @@ def _disable_echo() -> None:
 
 
 def _send_all_nonblocking(sock: socket.socket, data: bytes) -> bool:
+    """Write *data* to a non-blocking socket, waiting for writability as needed.
+
+    Uses a :func:`select.select`-based wait on ``BlockingIOError`` rather than
+    blocking inside ``send()`` so the calling worker thread never stalls
+    indefinitely on a slow remote peer. The per-wait timeout is
+    :data:`_SEND_WRITABLE_TIMEOUT_SECS`; exceeding it or any other
+    :class:`OSError` causes the function to return ``False`` so the caller
+    can tear the connection down.
+
+    Args:
+        sock: Connected non-blocking TCP socket.
+        data: Payload bytes to write in full.
+
+    Returns:
+        ``True`` when all bytes were transmitted; ``False`` on a closed
+        peer (``sent == 0``), write-readiness timeout, or ``OSError``.
+    """
     offset = 0
     total = len(data)
     while offset < total:
@@ -804,6 +1149,32 @@ def _send_all_nonblocking(sock: socket.socket, data: bytes) -> bool:
 
 
 class TcpConnectionWorker:
+    """Thread-backed TCP connection bridging one ``CONN_OPEN`` session.
+
+    Each worker owns a single outbound TCP socket and a self-pipe used to
+    wake its ``select()`` loop from the dispatcher thread. Inbound payload
+    bytes from the client are buffered in :attr:`_inbound` (bounded by
+    :data:`_MAX_TCP_INBOUND_CHUNKS`); outbound bytes from the remote peer
+    are forwarded as base64url-encoded ``DATA`` frames.
+
+    Protocol contract:
+        * ``CONN_ACK`` is emitted as soon as the TCP connect succeeds.
+        * ``CONN_CLOSE`` is always emitted in ``_run``'s ``finally`` block,
+          unless :attr:`_suppress_close_frame` is set because an ``ERROR``
+          frame has already been sent (saturation path).
+        * On connect failure an ``ERROR`` frame replaces ``CONN_ACK`` and
+          no ``CONN_CLOSE`` follows.
+
+    Args:
+        conn_id: Client-assigned connection identifier (matches ``_ID_RE``).
+        host: Destination hostname or IP literal.
+        port: Destination TCP port.
+        dns_cache: Shared DNS cache for address resolution.
+        on_close: Optional callback invoked from the worker thread after
+            teardown, typically used by the dispatcher to evict the worker
+            from its registry.
+    """
+
     def __init__(
         self,
         conn_id: str,
@@ -812,6 +1183,7 @@ class TcpConnectionWorker:
         dns_cache: _DnsCache,
         on_close: Callable[[], None] | None = None,
     ) -> None:
+        """Initialise state; the worker thread is not started until :meth:`start`."""
         self.conn_id = conn_id
         self._host = host
         self._port = port
@@ -868,16 +1240,35 @@ class TcpConnectionWorker:
                 os.close(self._notify_w)
 
     def start(self) -> None:
+        """Start the worker thread (connect + IO loop)."""
         self._thread.start()
 
     def join(self, timeout: float | None = None) -> None:
+        """Join the worker thread.
+
+        Args:
+            timeout: Maximum seconds to wait; ``None`` waits indefinitely.
+        """
         self._thread.join(timeout=timeout)
 
     @property
     def is_alive(self) -> bool:
+        """``True`` while the worker thread has not yet terminated."""
         return self._thread.is_alive()
 
     def feed(self, data: bytes) -> None:
+        """Hand client-originated *data* to the worker for onward TCP transmit.
+
+        Thread-safe: called from the dispatcher thread. Applies inbound
+        flow-control: once :data:`_MAX_TCP_INBOUND_CHUNKS` queued chunks
+        accumulate, the worker is declared saturated — an ``ERROR`` frame
+        is emitted, the connection is marked closed, and subsequent
+        feeds are silently dropped. Feeds received after the worker has
+        finally torn down (``_final_closed``) are logged at DEBUG.
+
+        Args:
+            data: Raw bytes decoded from a ``DATA`` frame payload.
+        """
         saturated = False
         with self._inbound_lock:
             # H1: worker already torn down — log and drop so late bytes are
@@ -915,10 +1306,24 @@ class TcpConnectionWorker:
         self._wake()
 
     def signal_eof(self) -> None:
+        """Request a half-close: no more inbound data, drain and send FIN.
+
+        The IO loop observes ``_closed`` and, after the outbound queue is
+        empty, performs ``shutdown(SHUT_WR)`` on the remote socket and
+        waits up to :data:`_HALF_CLOSE_DEADLINE_SECS` for the remote peer
+        to close its side.
+        """
         self._closed = True
         self._wake()
 
     def _run(self) -> None:
+        """Worker-thread main: connect, emit ``CONN_ACK``, run IO, clean up.
+
+        Exactly one of ``CONN_ACK`` or an ``ERROR`` frame is emitted per
+        worker lifecycle. Registry eviction is delegated to :attr:`_on_close`
+        so the dispatcher remains the single source of truth for worker
+        membership.
+        """
         cid = self.conn_id
         try:
             sock = _create_connection_cached(
@@ -989,6 +1394,20 @@ class TcpConnectionWorker:
                 self._on_close()
 
     def _io_loop(self, sock: socket.socket, cid: str) -> None:
+        """Pump bytes between *sock* and the client until either end closes.
+
+        Uses :func:`select.select` with the remote socket and the self-pipe
+        as readable sources; the remote socket is omitted from the readable
+        set when :func:`_stdout_backpressure_active` is true so OS receive
+        buffers can absorb backpressure upstream. Honors half-close: once
+        the client has signalled EOF and all pending bytes are forwarded,
+        the worker performs ``SHUT_WR`` and waits for the remote FIN up to
+        :data:`_HALF_CLOSE_DEADLINE_SECS`.
+
+        Args:
+            sock: Connected non-blocking TCP socket.
+            cid: Connection identifier — used to tag outbound frames.
+        """
         local_shut = False
         local_shut_deadline: float | None = None
 
@@ -1062,6 +1481,29 @@ class TcpConnectionWorker:
 
 
 class UdpFlowWorker:
+    """Thread-backed UDP flow bridging one ``UDP_OPEN`` session.
+
+    Mirrors :class:`TcpConnectionWorker` for UDP semantics: a single
+    connected :class:`socket.socket` of type ``SOCK_DGRAM`` is used so
+    receive side-steps require no per-datagram address tracking. Inbound
+    datagrams from the client are buffered up to
+    :data:`_MAX_UDP_INBOUND_DGRAMS`; further datagrams are dropped per
+    UDP semantics with rate-limited warnings.
+
+    Protocol contract:
+        * ``UDP_CLOSE`` is always emitted in ``_run``'s ``finally`` block
+          — including on resolve or connect failure — so the client can
+          deterministically reclaim the flow ID.
+
+    Args:
+        flow_id: Client-assigned flow identifier (matches ``_ID_RE``).
+        host: Destination hostname or IP literal.
+        port: Destination UDP port.
+        dns_cache: Shared DNS cache for address resolution.
+        on_close: Optional callback invoked from the worker thread after
+            teardown, typically used by the dispatcher to evict the flow.
+    """
+
     def __init__(
         self,
         flow_id: str,
@@ -1070,6 +1512,7 @@ class UdpFlowWorker:
         dns_cache: _DnsCache,
         on_close: Callable[[], None] | None = None,
     ) -> None:
+        """Initialise state; the worker thread is not started until :meth:`start`."""
         self._id = flow_id
         self._host = host
         self._port = port
@@ -1097,6 +1540,11 @@ class UdpFlowWorker:
         )
 
     def _wake(self) -> None:
+        """Wake the IO loop by writing one byte to the self-pipe.
+
+        Serialised against :meth:`_close_pipe` via ``_pipe_lock`` so a
+        write cannot race with fd reuse after close (H2 parity with TCP).
+        """
         with self._pipe_lock:
             if self._pipe_closed:
                 return
@@ -1104,6 +1552,7 @@ class UdpFlowWorker:
                 os.write(self._notify_w, b"\x00")
 
     def _close_pipe(self) -> None:
+        """Close both ends of the self-pipe atomically with the guard flag."""
         with self._pipe_lock:
             if self._pipe_closed:
                 return
@@ -1114,19 +1563,31 @@ class UdpFlowWorker:
                 os.close(self._notify_w)
 
     def start(self) -> None:
+        """Start the worker thread (resolve + connect + IO loop)."""
         self._thread.start()
 
     def join(self, timeout: float | None = None) -> None:
+        """Join the worker thread.
+
+        Args:
+            timeout: Maximum seconds to wait; ``None`` waits indefinitely.
+        """
         self._thread.join(timeout=timeout)
 
     @property
     def is_alive(self) -> bool:
+        """``True`` while the worker thread has not yet terminated."""
         return self._thread.is_alive()
 
     def feed(self, data: bytes) -> None:
-        """Enqueue *data* to be sent to the remote UDP peer.
+        """Enqueue *data* for transmission to the remote UDP peer.
 
-        Silently drops when the inbound queue is full — UDP semantics.
+        Silently drops the datagram when the inbound queue is full, per
+        UDP semantics, and emits a rate-limited warning every
+        :data:`_UDP_DROP_WARN_EVERY` drops.
+
+        Args:
+            data: Raw datagram bytes decoded from a ``UDP_DATA`` frame.
         """
         with self._inbound_lock:
             if self._final_closed:
@@ -1149,11 +1610,17 @@ class UdpFlowWorker:
         self._wake()
 
     def close(self) -> None:
-        """Signal the IO loop to exit after draining pending sends."""
+        """Request termination of the IO loop after draining pending sends."""
         self._closed = True
         self._wake()
 
     def _run(self) -> None:
+        """Worker-thread main: resolve, connect the UDP socket, run IO, clean up.
+
+        Emits exactly one ``UDP_CLOSE`` frame per flow lifecycle, including
+        on resolution or connect failure so the client can reclaim the
+        flow ID deterministically.
+        """
         fid = self._id
 
         try:
@@ -1212,6 +1679,17 @@ class UdpFlowWorker:
                 self._on_close()
 
     def _io_loop(self, sock: socket.socket, fid: str) -> None:
+        """Pump datagrams between *sock* and the client until closed.
+
+        Transient per-datagram send errors (``ECONNREFUSED``, ``EMSGSIZE``,
+        ``ENETUNREACH``, etc.) are treated as drops and the flow stays
+        alive; any other :class:`OSError` indicates the socket itself is
+        broken and terminates the loop.
+
+        Args:
+            sock: Connected non-blocking UDP socket.
+            fid: Flow identifier — used to tag outbound ``UDP_DATA`` frames.
+        """
         while not self._closed:
             readable, _, errored = select.select(
                 [sock, self._notify_r], [], [sock], _SELECT_TIMEOUT_SECS
@@ -1276,12 +1754,22 @@ class UdpFlowWorker:
                             self._send_block_count == 1
                             or self._send_block_count % _UDP_DROP_WARN_EVERY == 0
                         ):
+                            # ``errno.errorcode`` maps int → symbolic name;
+                            # fall back to the raw numeric string when the
+                            # platform does not expose a name for this code
+                            # (or when ``exc.errno`` is ``None``).
+                            err_no = exc.errno
+                            err_label: str = (
+                                errno.errorcode.get(err_no, str(err_no))
+                                if err_no is not None
+                                else "None"
+                            )
                             _log(
                                 "debug",
                                 "udp flow %s send transient error %s; "
                                 "datagram dropped (send_blocks=%d)",
                                 fid,
-                                errno.errorcode.get(exc.errno, exc.errno),
+                                err_label,
                                 self._send_block_count,
                             )
                         continue
@@ -1289,11 +1777,34 @@ class UdpFlowWorker:
 
 
 class _Dispatcher:
+    """Route incoming frames from stdin to per-connection and per-flow workers.
+
+    The dispatcher owns the authoritative registries of live
+    :class:`TcpConnectionWorker` and :class:`UdpFlowWorker` instances, a
+    per-process DNS cache shared by every worker, and the stdin reader
+    loop. It exposes a single public :meth:`run` entry-point plus the
+    :meth:`worker_counts` and :meth:`shutdown` helpers used by the stats
+    sampler and :func:`main` respectively.
+
+    Thread-safety: :attr:`_conn_map` and :attr:`_udp_map` are guarded by
+    dedicated locks. Workers evict themselves from the maps through their
+    ``on_close`` callbacks — the dispatcher never tears down a worker
+    implicitly.
+
+    Args:
+        fixed_host: In portforward mode, the fixed destination host that
+            overrides the address carried on each ``CONN_OPEN`` frame. Pass
+            ``None`` for tunnel (SOCKS5) mode.
+        fixed_port: Fixed destination port that pairs with *fixed_host*;
+            must be provided when *fixed_host* is set.
+    """
+
     def __init__(
         self,
         fixed_host: str | None,
         fixed_port: int | None,
     ) -> None:
+        """Initialise registries, locks, and the shared DNS cache."""
         self._fixed_host = fixed_host
         self._fixed_port = fixed_port
 
@@ -1304,7 +1815,15 @@ class _Dispatcher:
         self._dns_cache = _DnsCache()
 
     def dispatch(self, line: str) -> None:
-        """Parse and dispatch one raw frame line."""
+        """Parse and dispatch one raw frame line from stdin.
+
+        Updates the inbound byte / frame counters and records a dispatch
+        latency sample so malformed, oversized, or unknown frames are still
+        visible to the stats sampler.
+
+        Args:
+            line: One newline-stripped line read from stdin.
+        """
         # Step 2: count inbound bytes / frames at the earliest point so the
         # sampler sees real ingress even for malformed / oversized frames.
         global _RX_BYTES_TOTAL, _FRAMES_RX_TOTAL  # noqa: PLW0603
@@ -1317,6 +1836,16 @@ class _Dispatcher:
             _record_dispatch_sample(time.monotonic() - dispatch_started)
 
     def _dispatch_inner(self, line: str) -> None:
+        """Validate framing and route *line* to the matching handler.
+
+        Silently ignores empty lines, oversized frames (longer than
+        :data:`_MAX_INBOUND_FRAME_LEN`), frames missing the ``<<<EXECTUNNEL:``
+        / ``>>>`` envelope, and unknown frame types. ``KEEPALIVE`` is
+        accepted and deliberately ignored.
+
+        Args:
+            line: Raw line (newline already stripped by the caller).
+        """
         line = line.strip()
 
         if len(line) > _MAX_INBOUND_FRAME_LEN:
@@ -1357,9 +1886,11 @@ class _Dispatcher:
                 _log("debug", "unknown frame type ignored: %s", parts[0])
 
     def worker_counts(self) -> tuple[int, int]:
-        """Return current ``(tcp_workers, udp_workers)`` count.
+        """Return a snapshot of live worker counts.
 
-        Used by the stats sampler to report concurrency in the STATS frame.
+        Returns:
+            A ``(tcp_worker_count, udp_worker_count)`` tuple, used by the
+            stats sampler to report concurrency in each ``STATS`` frame.
         """
         with self._conn_lock:
             tcp = len(self._conn_map)
@@ -1368,11 +1899,13 @@ class _Dispatcher:
         return tcp, udp
 
     def shutdown(self) -> None:
-        """Signal all workers to close and wait briefly for clean teardown.
+        """Signal every worker to close and wait up to the grace period.
 
-        Called by ``main()`` before stopping the writer so that workers have
-        a chance to emit final ``CONN_CLOSE`` / ``UDP_CLOSE`` frames while
-        the writer is still alive.
+        Called by :func:`main` before the writer is stopped so that workers
+        can emit their final ``CONN_CLOSE`` / ``UDP_CLOSE`` frames while
+        the writer is still alive. Workers that fail to exit within
+        :data:`_WORKER_SHUTDOWN_GRACE_SECS` are logged and left to die with
+        the process (they are daemon threads).
         """
         with self._conn_lock:
             tcp_workers = list(self._conn_map.values())
@@ -1408,6 +1941,16 @@ class _Dispatcher:
             )
 
     def _on_conn_open(self, parts: list[str]) -> None:
+        """Handle a ``CONN_OPEN`` frame: validate, start a TCP worker.
+
+        In portforward mode the host/port carried by the frame is ignored
+        and the fixed target is used instead. Rejects frames with malformed
+        connection IDs, duplicate IDs (with an ``ERROR`` reply), and — as a
+        DoS guard — opens beyond :data:`_MAX_TCP_WORKERS`.
+
+        Args:
+            parts: Frame body split on ``:`` at most twice.
+        """
         if len(parts) < _MIN_PARTS_WITH_CONN_ID:
             return
         cid = parts[1]
@@ -1439,11 +1982,14 @@ class _Dispatcher:
                 _emit_ctrl(_make_error_frame(cid, "portforward: fixed_port not set"))
                 return
             host, port = self._fixed_host, self._fixed_port
-        elif len(parts) >= 3:
+        elif len(parts) >= _MIN_PARTS_WITH_PAYLOAD:
             result = _parse_host_port(parts[_HOST_PORT_PART_INDEX], cid, "CONN_OPEN")
             if result is None:
                 _emit_ctrl(
-                    _make_error_frame(cid, f"invalid CONN_OPEN host:port: {parts[_HOST_PORT_PART_INDEX]!r}")
+                    _make_error_frame(
+                        cid,
+                        f"invalid CONN_OPEN host:port: {parts[_HOST_PORT_PART_INDEX]!r}",
+                    )
                 )
                 return
             host, port = result
@@ -1485,6 +2031,15 @@ class _Dispatcher:
         worker.start()
 
     def _on_data(self, parts: list[str]) -> None:
+        """Handle a ``DATA`` frame: decode payload and feed the TCP worker.
+
+        Silently ignores frames referencing unknown connection IDs (the
+        worker may have torn down before the client learned about it);
+        malformed base64 causes an ``ERROR`` reply.
+
+        Args:
+            parts: Frame body split on ``:`` at most twice.
+        """
         if len(parts) < _MIN_PARTS_WITH_PAYLOAD:
             return
         cid = parts[1]
@@ -1501,6 +2056,11 @@ class _Dispatcher:
         worker.feed(data)
 
     def _on_conn_close(self, parts: list[str]) -> None:
+        """Handle a ``CONN_CLOSE`` frame: request a half-close on the worker.
+
+        Args:
+            parts: Frame body split on ``:`` at most twice.
+        """
         if len(parts) < _MIN_PARTS_WITH_CONN_ID:
             return
         cid = parts[1]
@@ -1510,6 +2070,14 @@ class _Dispatcher:
             worker.signal_eof()
 
     def _on_udp_open(self, parts: list[str]) -> None:
+        """Handle a ``UDP_OPEN`` frame: validate, start a UDP flow worker.
+
+        Malformed host/port or duplicate flow IDs cause an immediate
+        ``UDP_CLOSE`` reply so the client can reclaim the ID.
+
+        Args:
+            parts: Frame body split on ``:`` at most twice.
+        """
         if len(parts) < _MIN_PARTS_WITH_PAYLOAD:
             return
         fid = parts[1]
@@ -1539,6 +2107,14 @@ class _Dispatcher:
         flow.start()
 
     def _on_udp_data(self, parts: list[str]) -> None:
+        """Handle a ``UDP_DATA`` frame: decode and feed the UDP flow worker.
+
+        Frames for unknown flow IDs are ignored; malformed base64 triggers
+        a ``UDP_CLOSE`` reply.
+
+        Args:
+            parts: Frame body split on ``:`` at most twice.
+        """
         if len(parts) < _MIN_PARTS_WITH_PAYLOAD:
             return
         fid = parts[1]
@@ -1555,6 +2131,11 @@ class _Dispatcher:
         flow.feed(data)
 
     def _on_udp_close(self, parts: list[str]) -> None:
+        """Handle a ``UDP_CLOSE`` frame: request flow termination.
+
+        Args:
+            parts: Frame body split on ``:`` at most twice.
+        """
         if len(parts) < _MIN_PARTS_WITH_CONN_ID:
             return
         fid = parts[1]
@@ -1564,7 +2145,12 @@ class _Dispatcher:
             flow.close()
 
     def run(self) -> None:
-        """Read stdin line-by-line and dispatch each frame until EOF."""
+        """Read stdin line-by-line and dispatch each frame until EOF or terminate.
+
+        Returns when either stdin closes (client side went away) or the
+        termination flag is observed between frames. Lines are passed to
+        :meth:`dispatch` after stripping the trailing ``\\r\\n``.
+        """
         for raw_line in sys.stdin:
             if _TERMINATE:
                 break
@@ -1573,7 +2159,20 @@ class _Dispatcher:
 
 
 def main() -> None:
-    """Parse arguments, initialise the writer, and run the dispatcher."""
+    """Agent entry point.
+
+    Parses command-line arguments, installs signal handlers, initialises
+    the frame writer and the stats sampler, runs the dispatcher, and
+    performs an ordered teardown on exit.
+
+    Argument handling:
+        * No arguments: tunnel (SOCKS5) mode — the client supplies the
+          destination on each ``CONN_OPEN`` frame.
+        * Two arguments ``<host> <port>``: portforward mode — every
+          ``CONN_OPEN`` is connected to the given fixed target.
+
+    Exits with status 1 on invalid arguments (printed to stderr).
+    """
     _install_sigpipe_handler()
     _install_termination_handlers()
 
@@ -1587,7 +2186,7 @@ def main() -> None:
         except ValueError:
             sys.stderr.write(f"invalid port: {sys.argv[2]!r}\n")
             sys.exit(1)
-        if fixed_port <= 0 or fixed_port > _MAX_PORT:
+        if fixed_port <= 0 or fixed_port > _MAX_TCP_UDP_PORT:
             sys.stderr.write(f"port out of range: {fixed_port}\n")
             sys.exit(1)
     else:
