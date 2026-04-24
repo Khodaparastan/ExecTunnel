@@ -98,3 +98,19 @@ poetry run mypy exectunnel
 ### Versioning
 The single source of truth for the version is `exectunnel/_version.py`.
 `pyproject.toml` reads it via `poetry-dynamic-versioning` — do not edit the version in `pyproject.toml` directly.
+
+## Performance & measurement
+
+ExecTunnel ships a layered measurement framework for attributing cost to
+specific subsystems (network vs. agent vs. base64 ceiling). See
+[`docs/measurement.md`](docs/measurement.md) for the conceptual overview.
+
+Quick start:
+
+```bash
+make bench-baseline BENCH_LABEL=my-baseline        # produces JSON + MD + CSV
+make bench-compare A=reports/a.json B=reports/b.json
+make build-pod-echo                                 # optional: build L3 helper binary
+```
+
+Reports land in `./bench-reports/` (gitignored).

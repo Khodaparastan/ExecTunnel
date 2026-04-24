@@ -27,13 +27,14 @@
 #   clean                  Remove build artefacts and caches.
 #   clean-venv             Remove virtual environment as well.
 #   help                   Print this help.
-
-PYTHON        := .venv/bin/python
-PIP           := .venv/bin/pip
+ENVACT				:= $(shell zsh -c "poetry env activate")
+ENVDIR				:= $(shell zsh -c "dirname $(ENVACT) | tail -1")
+PYTHON        := $(ENVDIR)/python
+PIP           := $(ENVDIR)/pip
 POETRY        := poetry
-RUFF          := .venv/bin/ruff
-MYPY          := .venv/bin/mypy
-PYTEST        := .venv/bin/pytest
+RUFF          := $(ENVDIR)/ruff
+MYPY          := $(ENVDIR)/mypy
+PYTEST        := $(ENVDIR)/pytest
 
 SRC_DIR       := exectunnel
 TEST_DIR      := tests
@@ -174,6 +175,62 @@ build-go-agent-local: ## Compile Go agent for local OS/arch (testing only)
 clean-go-agent: ## Remove compiled Go agent binaries
 	rm -f $(GO_OUT) $(GO_OUT_LOCAL)
 	@echo "$(GREEN)Cleaned Go agent binaries.$(RESET)"
+
+# ── Pod-side helper (pod_echo) ───────────────────────────────────────────────
+POD_ECHO_DIR := tools/pod_echo
+
+.PHONY: build-pod-echo
+build-pod-echo: ## Cross-compile pod_echo helper for linux/amd64 + linux/arm64
+	$(MAKE) -C $(POD_ECHO_DIR) all GO=$(GO)
+	@echo "$(GREEN)Built pod_echo helper (amd64 + arm64).$(RESET)"
+
+.PHONY: clean-pod-echo
+clean-pod-echo: ## Remove compiled pod_echo binaries
+	$(MAKE) -C $(POD_ECHO_DIR) clean
+	@echo "$(GREEN)Cleaned pod_echo binaries.$(RESET)"
+
+# ── Benchmarks (measurement framework) ───────────────────────────────────────
+# See docs/measurement.md for the conceptual overview and how to interpret
+# the layered (L1..L4) reports.
+BENCH_LABEL ?= baseline
+BENCH_DURATION_SEC ?= 30
+BENCH_PAYLOAD_SIZE ?= 65536
+BENCH_HOST_KIND ?= laptop
+BENCH_REPEATS ?= 3
+BENCH_ENDPOINT ?=
+BENCH_OUTPUT_DIR ?= ./bench-reports
+
+.PHONY: bench-baseline
+bench-baseline: ## Run layered bench (L1+L4) with the Python agent
+	$(PYTHON) bench_layered.py \
+		--label $(BENCH_LABEL) \
+		--agent python \
+		--bench-host-kind $(BENCH_HOST_KIND) \
+		--duration-sec $(BENCH_DURATION_SEC) \
+		--payload-size $(BENCH_PAYLOAD_SIZE) \
+		--repeats $(BENCH_REPEATS) \
+		--output-dir $(BENCH_OUTPUT_DIR) \
+		$(if $(BENCH_ENDPOINT),--endpoint $(BENCH_ENDPOINT),)
+
+.PHONY: bench-go
+bench-go: ## Run layered bench with the Go agent (requires built go agent binary)
+	$(PYTHON) bench_layered.py \
+		--label $(BENCH_LABEL)-go \
+		--agent go \
+		--bench-host-kind $(BENCH_HOST_KIND) \
+		--duration-sec $(BENCH_DURATION_SEC) \
+		--payload-size $(BENCH_PAYLOAD_SIZE) \
+		--repeats $(BENCH_REPEATS) \
+		--output-dir $(BENCH_OUTPUT_DIR) \
+		$(if $(BENCH_ENDPOINT),--endpoint $(BENCH_ENDPOINT),)
+
+.PHONY: bench-compare
+bench-compare: ## Diff two bench JSON reports — usage: make bench-compare A=path/a.json B=path/b.json
+	@if [ -z "$(A)" ] || [ -z "$(B)" ]; then \
+		echo "$(BOLD)usage:$(RESET) make bench-compare A=<path-to-a.json> B=<path-to-b.json>"; \
+		exit 2; \
+	fi
+	$(PYTHON) bench_compare.py $(A) $(B)
 
 # ── Housekeeping ──────────────────────────────────────────────────────────────
 .PHONY: clean

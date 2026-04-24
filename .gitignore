@@ -32,3 +32,10 @@ __pycache__/
 .jbeval
 _tmp
 /.mid.env
+
+# Bench reports (measurement framework)
+bench-reports/
+
+# Compiled pod-side helper binaries (rebuild with `make build-pod-echo`)
+exectunnel/payload/pod_echo/pod_echo_linux_amd64
+exectunnel/payload/pod_echo/pod_echo_linux_arm64

@@ -1,0 +1,59 @@
+# yaml-language-server: $schema=https://squidfunk.github.io/mkdocs-material/schema.json
+site_name: ExecTunnel
+site_description: SOCKS5 tunnel over Kubernetes exec/WebSocket channels
+site_url: "https://github.com/Khodaparastan/ExecTunnel"
+repo_url: "https://github.com/Khodaparastan/ExecTunnel"
+repo_name: "ExecTunnel"
+
+theme:
+  name: material
+  palette:
+    scheme: slate
+  features:
+    - navigation.sections
+    - navigation.expand
+    - navigation.indexes
+    - content.code.copy
+    - search.suggest
+    - search.highlight
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            show_source: false
+            show_root_heading: true
+            show_root_toc_entry: true
+            inherited_members: true
+            separate_signature: true
+            show_signature_annotations: true
+            members_order: source
+            docstring_style: google
+
+markdown_extensions:
+  - admonition
+  - toc:
+      permalink: true
+  - pymdownx.superfences
+  - pymdownx.details
+  - pymdownx.highlight
+
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - Configuration: configuration.md
+  - Architecture: architecture.md
+  - Transport Architecture: transport/arch.md
+  - Protocol Architecture: protocol/arch.md
+  - Proxy Architecture: proxy/arch.md
+  - Session Architecture: session/arch.md
+  - Protocol API: protocol/api.md
+  - Protocol: protocol.md
+  - Production: production.md
+  - Troubleshooting: troubleshooting.md
+  - CLI:
+      - Overview: cli/index.md
+  - API:
+      - Overview: api/index.md
