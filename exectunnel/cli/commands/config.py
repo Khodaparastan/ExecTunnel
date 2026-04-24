@@ -23,7 +23,6 @@ app = typer.Typer(
     help="Show and validate ExecTunnel configuration.",
 )
 
-# Shared console — one instance for all config sub-commands.
 _console = Console(theme=THEME, highlight=False)
 
 
@@ -133,7 +132,7 @@ def validate_config() -> None:
     warnings: list[str] = []
     ok_items: list[str] = []
 
-    # ── WebSocket URL ─────────────────────────────────────────────────────
+    # ── WebSocket URL ──────────────────────────────────────────────────────
     wss_url = os.environ.get("EXECTUNNEL_WSS_URL") or os.environ.get("WSS_URL")
     if wss_url:
         if wss_url.startswith(("ws://", "wss://")):
@@ -145,7 +144,7 @@ def validate_config() -> None:
     else:
         warnings.append("No WSS URL set (EXECTUNNEL_WSS_URL / WSS_URL)")
 
-    # ── Selected env sanity checks ───────────────────────────────────────
+    # ── Bootstrap delivery ─────────────────────────────────────────────────
     bootstrap_delivery = os.environ.get(
         "EXECTUNNEL_BOOTSTRAP_DELIVERY", "upload"
     ).strip()
@@ -154,7 +153,9 @@ def validate_config() -> None:
     else:
         ok_items.append(f"Bootstrap delivery mode is valid: {bootstrap_delivery}")
 
-    def _parse_float(name: str) -> float | None:
+    # ── Numeric env sanity checks ──────────────────────────────────────────
+
+    def _parse_float_env(name: str) -> float | None:
         raw = os.environ.get(name)
         if raw is None:
             return None
@@ -164,7 +165,7 @@ def validate_config() -> None:
             errors.append(f"{name} must be a float, got: {raw!r}")
             return None
 
-    def _parse_int(name: str) -> int | None:
+    def _parse_int_env(name: str) -> int | None:
         raw = os.environ.get(name)
         if raw is None:
             return None
@@ -174,36 +175,30 @@ def validate_config() -> None:
             errors.append(f"{name} must be an integer, got: {raw!r}")
             return None
 
-    base_delay = _parse_float("EXECTUNNEL_RECONNECT_BASE_DELAY")
-    max_delay = _parse_float("EXECTUNNEL_RECONNECT_MAX_DELAY")
+    base_delay = _parse_float_env("EXECTUNNEL_RECONNECT_BASE_DELAY")
+    max_delay = _parse_float_env("EXECTUNNEL_RECONNECT_MAX_DELAY")
     if base_delay is not None and max_delay is not None and max_delay < base_delay:
         errors.append(
             "EXECTUNNEL_RECONNECT_MAX_DELAY must be >= EXECTUNNEL_RECONNECT_BASE_DELAY"
         )
 
-    send_queue_cap = _parse_int("EXECTUNNEL_SEND_QUEUE_CAP")
+    send_queue_cap = _parse_int_env("EXECTUNNEL_SEND_QUEUE_CAP")
     if send_queue_cap is not None and send_queue_cap < 1:
         errors.append("EXECTUNNEL_SEND_QUEUE_CAP must be >= 1")
 
     # ── Full SessionConfig round-trip ──────────────────────────────────────
     try:
-
         build_session_config()
         ok_items.append("Full SessionConfig validation passed")
     except ImportError as exc:
-        # Structural problem — always an error regardless of URL presence.
         errors.append(f"Cannot import settings module: {exc}")
     except Exception as exc:  # noqa: BLE001
-        # If the URL is configured, config should succeed → real error.
-        # If the URL is absent, the failure is expected (URL is required) →
-        # downgrade to a warning to avoid redundant noise alongside the
-        # already-flagged "No WSS URL set" warning above.
         if wss_url:
             errors.append(f"SessionConfig validation failed: {exc}")
         else:
             warnings.append(f"SessionConfig incomplete (URL not set): {exc}")
 
-    # ── Render results ────────────────────────────────────────────────────
+    # ── Render results ─────────────────────────────────────────────────────
     _console.print(f"\n[et.brand]{Icons.BOLT} Configuration Validation[/et.brand]\n")
     for item in ok_items:
         _console.print(f"  [et.ok]{Icons.CHECK}[/et.ok] {item}")

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Annotated, Literal
+from typing import Annotated
 
 import typer
 from rich.console import Console
@@ -17,16 +17,12 @@ from exectunnel.session import TunnelConfig
 from .._config import build_session_config
 from ..runner import run_session
 from ..ui import BANNER, THEME, BootstrapSpinner, Icons
+from ..utils import VALID_LOG_LEVELS, normalize_log_level
 
 __all__ = ["connect"]
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
 _URL_DISPLAY_MAX = 90
 _VALID_SCHEMES = ("ws://", "wss://")
-_VALID_LOG_LEVELS = frozenset({"debug", "info", "warning", "error"})
 
 
 # ---------------------------------------------------------------------------
@@ -34,20 +30,13 @@ _VALID_LOG_LEVELS = frozenset({"debug", "info", "warning", "error"})
 # ---------------------------------------------------------------------------
 
 
-def _get_console() -> Console:
+def _make_console() -> Console:
+    """Return a fresh themed console for this command invocation."""
     return Console(theme=THEME, highlight=False)
 
 
 def _print_banner(con: Console) -> None:
-
     con.print(BANNER.format(version=__version__))
-
-
-def _normalize_log_level(value: str) -> Literal["debug", "info", "warning", "error"]:
-    level = value.lower().strip()
-    if level == "warn":
-        level = "warning"
-    return level
 
 
 def _parse_headers(
@@ -184,17 +173,17 @@ def connect(
     ] = False,
 ) -> None:
     """Connect via a raw WebSocket exec URL."""
-    normalized_log_level = _normalize_log_level(log_level)
-    if normalized_log_level not in _VALID_LOG_LEVELS:
+    normalized = normalize_log_level(log_level)
+    if normalized not in VALID_LOG_LEVELS:
         raise typer.BadParameter(
             f"Invalid log level {log_level!r}. "
-            f"Choose from: {', '.join(sorted(_VALID_LOG_LEVELS))}",
+            f"Choose from: {', '.join(sorted(VALID_LOG_LEVELS))}",
             param_hint="'--log-level'",
         )
 
-    configure_logging(normalized_log_level)
+    configure_logging(normalized)  # type: ignore[arg-type]
 
-    con = _get_console()
+    con = _make_console()
     _print_banner(con)
 
     try:
@@ -259,8 +248,6 @@ async def _ws_async(
         con.print(f"[et.warn]{Icons.WARN} TLS verification disabled.[/et.warn]")
 
     _print_ws_summary(con, url, ws_headers, socks_host, socks_port)
-
-    # Build configs
 
     session_cfg = build_session_config(
         wss_url=url,

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -30,10 +31,12 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_DEFAULT_SOCKET = "/tmp/exectunnel.sock"  # TODO: move to XDG_RUNTIME_DIR  # noqa: S108
+_XDG_RUNTIME = os.environ.get("XDG_RUNTIME_DIR", "/tmp")  # noqa: S108
+_DEFAULT_SOCKET = str(Path(_XDG_RUNTIME) / "exectunnel.sock")
 _QUERY_TIMEOUT_SECS = 5.0
 _CONNECT_TIMEOUT_SECS = 3.0
 _WATCH_INTERVAL_SECS = 1.0
+_MAX_CONSECUTIVE_FAILURES = 3
 
 _STATUS_KEYS: tuple[tuple[str, str, str, str], ...] = (
     ("Connected", "connected", "Uptime", "uptime"),
@@ -50,7 +53,7 @@ _STATUS_KEYS: tuple[tuple[str, str, str, str], ...] = (
 # ---------------------------------------------------------------------------
 
 
-def _get_console() -> Console:
+def _make_console() -> Console:
     return Console(theme=THEME, highlight=False)
 
 
@@ -156,7 +159,7 @@ async def _status_async(
     watch: bool,
     json_output: bool,
 ) -> int:
-    con = _get_console()
+    con = _make_console()
 
     if not Path(socket_path).exists():
         con.print(
@@ -189,14 +192,12 @@ async def _status_async(
         return 0
 
     # -- Live watch loop --
-
     with Live(
         _build_status_panel(data),
         console=con,
         refresh_per_second=1,
     ) as live:
         consecutive_failures = 0
-        max_consecutive_failures = 3
 
         try:
             while True:
@@ -210,13 +211,13 @@ async def _status_async(
                     logger.debug(
                         "Watch query failed (%d/%d): %s",
                         consecutive_failures,
-                        max_consecutive_failures,
+                        _MAX_CONSECUTIVE_FAILURES,
                         exc,
                     )
-                    if consecutive_failures >= max_consecutive_failures:
+                    if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
                         con.print(
                             f"\n[et.error]{Icons.CROSS} Lost connection to "
-                            f"session after {max_consecutive_failures} failures: "
+                            f"session after {_MAX_CONSECUTIVE_FAILURES} failures: "
                             f"{exc}[/et.error]"
                         )
                         return 1
