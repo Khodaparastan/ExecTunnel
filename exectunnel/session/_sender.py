@@ -1,7 +1,7 @@
 """WebSocket send abstraction — concurrency-safe frame sender for TunnelSession.
 
 Implements the ``WsSendCallable`` protocol expected by the transport layer.
-All outgoing frames are serialised through a single asyncio task (_run)
+All outgoing frames are serialised through a single asyncio task (:meth:`WsSender._run`)
 that owns the WebSocket write path.
 
 Priority model
@@ -10,17 +10,18 @@ Control frames (``control=True``) are enqueued into an unbounded queue and
 are never dropped.  Data frames use a bounded queue; when full they are either
 dropped silently or block the caller (``must_queue=True``).
 
-The ``_run`` loop drains the control queue before the data queue on every
-iteration, guaranteeing that ``CONN_CLOSE`` / ``UDP_CLOSE`` / ``UDP_OPEN``
-frames are delivered ahead of bulk data.
+The :meth:`WsSender._run` loop drains the control queue before the data queue
+on every iteration, guaranteeing that ``CONN_CLOSE`` / ``UDP_CLOSE`` /
+``UDP_OPEN`` frames are delivered ahead of bulk data.
 
 Dequeue strategy
 ----------------
-The send loop uses an ``asyncio.Event`` (``_frame_ready``) instead of racing
-two ``asyncio.Task``s.  ``send()`` and ``stop()`` set the event after
-enqueuing; the loop clears it and double-checks both queues before waiting
-(standard condition-variable pattern).  This eliminates per-iteration task
-creation, cancellation, and the fragile item-rescue logic.
+The send loop uses an :class:`asyncio.Event` (``_frame_ready``) instead of
+racing two :class:`asyncio.Task` objects.  :meth:`WsSender.send` and
+:meth:`WsSender.stop` set the event after enqueuing; the loop clears it and
+double-checks both queues before waiting (standard condition-variable pattern).
+This eliminates per-iteration task creation, cancellation, and fragile
+item-rescue logic.
 """
 
 import asyncio
@@ -37,27 +38,20 @@ from exectunnel.exceptions import (
     ConnectionClosedError,
     WebSocketSendTimeoutError,
 )
-from exectunnel.observability import (
-    aspan,
-    metrics_gauge_set,
-    metrics_inc,
-)
+from exectunnel.observability import aspan, metrics_gauge_set, metrics_inc
 from exectunnel.protocol import FRAME_PREFIX, FRAME_SUFFIX, encode_keepalive_frame
 
 from ._config import SessionConfig
+from ._constants import STOP_GRACE_TIMEOUT_SECS
 
 logger = logging.getLogger(__name__)
 
-# ── Internal constants ────────────────────────────────────────────────────────
-
-# Length of the frame prefix — used to extract msg_type for metrics.
 _FRAME_PREFIX_LEN: Final[int] = len(FRAME_PREFIX)
-_STOP_GRACE_TIMEOUT_SECS: Final[float] = 5.0
 _MSG_TYPE_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Z_]+$")
 
 
 class _StopSentinel:
-    """Singleton stop signal for the send-loop queues."""
+    """Singleton stop signal inserted into the send-loop queues on shutdown."""
 
     __slots__ = ()
 
@@ -66,15 +60,20 @@ class _StopSentinel:
 
 
 _QUEUE_STOP = _StopSentinel()
+"""Singleton instance used to signal the send loop to exit."""
 
-_SendQueueItem = str | _StopSentinel
+type _SendQueueItem = str | _StopSentinel
 
 
 def _extract_msg_type(frame: str) -> str:
-    """Extract the msg_type token from an encoded frame string for metrics.
+    """Extract the ``msg_type`` token from an encoded frame string for metrics.
 
-    Expects the canonical format ``<<<EXECTUNNEL:{TYPE}:...>>>\\n``.
-    Returns ``"unknown"`` if the format is unexpected.
+    Args:
+        frame: A newline-terminated encoded frame string.
+
+    Returns:
+        The ``msg_type`` token extracted from the frame prefix, or ``"unknown"``
+        if the frame format is unexpected or the token contains invalid characters.
     """
     if not frame.startswith(FRAME_PREFIX):
         return "unknown"
@@ -100,21 +99,26 @@ class WsSender:
     task.  Callers enqueue frames via :meth:`send`; the loop drains them in
     priority order and writes to the WebSocket.
 
-    Lifecycle
-    ---------
-    1. Construct with ``WsSender(ws, session_cfg, ws_closed_event)``.
-    2. Call ``start()`` to spawn the send loop task.
-    3. Enqueue frames via ``await sender.send(frame, ...)``.
-    4. Call ``stop()`` to drain and shut down.
+    Lifecycle:
+        1. Construct with ``WsSender(ws, session_cfg, ws_closed_event)``.
+        2. Call :meth:`start` to spawn the send loop task.
+        3. Enqueue frames via ``await sender.send(frame, ...)``.
+        4. Call :meth:`stop` to drain and shut down.
 
-    The ``ws_closed`` event is set by ``FrameReceiver`` when the WebSocket
-    closes.  ``WsSender`` reads it to reject ``must_queue`` calls on a dead
-    connection.
+    The ``ws_closed`` event is set by
+    :class:`~exectunnel.session._receiver.FrameReceiver` when the WebSocket
+    closes.  :class:`WsSender` reads it to reject ``must_queue`` calls on a
+    dead connection.
 
-    The send loop sets ``ws_closed`` in its ``finally`` block **only** when
-    it exits due to an unexpected error (``WebSocketSendTimeoutError`` or
-    ``ConnectionClosedError``).  A clean ``stop()`` call does not set the
-    event — ``FrameReceiver`` is the authoritative setter for normal teardown.
+    The send loop sets ``ws_closed`` in its ``finally`` block **only** when it
+    exits due to an unexpected error.  A clean :meth:`stop` call does not set
+    the event — :class:`~exectunnel.session._receiver.FrameReceiver` is the
+    authoritative setter for normal teardown.
+
+    Args:
+        ws:          Live WebSocket connection.
+        session_cfg: Session-level configuration.
+        ws_closed:   Shared closed event owned by ``FrameReceiver``.
     """
 
     __slots__ = (
@@ -140,16 +144,12 @@ class WsSender:
         self._cfg = session_cfg
         self._ws_closed = ws_closed
 
-        # Control queue is unbounded — teardown sentinels must never be
-        # dropped.
         self._ctrl_queue: asyncio.Queue[_SendQueueItem] = asyncio.Queue()
         self._data_queue: asyncio.Queue[_SendQueueItem] = asyncio.Queue(
             maxsize=session_cfg.send_queue_cap,
         )
 
-        # Notification event — set by send()/stop(), cleared by send loop.
         self._frame_ready = asyncio.Event()
-
         self._loop_task: asyncio.Task[None] | None = None
         self._send_drop_count: int = 0
         self._started: bool = False
@@ -158,14 +158,14 @@ class WsSender:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        """Spawn the background send loop task.  Call once per session."""
+        """Spawn the background send loop task.
+
+        Idempotent — subsequent calls are no-ops.
+        """
         if self._started:
             return
         self._started = True
-        self._loop_task = asyncio.create_task(
-            self._run(),
-            name="tun-send-loop",
-        )
+        self._loop_task = asyncio.create_task(self._run(), name="tun-send-loop")
 
     async def stop(self) -> None:
         """Signal the send loop to exit and await its completion.
@@ -173,8 +173,12 @@ class WsSender:
         Inserts the stop sentinel into the control queue (always succeeds —
         unbounded) and sets the notification event so the loop wakes
         immediately.  Waits for graceful drain/exit first, then force-cancels
-        after a timeout if needed.  Does NOT set ``ws_closed`` — that is
-        ``FrameReceiver``'s responsibility.
+        after :data:`~exectunnel.session._constants.STOP_GRACE_TIMEOUT_SECS`.
+
+        Does **not** set ``ws_closed`` — that is
+        :class:`~exectunnel.session._receiver.FrameReceiver`'s responsibility.
+
+        Idempotent — subsequent calls are no-ops.
         """
         if self._stopped:
             return
@@ -185,7 +189,7 @@ class WsSender:
 
         if self._loop_task is not None and not self._loop_task.done():
             try:
-                async with asyncio.timeout(_STOP_GRACE_TIMEOUT_SECS):
+                async with asyncio.timeout(STOP_GRACE_TIMEOUT_SECS):
                     await self._loop_task
             except (TimeoutError, asyncio.CancelledError):
                 self._loop_task.cancel()
@@ -201,14 +205,8 @@ class WsSender:
 
     def _emit_queue_gauges(self) -> None:
         """Publish current queue depths as gauge metrics."""
-        metrics_gauge_set(
-            "session.send.queue.data",
-            float(self._data_queue.qsize()),
-        )
-        metrics_gauge_set(
-            "session.send.queue.ctrl",
-            float(self._ctrl_queue.qsize()),
-        )
+        metrics_gauge_set("session.send.queue.data", float(self._data_queue.qsize()))
+        metrics_gauge_set("session.send.queue.ctrl", float(self._ctrl_queue.qsize()))
 
     # ── WsSendCallable implementation ─────────────────────────────────────────
 
@@ -221,22 +219,21 @@ class WsSender:
     ) -> None:
         """Enqueue *frame* for delivery by the send loop.
 
-        Parameters mirror the ``WsSendCallable`` protocol exactly.
-
         Args:
-            frame:      Newline-terminated frame string from
-                        ``encode_*_frame()``.
+            frame:      Newline-terminated frame string from an ``encode_*_frame()``
+                        helper.
             must_queue: Block until enqueued under backpressure (DATA frames).
-            control:    Bypass flow-control ordering (CONN_CLOSE, UDP_*
-                        frames).  When ``True``, ``must_queue`` is ignored.
+                        Ignored when *control* is ``True``.
+            control:    Bypass flow-control ordering (``CONN_OPEN``, ``CONN_CLOSE``,
+                        ``UDP_*`` frames).  When ``True``, the frame is placed in
+                        the unbounded control queue and *must_queue* is ignored.
 
         Raises:
             ConnectionClosedError: When ``must_queue=True`` and the WebSocket
-                is already closed — signals the caller that the frame was not
-                delivered.
+                                   is already closed or closes while waiting to
+                                   enqueue.
         """
         if control:
-            # Unbounded queue — put_nowait never raises QueueFull.
             self._ctrl_queue.put_nowait(frame)
             self._frame_ready.set()
             self._emit_queue_gauges()
@@ -252,10 +249,25 @@ class WsSender:
                         "close_reason": "ws_closed_before_enqueue",
                     },
                 )
-            # Race ws_closed against the blocking put so callers don't hang
-            # forever when the send loop exits during shutdown.
-            ws_wait = asyncio.ensure_future(self._ws_closed.wait())
-            put_task = asyncio.ensure_future(self._data_queue.put(frame))
+
+            # Fast path — avoid creating auxiliary tasks when the data queue
+            # has headroom.  Under high data rates this path is hit on nearly
+            # every call and measurably reduces per-chunk overhead.
+            try:
+                self._data_queue.put_nowait(frame)
+            except asyncio.QueueFull:
+                pass
+            else:
+                self._frame_ready.set()
+                self._emit_queue_gauges()
+                return
+
+            # Slow path — the queue is full.  Race put() against ws_closed
+            # so a dying WebSocket does not wedge the caller indefinitely.
+            ws_wait = asyncio.create_task(self._ws_closed.wait(), name="ws-closed-wait")
+            put_task = asyncio.create_task(
+                self._data_queue.put(frame), name="data-queue-put"
+            )
             try:
                 done, _ = await asyncio.wait(
                     {ws_wait, put_task},
@@ -271,7 +283,6 @@ class WsSender:
                 raise
 
             if put_task in done:
-                # Frame was enqueued successfully.
                 ws_wait.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await ws_wait
@@ -279,7 +290,6 @@ class WsSender:
                 self._emit_queue_gauges()
                 return
 
-            # ws_closed won the race — cancel the put and raise.
             put_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await put_task
@@ -316,7 +326,9 @@ class WsSender:
     def _try_dequeue(self) -> _SendQueueItem | None:
         """Try to dequeue one item, preferring the control queue.
 
-        Returns ``None`` if both queues are empty.  Never blocks.
+        Returns:
+            The next item from the control queue if non-empty, then from the
+            data queue, or ``None`` if both queues are empty.
         """
         try:
             return self._ctrl_queue.get_nowait()
@@ -330,24 +342,24 @@ class WsSender:
     async def _run(self) -> None:
         """Single writer to the WebSocket — serialises all outgoing frames.
 
-        Priority: control queue is drained before data queue on every
-        iteration.  Exits on the ``_QUEUE_STOP`` sentinel or on WebSocket
-        close.
+        Priority: control queue drained before data queue on every iteration.
+        Exits on the :data:`_QUEUE_STOP` sentinel or on WebSocket close.
 
-        Uses an ``asyncio.Event`` (``_frame_ready``) for idle-wait instead
-        of racing two tasks.  The standard condition-variable double-check
-        pattern (clear → re-check → wait) prevents lost wakeups without
-        creating any tasks.
+        Uses an :class:`asyncio.Event` for idle-wait (standard
+        condition-variable double-check pattern) rather than racing two tasks,
+        eliminating per-iteration task overhead.
 
-        On unexpected exit (timeout or connection closed) the ``ws_closed``
-        event is set so that ``_await_conn_ack``'s ``ws_closed_task``
-        unblocks promptly.  On clean ``stop()`` the event is NOT set here —
-        ``FrameReceiver`` is the authoritative setter.
+        On unexpected exit (timeout or connection closed) ``ws_closed`` is set
+        so that ``_await_conn_ack``'s ``ws_closed_task`` unblocks promptly.
+        On clean :meth:`stop`, the event is **not** set here —
+        :class:`~exectunnel.session._receiver.FrameReceiver` is the
+        authoritative setter.
 
         Raises:
-            WebSocketSendTimeoutError: Propagated to ``_run_tasks`` to
-                                       trigger reconnect.
-            ConnectionClosedError:     Same.
+            WebSocketSendTimeoutError: Propagated to ``_run_tasks`` to trigger
+                                       reconnect.
+            ConnectionClosedError:     Propagated to ``_run_tasks`` to trigger
+                                       reconnect.
         """
         ws = self._ws
         send_timeout = self._cfg.send_timeout
@@ -356,14 +368,8 @@ class WsSender:
         try:
             async with aspan("session.send_loop"):
                 while True:
-                    # ── Dequeue with priority ─────────────────────────────
                     item = self._try_dequeue()
                     if item is None:
-                        # Standard condition-variable double-check:
-                        # 1. Clear the event.
-                        # 2. Re-check queues (catches races with concurrent
-                        #    send()).
-                        # 3. Only wait if still empty.
                         self._frame_ready.clear()
                         item = self._try_dequeue()
                         if item is None:
@@ -371,9 +377,8 @@ class WsSender:
                             continue
 
                     if isinstance(item, _StopSentinel):
-                        return  # Clean exit.
+                        return
 
-                    # ── Send frame ────────────────────────────────────────
                     frame: str = item
                     msg_type = _extract_msg_type(frame)
                     frame_bytes = len(frame.encode())
@@ -382,14 +387,8 @@ class WsSender:
                         async with asyncio.timeout(send_timeout):
                             await ws.send(frame)
 
-                        metrics_inc(
-                            "session.frames.outbound",
-                            msg_type=msg_type,
-                        )
-                        metrics_inc(
-                            "session.frames.outbound.bytes",
-                            value=frame_bytes,
-                        )
+                        metrics_inc("session.frames.outbound", msg_type=msg_type)
+                        metrics_inc("session.frames.outbound.bytes", value=frame_bytes)
                         self._emit_queue_gauges()
 
                     except TimeoutError as exc:
@@ -421,12 +420,9 @@ class WsSender:
                         ) from exc
 
         finally:
-            # Only set ws_closed on unexpected exit — clean stop() does not
-            # set it here; FrameReceiver.run() is the authoritative setter.
             if unexpected_exit:
                 metrics_inc("session.send.unexpected_exit")
                 self._ws_closed.set()
-            # Zero out queue gauges on loop exit.
             metrics_gauge_set("session.send.queue.data", 0.0)
             metrics_gauge_set("session.send.queue.ctrl", 0.0)
 
@@ -437,13 +433,15 @@ class KeepaliveLoop:
     The KEEPALIVE frame is discarded by the agent.  It exists solely to keep
     the WebSocket alive through NAT/proxy idle timeouts.
 
-    Uses ``asyncio.timeout`` on ``ws_closed.wait()`` so the loop exits
-    promptly when the WebSocket closes rather than sleeping for a full
-    interval.
+    Uses :func:`asyncio.timeout` on ``ws_closed.wait()`` so the loop exits
+    promptly when the WebSocket closes rather than sleeping a full interval.
+
+    Args:
+        sender:    The concurrency-safe frame sender.
+        ws_closed: Shared closed event owned by ``FrameReceiver``.
+        interval:  Seconds between KEEPALIVE frames.
     """
 
-    # Computed once at module load via the canonical encoder — stays in sync
-    # with any future changes to FRAME_PREFIX / FRAME_SUFFIX / frame format.
     _KEEPALIVE_FRAME: Final[str] = encode_keepalive_frame()
 
     __slots__ = ("_sender", "_ws_closed", "_interval")
@@ -465,10 +463,7 @@ class KeepaliveLoop:
                 try:
                     async with asyncio.timeout(self._interval):
                         await self._ws_closed.wait()
-                    return  # WebSocket closed — exit cleanly.
+                    return
                 except TimeoutError:
                     metrics_inc("session.keepalive.sent")
-                    await self._sender.send(
-                        self._KEEPALIVE_FRAME,
-                        control=True,
-                    )
+                    await self._sender.send(self._KEEPALIVE_FRAME, control=True)

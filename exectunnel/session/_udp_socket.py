@@ -1,7 +1,7 @@
 """Async-safe UDP socket helpers for the session layer.
 
-``make_udp_socket`` and ``resolve_address_family`` are used by the
-direct-UDP relay path in ``_dispatcher.py``.
+:func:`make_udp_socket` and :func:`resolve_address_family` are used by the
+direct-UDP relay path in :mod:`_dispatcher`.
 """
 
 from __future__ import annotations
@@ -20,6 +20,9 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+_IPV6_VERSION: int = 6
+"""IP version number that identifies an IPv6 address."""
+
 
 async def resolve_address_family(
     host: str,
@@ -28,27 +31,28 @@ async def resolve_address_family(
 ) -> socket.AddressFamily:
     """Resolve the correct socket address family for *host* without blocking.
 
-    For IP literals the resolution is synchronous (no I/O).
-    For domain names ``getaddrinfo`` is dispatched to the default executor
-    so the event loop is never blocked.
+    For IP literals the resolution is purely synchronous (no I/O).  For
+    domain names ``getaddrinfo`` is dispatched to the default executor so
+    the event loop is never blocked.
 
     Args:
-        host:         An IPv4 or IPv6 address string, or a domain name.
-        prefer_ipv4:  When *host* is a domain that resolves to both IPv4 and
-                      IPv6 addresses, prefer ``AF_INET``.  Default ``False``
-                      (use whatever ``getaddrinfo`` returns first — typically
-                      IPv6 on dual-stack systems).
+        host:        An IPv4 or IPv6 address string, or a domain name.
+        prefer_ipv4: When *host* is a domain that resolves to both IPv4 and
+                     IPv6 addresses, prefer ``AF_INET``.  Defaults to ``False``
+                     (use whatever ``getaddrinfo`` returns first — typically
+                     IPv6 on dual-stack systems).
 
     Returns:
-        ``socket.AF_INET`` or ``socket.AF_INET6``.
+        ``socket.AF_INET`` for IPv4 or ``socket.AF_INET6`` for IPv6.
 
     Raises:
-        ConfigurationError: If the address family cannot be determined.
+        ConfigurationError: If the address family cannot be determined, either
+                            because DNS resolution failed or returned no results.
     """
-    # Fast path for IP literals — no async I/O needed.
+    # Fast path for IP literals — no async I/O required.
     try:
         addr = ipaddress.ip_address(host)
-        return socket.AF_INET6 if addr.version == 6 else socket.AF_INET
+        return socket.AF_INET6 if addr.version == _IPV6_VERSION else socket.AF_INET
     except ValueError:
         pass
 
@@ -73,7 +77,6 @@ async def resolve_address_family(
     if prefer_ipv4 and socket.AF_INET in families:
         return socket.AF_INET
 
-    # Return whatever getaddrinfo considers highest-priority.
     family = infos[0][0]
     logger.debug(
         "resolved %s → %s (available: %s)",
@@ -92,23 +95,20 @@ async def make_udp_socket(
     """Create a non-blocking UDP socket with the correct address family for *host*.
 
     Always safe to call from the asyncio event loop thread — domain name
-    resolution is dispatched to the executor.
-
-    The returned socket is set to non-blocking mode for direct use with
-    ``asyncio`` transport APIs.
+    resolution is dispatched to the executor via :func:`resolve_address_family`.
 
     The caller is responsible for closing the returned socket.
 
     Args:
-        host:         An IPv4 or IPv6 address string, or a domain name.
-        prefer_ipv4:  Prefer ``AF_INET`` for dual-stack domain names.
+        host:        An IPv4 or IPv6 address string, or a domain name.
+        prefer_ipv4: Prefer ``AF_INET`` for dual-stack domain names.
 
     Returns:
-        A non-blocking, unconnected UDP socket.
+        A non-blocking, unconnected UDP :class:`socket.socket`.
 
     Raises:
         ConfigurationError: If address family resolution fails or the OS
-            refuses to create a UDP socket.
+                            refuses to create a UDP socket (e.g. IPv6 disabled).
     """
     family = await resolve_address_family(host, prefer_ipv4=prefer_ipv4)
     try:

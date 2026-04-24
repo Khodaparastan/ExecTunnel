@@ -2,15 +2,32 @@
 
 Frame dispatch table
 --------------------
-``CONN_ACK``   → resolve pending connect future
-``DATA``       → feed bytes to TcpConnection via synchronous feed()
-``CONN_CLOSE`` → signal handler remote-closed
-``UDP_DATA``   → feed datagram to UdpFlow
-``UDP_CLOSE``  → signal flow remote-closed
-``ERROR``      → session-level or per-connection/flow error handling
+
+.. list-table::
+   :header-rows: 1
+
+   * - Frame type
+     - Action
+   * - ``CONN_ACK``
+     - Resolve the pending connect future.
+   * - ``DATA``
+     - Feed bytes to :class:`~exectunnel.transport.TcpConnection` via ``feed()``.
+   * - ``CONN_CLOSE``
+     - Signal the handler that the remote side closed.
+   * - ``UDP_DATA``
+     - Feed a datagram to :class:`~exectunnel.transport.UdpFlow`.
+   * - ``UDP_CLOSE``
+     - Signal the flow that the remote side closed.
+   * - ``ERROR``
+     - Session-level or per-connection/flow error handling.
+   * - ``STATS``
+     - Decode and forward to the optional stats listener.
 """
 
 import asyncio
+import base64
+import binascii
+import json
 import logging
 
 from websockets.asyncio.client import ClientConnection
@@ -19,22 +36,27 @@ from websockets.exceptions import ConnectionClosed
 from exectunnel.exceptions import (
     ConnectionClosedError,
     FrameDecodingError,
+    TransportError,
     UnexpectedFrameError,
 )
-from exectunnel.observability import (
-    aspan,
-    metrics_inc,
-    metrics_observe,
-)
+from exectunnel.observability import aspan, metrics_inc, metrics_observe
 from exectunnel.protocol import (
     SESSION_CONN_ID,
     decode_binary_payload,
     decode_error_payload,
+    encode_error_frame,
     parse_frame,
 )
 from exectunnel.transport import TcpConnection, UdpFlow
+from exectunnel.transport._types import WsSendCallable
 
+from ._constants import (
+    UNEXPECTED_NO_CONN_ID_FRAMES,
+    WS_CLOSE_CODE_INTERNAL_ERROR,
+    WS_CLOSE_CODE_PROTOCOL_ERROR,
+)
 from ._state import AckStatus, PendingConnect
+from ._types import AgentStatsCallable
 
 logger = logging.getLogger(__name__)
 
@@ -42,17 +64,23 @@ logger = logging.getLogger(__name__)
 class FrameReceiver:
     """Reads WebSocket messages and dispatches frames to registered handlers.
 
-    Shared state (registries, pending connects) is owned by ``TunnelSession``
-    and passed in by reference — ``FrameReceiver`` never copies them.
+    Shared state (registries, pending connects) is owned by
+    :class:`~exectunnel.session._session.TunnelSession` and passed in by
+    reference — :class:`FrameReceiver` never copies them.
 
     Args:
         ws:               Live WebSocket connection.
         ws_closed:        Event set when the WebSocket closes.
-        tcp_registry:     Shared TCP connection registry.
-        pending_connects: Shared pending-connect registry.
-        udp_registry:     Shared UDP flow registry.
-        post_ready_lines: Lines buffered during bootstrap for replay.
-        pre_ready_carry:  Partial frame fragment from bootstrap.
+        tcp_registry:     Shared TCP connection registry mapping conn IDs to handlers.
+        pending_connects: Shared pending-connect registry mapping conn IDs to futures.
+        udp_registry:     Shared UDP flow registry mapping flow IDs to flows.
+        post_ready_lines: Lines buffered during bootstrap for replay before live
+                          WebSocket iteration begins.
+        pre_ready_carry:  Partial frame fragment accumulated during bootstrap.
+        ws_send:          Optional sender used to emit ``ERROR`` frames on
+                          per-connection inbound saturation (head-of-line guard).
+        on_agent_stats:   Optional listener invoked for each decoded ``STATS``
+                          snapshot.  Must not block or raise.
     """
 
     __slots__ = (
@@ -63,6 +91,8 @@ class FrameReceiver:
         "_udp_registry",
         "_post_ready_lines",
         "_pre_ready_carry",
+        "_ws_send",
+        "_on_agent_stats_cb",
     )
 
     def __init__(
@@ -74,6 +104,8 @@ class FrameReceiver:
         udp_registry: dict[str, UdpFlow],
         post_ready_lines: list[str],
         pre_ready_carry: str,
+        ws_send: WsSendCallable | None = None,
+        on_agent_stats: AgentStatsCallable | None = None,
     ) -> None:
         self._ws = ws
         self._ws_closed = ws_closed
@@ -82,6 +114,8 @@ class FrameReceiver:
         self._udp_registry = udp_registry
         self._post_ready_lines = list(post_ready_lines)
         self._pre_ready_carry = pre_ready_carry
+        self._ws_send = ws_send
+        self._on_agent_stats_cb = on_agent_stats
 
     # ── Entry point ───────────────────────────────────────────────────────────
 
@@ -91,18 +125,16 @@ class FrameReceiver:
         Replays buffered post-ready lines first, then takes over the live
         WebSocket iterator.
 
-        Close sequencing
-        ----------------
-        ``_ws_closed`` is set **before** closing handlers so that any
-        coroutine blocked on ``_ws_closed.wait()`` (e.g. the ws_closed_task
-        in ``_handle_tunnel_connect``) unblocks immediately and does not race
-        with handler teardown.
+        Close sequencing: ``_ws_closed`` is set **before** closing handlers so
+        any coroutine blocked on ``_ws_closed.wait()`` unblocks immediately and
+        does not race with handler teardown.
 
         Raises:
-            ConnectionClosedError: On session-level ERROR frame or corrupt
-                                   frame.
-            UnexpectedFrameError:  On AGENT_READY / CONN_OPEN / UDP_OPEN /
-                                   KEEPALIVE from agent.
+            ConnectionClosedError: On a session-level ``ERROR`` frame or a
+                                   corrupt/non-UTF-8 frame.
+            UnexpectedFrameError:  On ``AGENT_READY``, ``KEEPALIVE``,
+                                   ``CONN_OPEN``, or ``UDP_OPEN`` received from
+                                   the agent post-bootstrap.
         """
         async with aspan("session.recv_loop"):
             for line in self._post_ready_lines:
@@ -124,7 +156,7 @@ class FrameReceiver:
                             raise ConnectionClosedError(
                                 "Agent sent non-UTF-8 frame bytes.",
                                 details={
-                                    "close_code": 1002,
+                                    "close_code": WS_CLOSE_CODE_PROTOCOL_ERROR,
                                     "close_reason": "non_utf8_frame_bytes",
                                 },
                             ) from exc
@@ -137,7 +169,7 @@ class FrameReceiver:
             finally:
                 if buf.strip():
                     logger.debug(
-                        "recv: WebSocket closed with %d chars of residual buffered data dropped: %r",
+                        "recv: WebSocket closed with %d chars of residual data dropped: %r",
                         len(buf),
                         buf[:120],
                     )
@@ -150,11 +182,7 @@ class FrameReceiver:
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
     def _force_cleanup(self) -> None:
-        """Abort all TCP handlers and close all UDP flows on WS disconnect.
-
-        Emits cleanup metrics so operators can see the blast radius of an
-        unclean disconnect.
-        """
+        """Abort all TCP handlers and signal close to all UDP flows on WebSocket disconnect."""
         tcp_count = 0
         for handler in list(self._tcp_registry.values()):
             handler.abort_upstream()
@@ -185,21 +213,23 @@ class FrameReceiver:
     async def _dispatch_frame(self, line: str) -> None:
         """Parse and dispatch one frame line.
 
-        Two layers of ``FrameDecodingError`` handling:
+        Two layers of :exc:`~exectunnel.exceptions.FrameDecodingError` handling:
 
-        1. **Frame structure** — ``parse_frame`` rejects malformed frames
-           (bad conn_id, unknown msg_type).  Caught here and wrapped.
-        2. **Payload content** — ``decode_binary_payload`` /
-           ``decode_error_payload`` reject corrupt base64 / UTF-8.  Caught
-           around the ``match`` block and wrapped identically.
+        1. **Frame structure** — ``parse_frame`` rejects malformed frames.
+           Caught here and wrapped in :exc:`~exectunnel.exceptions.ConnectionClosedError`.
+        2. **Payload content** — decode helpers reject corrupt base64/UTF-8.
+           Caught around the ``match`` block and wrapped identically.
 
-        Both layers produce ``ConnectionClosedError`` because a corrupt frame
-        from the agent indicates either a protocol violation or proxy
-        corruption — the session cannot continue safely.
+        Both produce :exc:`~exectunnel.exceptions.ConnectionClosedError` because
+        a corrupt frame from the agent signals a protocol violation the session
+        cannot safely continue.
+
+        Args:
+            line: A single newline-delimited frame string.
 
         Raises:
             ConnectionClosedError: On corrupt frame structure or payload.
-            UnexpectedFrameError:  On unexpected frame type for current state.
+            UnexpectedFrameError:  On unexpected frame type.
         """
         try:
             frame = parse_frame(line)
@@ -208,7 +238,7 @@ class FrameReceiver:
             raise ConnectionClosedError(
                 "Agent sent a corrupt tunnel frame.",
                 details={
-                    "close_code": 1002,
+                    "close_code": WS_CLOSE_CODE_PROTOCOL_ERROR,
                     "close_reason": exc.message,
                 },
             ) from exc
@@ -222,12 +252,28 @@ class FrameReceiver:
         conn_id = frame.conn_id
         metrics_inc("session.frames.inbound", msg_type=msg_type)
 
-        try:
-            if conn_id is None:
-                logger.debug("recv: frame with no conn_id: %r", frame)
-                metrics_inc("session.frames.no_conn_id")
-                return
+        # Must be checked before the conn_id guard — AGENT_READY and KEEPALIVE
+        # have conn_id=None by design, so the guard below would silently drop
+        # them instead of surfacing the protocol violation.
+        if msg_type in UNEXPECTED_NO_CONN_ID_FRAMES:
+            raise UnexpectedFrameError(
+                f"{msg_type} received from agent after session was established.",
+                details={"state": "running", "frame_type": msg_type},
+            )
 
+        # STATS is a session-scoped observability snapshot (no conn_id).
+        if msg_type == "STATS":
+            self._on_stats(frame.payload)
+            return
+
+        if conn_id is None:
+            logger.warning(
+                "recv: frame %r arrived with no conn_id — dropping", msg_type
+            )
+            metrics_inc("session.frames.no_conn_id")
+            return
+
+        try:
             async with aspan(
                 "session.handle_frame", msg_type=msg_type, conn_id=conn_id
             ):
@@ -250,13 +296,7 @@ class FrameReceiver:
                     case "ERROR":
                         await self._on_error(conn_id, frame.payload)
 
-                    case "AGENT_READY":
-                        raise UnexpectedFrameError(
-                            "AGENT_READY received after session was established.",
-                            details={"state": "running", "frame_type": "AGENT_READY"},
-                        )
-
-                    case "CONN_OPEN" | "UDP_OPEN" | "KEEPALIVE":
+                    case "CONN_OPEN" | "UDP_OPEN":
                         raise UnexpectedFrameError(
                             f"{msg_type} received from agent — unexpected direction.",
                             details={"state": "running", "frame_type": msg_type},
@@ -271,9 +311,10 @@ class FrameReceiver:
         except FrameDecodingError as exc:
             metrics_inc("session.frames.payload_decode_error")
             raise ConnectionClosedError(
-                f"Agent sent a frame with a corrupt payload (msg_type={msg_type!r}, conn_id={conn_id!r}).",
+                f"Agent sent a frame with a corrupt payload "
+                f"(msg_type={msg_type!r}, conn_id={conn_id!r}).",
                 details={
-                    "close_code": 1002,
+                    "close_code": WS_CLOSE_CODE_PROTOCOL_ERROR,
                     "close_reason": exc.message,
                     "msg_type": msg_type,
                     "conn_id": conn_id,
@@ -283,10 +324,10 @@ class FrameReceiver:
     # ── Per-type callbacks ────────────────────────────────────────────────────
 
     def _on_conn_ack(self, conn_id: str) -> None:
-        """Resolve the pending connect future for a CONN_ACK frame.
+        """Resolve the pending connect future for a ``CONN_ACK`` frame.
 
-        ``conn_id`` is already validated by ``parse_frame`` via ``ID_RE`` —
-        no additional format check is needed here.
+        Args:
+            conn_id: Connection ID from the received frame.
         """
         pending = self._pending_connects.get(conn_id)
         if pending is not None and not pending.ack_future.done():
@@ -299,6 +340,12 @@ class FrameReceiver:
             metrics_inc("session.frames.orphaned", frame_type="CONN_ACK")
 
     async def _on_data(self, conn_id: str, payload: str) -> None:
+        """Feed decoded data to the :class:`~exectunnel.transport.TcpConnection` handler.
+
+        Args:
+            conn_id: Connection ID from the received frame.
+            payload: Base64-encoded data payload from the frame.
+        """
         handler = self._tcp_registry.get(conn_id)
         if handler is None:
             metrics_inc("session.frames.orphaned", frame_type="DATA")
@@ -309,43 +356,88 @@ class FrameReceiver:
 
         pending = self._pending_connects.get(conn_id)
         if pending is not None and not pending.ack_future.done():
-            # Pre-ACK: synchronous feed with overflow detection.
             if handler.is_closed:
                 return
             try:
                 handler.feed(data)
-            except Exception as exc:
-                if (
-                    hasattr(exc, "error_code")
-                    and getattr(exc, "error_code")
-                    == "transport.pre_ack_buffer_overflow"
-                ):
+            except TransportError as exc:
+                if exc.error_code == "transport.pre_ack_buffer_overflow":
                     if not pending.ack_future.done():
                         pending.ack_future.set_result(AckStatus.PRE_ACK_OVERFLOW)
                     metrics_inc("tunnel.pre_ack_buffer.overflow")
                 else:
                     metrics_inc(
                         "tunnel.inbound_queue.drop",
-                        error=getattr(exc, "error_code", type(exc).__name__).replace(
-                            ".", "_"
-                        ),
+                        error=exc.error_code.replace(".", "_"),
                     )
                     logger.debug(
-                        "conn %s: feed() dropped chunk: %s",
+                        "conn %s: pre-ACK feed() dropped chunk: %s",
                         conn_id,
                         exc,
                         extra={"conn_id": conn_id},
                     )
             return
 
+        # Non-blocking enqueue: a slow local consumer must not stall the
+        # receive loop for other multiplexed connections.  On overflow we
+        # tear down only this connection (ERROR + abort) and keep reading.
+        if self._ws_send is not None:
+            try:
+                accepted = handler.try_feed(data)
+            except TransportError as exc:
+                metrics_inc(
+                    "tunnel.inbound_queue.drop",
+                    error=exc.error_code.replace(".", "_"),
+                )
+                logger.debug(
+                    "conn %s: post-ACK try_feed() error: %s",
+                    conn_id,
+                    exc,
+                    extra={"conn_id": conn_id},
+                )
+                return
+            if accepted:
+                return
+            # Queue full → signal the agent to close its side and locally
+            # abort, so the slow consumer cannot stall the WS dispatcher.
+            metrics_inc(
+                "tunnel.inbound_queue.drop",
+                error="transport_inbound_queue_full",
+            )
+            metrics_inc("session.recv.hol_abort")
+            logger.warning(
+                "conn %s: inbound queue full — aborting connection to avoid "
+                "head-of-line blocking of other muxed connections",
+                conn_id,
+                extra={"conn_id": conn_id},
+            )
+            try:
+                await self._ws_send(
+                    encode_error_frame(conn_id, "client inbound saturated"),
+                    control=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "conn %s: failed to emit saturation ERROR frame: %s",
+                    conn_id,
+                    exc,
+                    extra={"conn_id": conn_id},
+                )
+            handler.abort_upstream()
+            handler.on_remote_closed()
+            return
+
+        # Fallback (legacy path, no ws_send wired in): await feed_async —
+        # preserves previous behaviour for any construction site that has
+        # not been updated to pass ``ws_send``.
         try:
             await handler.feed_async(data)
         except ConnectionClosedError:
             metrics_inc("session.frames.orphaned", frame_type="DATA")
-        except Exception as exc:
+        except TransportError as exc:
             metrics_inc(
                 "tunnel.inbound_queue.drop",
-                error=getattr(exc, "error_code", type(exc).__name__).replace(".", "_"),
+                error=exc.error_code.replace(".", "_"),
             )
             logger.debug(
                 "conn %s: post-ACK feed_async() dropped chunk: %s",
@@ -355,7 +447,11 @@ class FrameReceiver:
             )
 
     def _on_conn_close(self, conn_id: str) -> None:
-        """React to CONN_CLOSE from agent."""
+        """React to a ``CONN_CLOSE`` frame from the agent.
+
+        Args:
+            conn_id: Connection ID from the received frame.
+        """
         handler = self._tcp_registry.get(conn_id)
         if handler is None:
             metrics_inc("session.frames.orphaned", frame_type="CONN_CLOSE")
@@ -366,11 +462,11 @@ class FrameReceiver:
         handler.on_remote_closed()
 
     def _on_udp_data(self, flow_id: str, payload: str) -> None:
-        """Feed decoded datagram to the UdpFlow handler.
+        """Feed a decoded datagram to the :class:`~exectunnel.transport.UdpFlow` handler.
 
-        ``decode_binary_payload`` raises ``FrameDecodingError`` on corrupt
-        base64 — propagated to ``_dispatch_frame`` which wraps it in
-        ``ConnectionClosedError``.
+        Args:
+            flow_id: Flow ID from the received frame.
+            payload: Base64-encoded datagram payload from the frame.
         """
         flow = self._udp_registry.get(flow_id)
         if flow is None:
@@ -380,8 +476,46 @@ class FrameReceiver:
         metrics_inc("session.frames.bytes.in", value=len(data))
         flow.feed(data)
 
+    def _on_stats(self, payload: str) -> None:
+        """Decode a ``STATS`` payload (base64url-JSON) and invoke the listener.
+
+        When no listener is registered, increments a metric counter so STATS
+        traffic remains observable at near-zero cost.
+
+        Args:
+            payload: Base64url-encoded JSON snapshot string (no padding).
+        """
+        metrics_inc("session.frames.stats")
+        if self._on_agent_stats_cb is None:
+            return
+        try:
+            # STATS uses URL-safe base64 without padding (same as DATA); add
+            # padding before decoding.
+            padding = (4 - len(payload) % 4) % 4
+            raw = base64.urlsafe_b64decode(payload + "=" * padding)
+            snapshot = json.loads(raw.decode("utf-8"))
+        except (binascii.Error, ValueError, UnicodeDecodeError) as exc:
+            metrics_inc("session.frames.stats_decode_error")
+            logger.debug("recv: failed to decode STATS payload: %s", exc)
+            return
+        if not isinstance(snapshot, dict):
+            metrics_inc("session.frames.stats_decode_error")
+            logger.debug(
+                "recv: STATS payload decoded to %s, expected dict",
+                type(snapshot).__name__,
+            )
+            return
+        try:
+            self._on_agent_stats_cb(snapshot)
+        except Exception as exc:  # noqa: BLE001 — listener must never crash recv loop
+            logger.warning("recv: on_agent_stats listener raised: %s", exc)
+
     def _on_udp_close(self, flow_id: str) -> None:
-        """React to UDP_CLOSE from agent."""
+        """React to a ``UDP_CLOSE`` frame from the agent.
+
+        Args:
+            flow_id: Flow ID from the received frame.
+        """
         flow = self._udp_registry.get(flow_id)
         if flow is not None:
             flow.on_remote_closed()
@@ -389,15 +523,19 @@ class FrameReceiver:
             metrics_inc("session.frames.orphaned", frame_type="UDP_CLOSE")
 
     async def _on_error(self, conn_id: str, payload: str) -> None:
-        """React to ERROR frame from agent.
+        """React to an ``ERROR`` frame from the agent.
 
-        Session-level errors (SESSION_CONN_ID) raise ConnectionClosedError.
+        Session-level errors (``SESSION_CONN_ID``) raise
+        :exc:`~exectunnel.exceptions.ConnectionClosedError`.
         Connection-level errors abort the upstream and signal the handler.
-        Flow-level errors signal the UdpFlow.
+        Flow-level errors signal the :class:`~exectunnel.transport.UdpFlow`.
 
-        ``decode_error_payload`` raises ``FrameDecodingError`` on corrupt
-        base64 / UTF-8 — propagated to ``_dispatch_frame`` which wraps it
-        in ``ConnectionClosedError``.
+        Args:
+            conn_id: Connection or flow ID from the received frame.
+            payload: Base64-encoded error message payload.
+
+        Raises:
+            ConnectionClosedError: On a session-level error frame.
         """
         message = decode_error_payload(payload)
 
@@ -406,7 +544,7 @@ class FrameReceiver:
             raise ConnectionClosedError(
                 f"Agent session error: {message}",
                 details={
-                    "close_code": 1011,
+                    "close_code": WS_CLOSE_CODE_INTERNAL_ERROR,
                     "close_reason": message,
                 },
             )
@@ -430,7 +568,7 @@ class FrameReceiver:
             return
 
         logger.debug(
-            "recv: ERROR frame for unknown conn_id %r — handler already cleaned up (message: %s)",
+            "recv: ERROR for unknown conn_id %r — handler already cleaned up (message: %s)",
             conn_id,
             message[:120],
         )
