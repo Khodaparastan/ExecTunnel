@@ -5,15 +5,15 @@ routes all connections through the WebSocket exec tunnel.
 
 Architecture
 ------------
-``TunnelSession`` wires together five sub-components:
+:class:`TunnelSession` wires together five sub-components:
 
-* ``AgentBootstrapper``  — uploads and starts the agent script.
-* ``WsSender``           — concurrency-safe WebSocket frame sender.
-* ``KeepaliveLoop``      — sends heartbeat frames to prevent idle timeouts.
-* ``FrameReceiver``      — reads inbound frames and dispatches to handlers.
-* ``RequestDispatcher``  — handles CONNECT and UDP_ASSOCIATE requests.
+* :class:`~exectunnel.session._bootstrap.AgentBootstrapper`  — uploads and starts the agent script.
+* :class:`~exectunnel.session._sender.WsSender`              — concurrency-safe WebSocket frame sender.
+* :class:`~exectunnel.session._sender.KeepaliveLoop`         — sends heartbeat frames to prevent idle timeouts.
+* :class:`~exectunnel.session._receiver.FrameReceiver`       — reads inbound frames and dispatches to handlers.
+* :class:`~exectunnel.session._dispatcher.RequestDispatcher` — handles CONNECT and UDP_ASSOCIATE requests.
 
-Each sub-component is constructed fresh per session (per ``_start_session``
+Each sub-component is constructed fresh per session (per :meth:`TunnelSession._start_session`
 call) so reconnects start with clean state.
 """
 
@@ -23,7 +23,7 @@ import logging
 import random
 import re
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed
@@ -43,7 +43,7 @@ from exectunnel.observability import (
     metrics_inc,
     metrics_observe,
 )
-from exectunnel.proxy import Socks5Request, Socks5Server, Socks5ServerConfig
+from exectunnel.proxy import Socks5Server, Socks5ServerConfig, TCPRelay
 from exectunnel.transport import TcpConnection, UdpFlow
 
 from ._bootstrap import AgentBootstrapper
@@ -52,6 +52,7 @@ from ._dispatcher import RequestDispatcher
 from ._receiver import FrameReceiver
 from ._sender import KeepaliveLoop, WsSender
 from ._state import PendingConnect
+from ._types import AgentStatsCallable
 
 if TYPE_CHECKING:
     from ._dns import DnsForwarder
@@ -60,15 +61,22 @@ __all__ = ["TunnelSession"]
 
 logger = logging.getLogger(__name__)
 
-# Reconnect jitter fraction — delay is multiplied by U(0, _RECONNECT_JITTER).
-_RECONNECT_JITTER: float = 0.25
+_RECONNECT_JITTER: Final[float] = 0.25
+"""Jitter factor applied to the reconnect back-off delay."""
+
+_SAFE_HOST_RE: Final[re.Pattern[str]] = re.compile(r"[^a-zA-Z0-9_.\-]")
+"""Compiled pattern for sanitising host strings used in asyncio task names."""
 
 
 def _reconnect_reason_tag(reason: str) -> str:
-    """Extract a stable, short tag from a reconnect reason string.
+    """Extract a stable metric-safe tag from a reconnect reason string.
 
-    Returns the portion before the first colon, stripped and lowercased,
-    with dots replaced by underscores for metric-tag safety.
+    Args:
+        reason: Free-form reconnect reason string.
+
+    Returns:
+        The portion before the first colon, stripped, lowercased, with dots
+        replaced by underscores.  Falls back to ``"unknown"`` if empty.
     """
     tag = reason.split(":", 1)[0].strip().lower().replace(".", "_")
     return tag or "unknown"
@@ -93,23 +101,21 @@ class TunnelSession:
         "_cfg",
         "_tun",
         "_ws",
-        # Per-session handler registries — cleared on each reconnect.
         "_tcp_registry",
         "_pending_connects",
         "_udp_registry",
-        # WebSocket closed signal — recreated on each session.
         "_ws_closed",
-        # In-flight request tasks.
         "_request_tasks",
-        # Sub-components — constructed per session in _start_session().
         "_sender",
         "_dispatcher",
+        "_on_agent_stats",
     )
 
     def __init__(self, session_cfg: SessionConfig, tun_cfg: TunnelConfig) -> None:
         self._cfg = session_cfg
         self._tun = tun_cfg
         self._ws: ClientConnection | None = None
+        self._on_agent_stats: AgentStatsCallable | None = None
 
         self._tcp_registry: dict[str, TcpConnection] = {}
         self._pending_connects: dict[str, PendingConnect] = {}
@@ -118,17 +124,38 @@ class TunnelSession:
         self._ws_closed: asyncio.Event = asyncio.Event()
         self._request_tasks: set[asyncio.Task[None]] = set()
 
-        # Populated in _start_session — typed here for IDE support.
         self._sender: WsSender | None = None
         self._dispatcher: RequestDispatcher | None = None
+
+    def set_agent_stats_listener(self, callback: AgentStatsCallable | None) -> None:
+        """Register or clear a listener for agent-emitted STATS snapshots.
+
+        STATS frames are periodic observability snapshots (queue depth,
+        byte/frame counters, dispatch latency percentiles, worker counts)
+        emitted by the agent roughly once per second.  Production sessions
+        leave this unset so STATS traffic is a near-free no-op; the
+        measurement framework registers a listener that aggregates snapshots
+        into benchmark reports.
+
+        The listener takes effect on the **next** WebSocket (re)connect,
+        because :class:`~exectunnel.session._receiver.FrameReceiver` captures
+        the callback by value at construction time.
+
+        Args:
+            callback: A callable taking one decoded snapshot ``dict``, or
+                      ``None`` to disable the listener.  Must not block or
+                      raise — exceptions are logged and suppressed.
+        """
+        self._on_agent_stats = callback
 
     # ── Top-level run ─────────────────────────────────────────────────────────
 
     async def run(self) -> None:
-        """Connect, bootstrap the agent, and serve.
+        """Connect, bootstrap the agent, and serve SOCKS5 requests.
 
         Retries on transport/session interruptions using reconnect settings
-        from ``SessionConfig``.  Bootstrap failures are always fatal.
+        from :class:`~exectunnel.session._config.SessionConfig`.  Bootstrap
+        failures are always fatal and are never retried.
 
         Raises:
             BootstrapError:          Propagated immediately; never retried.
@@ -156,27 +183,22 @@ class TunnelSession:
                         self._cfg.wss_url,
                         ssl=ssl_ctx,
                         additional_headers=self._cfg.ws_headers or None,
-                        # Disable built-in ping — we implement our own via
-                        # KeepaliveLoop which serialises through WsSender.
                         ping_interval=None,
                         max_size=None,
                     ) as ws:
                         await self._start_session(ws)
-                        attempt = 0  # Clean session — reset retry counter.
+                        attempt = 0
 
                 except BootstrapError:
                     metrics_inc("session.bootstrap.error")
-                    raise  # Never retried.
+                    raise
 
                 except asyncio.CancelledError:
                     logger.info("tunnel session cancelled")
                     raise
 
                 except WebSocketSendTimeoutError as exc:
-                    metrics_inc(
-                        "session.connect.error",
-                        error="ws_send_timeout",
-                    )
+                    metrics_inc("session.connect.error", error="ws_send_timeout")
                     reconnect_reason = (
                         f"ws_send_timeout: {exc.message} (error_id={exc.error_id})"
                     )
@@ -187,10 +209,7 @@ class TunnelSession:
                     )
 
                 except ConnectionClosedError as exc:
-                    metrics_inc(
-                        "session.connect.error",
-                        error="connection_closed",
-                    )
+                    metrics_inc("session.connect.error", error="connection_closed")
                     reconnect_reason = (
                         f"connection_closed: "
                         f"{exc.details.get('close_reason', '')} "
@@ -220,66 +239,46 @@ class TunnelSession:
                     )
 
                 except (OSError, ConnectionClosed) as exc:
-                    metrics_inc(
-                        "session.connect.error",
-                        error=type(exc).__name__,
-                    )
+                    metrics_inc("session.connect.error", error=type(exc).__name__)
                     reconnect_reason = str(exc) or type(exc).__name__
 
                 except TimeoutError as exc:
-                    metrics_inc(
-                        "session.connect.error",
-                        error="timeout",
-                    )
+                    metrics_inc("session.connect.error", error="timeout")
                     reconnect_reason = f"timeout: {exc}"
 
                 except Exception:
-                    raise  # Truly unexpected — propagate.
+                    raise
 
                 finally:
                     self._ws = None
-                    session_duration = time.monotonic() - session_start
                     metrics_observe(
-                        "session.duration_sec",
-                        session_duration,
+                        "session.duration_sec", time.monotonic() - session_start
                     )
-                    # Zero out all session-level gauges on exit.
                     self._zero_gauges()
 
                 if reconnect_reason is None:
-                    return  # Clean exit.
+                    return
 
                 if attempt >= retries:
                     metrics_inc("session.reconnect.exhausted")
                     raise ReconnectExhaustedError(
                         f"WebSocket session terminated after {retries} "
                         "reconnect attempts.",
-                        details={
-                            "attempts": retries,
-                            "last_error": reconnect_reason,
-                        },
+                        details={"attempts": retries, "last_error": reconnect_reason},
                         hint=(
-                            "Check network connectivity to the tunnel "
-                            "endpoint and increase "
-                            "EXECTUNNEL_RECONNECT_MAX_RETRIES if transient "
-                            "disruptions are expected."
+                            "Check network connectivity to the tunnel endpoint "
+                            "and increase EXECTUNNEL_RECONNECT_MAX_RETRIES if "
+                            "transient disruptions are expected."
                         ),
                     )
 
                 delay = min(base_delay * (2**attempt), max_delay)
-                jitter = random.uniform(0, delay * _RECONNECT_JITTER)
-                # Do NOT cap after adding jitter — capping would collapse
-                # the jitter range to zero when delay is close to
-                # max_delay, defeating the purpose of jitter at high retry
-                # counts.
-                delay += jitter
+                delay += random.uniform(0, delay * _RECONNECT_JITTER)
                 attempt += 1
                 metrics_inc(
                     "session.reconnect",
                     reason=_reconnect_reason_tag(reconnect_reason),
                 )
-                if self._dispatcher is not None:
-                    self._dispatcher.reset_ack_state()
                 metrics_observe("session.reconnect.delay_sec", delay)
                 logger.warning(
                     "WebSocket disconnected (%s), reconnecting in %.1fs "
@@ -294,27 +293,18 @@ class TunnelSession:
     # ── Gauge management ──────────────────────────────────────────────────────
 
     def _emit_registry_gauges(self) -> None:
-        """Publish current sizes of all session registries as gauges."""
-        metrics_gauge_set(
-            "session.registry.tcp",
-            float(len(self._tcp_registry)),
-        )
+        """Publish current sizes of all session registries as gauge metrics."""
+        metrics_gauge_set("session.registry.tcp", float(len(self._tcp_registry)))
         metrics_gauge_set(
             "session.registry.pending_connects",
             float(len(self._pending_connects)),
         )
-        metrics_gauge_set(
-            "session.registry.udp",
-            float(len(self._udp_registry)),
-        )
-        metrics_gauge_set(
-            "session.request_tasks",
-            float(len(self._request_tasks)),
-        )
+        metrics_gauge_set("session.registry.udp", float(len(self._udp_registry)))
+        metrics_gauge_set("session.request_tasks", float(len(self._request_tasks)))
 
     @staticmethod
     def _zero_gauges() -> None:
-        """Zero all session-level gauges — called on session teardown."""
+        """Zero all session-level gauges on session teardown."""
         for name in (
             "session.registry.tcp",
             "session.registry.pending_connects",
@@ -326,7 +316,12 @@ class TunnelSession:
     # ── Session initialisation ────────────────────────────────────────────────
 
     async def _request_reconnect(self, reason: str) -> None:
-        """Force-close the current websocket so the reconnect loop proceeds."""
+        """Force-close the current WebSocket so the reconnect loop proceeds.
+
+        Args:
+            reason: Short human-readable reason string logged and sent as the
+                    WebSocket close reason (truncated to 120 characters).
+        """
         ws = self._ws
         if ws is None:
             return
@@ -342,13 +337,12 @@ class TunnelSession:
             )
 
     async def _clear_session_state(self) -> None:
-        """Abort/close all per-session state before a new session starts.
+        """Abort all per-session state before a new session starts.
 
-        Aborts any lingering TCP connections, cancels pending connect
-        futures, and closes UDP flows from a previous session to prevent
-        resource leaks on reconnect.
+        Aborts lingering TCP connections, cancels pending connect futures,
+        and closes UDP flows from a previous session to prevent resource
+        leaks on reconnect.
         """
-        # ── Close the previous session's dispatcher sentinel task ─────
         if self._dispatcher is not None:
             self._dispatcher.close()
             self._dispatcher = None
@@ -358,19 +352,13 @@ class TunnelSession:
                 await self._sender.stop()
             self._sender = None
 
-        # Cancel and await all in-flight request tasks BEFORE clearing
-        # registries — request tasks may reference registry entries.
         for task in list(self._request_tasks):
             if not task.done():
                 task.cancel()
         if self._request_tasks:
-            await asyncio.gather(
-                *self._request_tasks,
-                return_exceptions=True,
-            )
+            await asyncio.gather(*self._request_tasks, return_exceptions=True)
         self._request_tasks.clear()
 
-        # Abort TCP connections from the previous session.
         tcp_cleaned = 0
         for conn in self._tcp_registry.values():
             try:
@@ -386,14 +374,12 @@ class TunnelSession:
                 )
         self._tcp_registry.clear()
 
-        # Cancel pending connect futures.
         pending_cleaned = len(self._pending_connects)
         for pending in self._pending_connects.values():
             if not pending.ack_future.done():
                 pending.ack_future.cancel()
         self._pending_connects.clear()
 
-        # Signal UDP flows that the remote side is gone.
         udp_cleaned = 0
         for flow in self._udp_registry.values():
             try:
@@ -407,18 +393,9 @@ class TunnelSession:
         self._udp_registry.clear()
 
         if tcp_cleaned or pending_cleaned or udp_cleaned:
-            metrics_inc(
-                "session.cleanup.tcp",
-                value=tcp_cleaned,
-            )
-            metrics_inc(
-                "session.cleanup.pending",
-                value=pending_cleaned,
-            )
-            metrics_inc(
-                "session.cleanup.udp",
-                value=udp_cleaned,
-            )
+            metrics_inc("session.cleanup.tcp", value=tcp_cleaned)
+            metrics_inc("session.cleanup.pending", value=pending_cleaned)
+            metrics_inc("session.cleanup.udp", value=udp_cleaned)
             logger.info(
                 "session reset: cleaned %d TCP, %d pending, %d UDP",
                 tcp_cleaned,
@@ -429,24 +406,23 @@ class TunnelSession:
         self._emit_registry_gauges()
 
     async def _start_session(self, ws: ClientConnection) -> None:
-        """Initialise per-session state, bootstrap agent, and run tasks."""
+        """Initialise per-session state, bootstrap the agent, and run tasks.
+
+        Args:
+            ws: Live WebSocket connection to the pod exec channel.
+        """
         async with aspan("session.start"):
             metrics_inc("session.connect.ok")
             self._ws = ws
 
-            # Recreate the event — prevents races from stale references
-            # held by previous-session sub-components that might call
-            # .set() late.
             self._ws_closed = asyncio.Event()
 
             await self._clear_session_state()
 
-            # Bootstrap — raises BootstrapError subclasses on failure.
             async with aspan("session.bootstrap"):
                 bootstrapper = AgentBootstrapper(ws, self._cfg, self._tun)
                 await bootstrapper.run()
 
-            # Construct per-session sub-components.
             self._sender = WsSender(ws, self._cfg, self._ws_closed)
             self._dispatcher = RequestDispatcher(
                 tun_cfg=self._tun,
@@ -458,12 +434,6 @@ class TunnelSession:
                 pre_ack_buffer_cap_bytes=self._tun.pre_ack_buffer_cap_bytes,
                 request_reconnect=self._request_reconnect,
             )
-
-            if self._sender is None or self._dispatcher is None:
-                raise RuntimeError(
-                    "sub-components unexpectedly None after construction "
-                    "in _start_session — this is a bug.",
-                )
 
             self._dispatcher.reset_ack_state()
             self._sender.start()
@@ -484,19 +454,28 @@ class TunnelSession:
         """Start all session tasks and wait for the first to fail or finish.
 
         The ``first_exc`` is captured inside the ``async with`` block and
-        re-raised *after* the SOCKS5 server context manager exits, ensuring
-        the server is fully stopped before the exception propagates to the
+        re-raised after the SOCKS5 server context manager exits, ensuring the
+        server is fully stopped before the exception propagates to the
         reconnect loop.
+
+        Args:
+            ws:               Live WebSocket connection.
+            post_ready_lines: Lines buffered during bootstrap for replay.
+            pre_ready_carry:  Partial frame fragment from bootstrap.
+
+        Raises:
+            RuntimeError: If called before :meth:`_start_session` has
+                          initialised ``_sender`` and ``_dispatcher``.
         """
         if self._sender is None:
             raise RuntimeError(
                 "_run_tasks called before _sender was initialised — "
-                "call _start_session() instead of _run_tasks() directly.",
+                "call _start_session() instead."
             )
         if self._dispatcher is None:
             raise RuntimeError(
                 "_run_tasks called before _dispatcher was initialised — "
-                "call _start_session() instead of _run_tasks() directly.",
+                "call _start_session() instead."
             )
 
         metrics_inc("session.serve.started")
@@ -509,6 +488,11 @@ class TunnelSession:
             udp_registry=self._udp_registry,
             post_ready_lines=post_ready_lines,
             pre_ready_carry=pre_ready_carry,
+            # Pass the sender so the receiver can emit ERROR frames on
+            # per-connection inbound saturation without stalling the WS
+            # dispatcher for other muxed connections (head-of-line guard).
+            ws_send=self._sender.send,
+            on_agent_stats=self._on_agent_stats,
         )
 
         socks_cfg = Socks5ServerConfig(
@@ -541,17 +525,15 @@ class TunnelSession:
 
                 async with dns_fwd if dns_fwd is not None else contextlib.nullcontext():
                     recv_task = asyncio.create_task(
-                        receiver.run(),
-                        name="tun-recv-loop",
+                        receiver.run(), name="tun-recv-loop"
                     )
                     send_task = self._sender.task
                     if send_task is None:
                         raise RuntimeError(
-                            "WsSender.task is None after start() — this is a bug.",
+                            "WsSender.task is None after start() — this is a bug."
                         )
                     socks_task = asyncio.create_task(
-                        self._accept_loop(socks),
-                        name="tun-socks-accept",
+                        self._accept_loop(socks), name="tun-socks-accept"
                     )
                     keepalive = KeepaliveLoop(
                         sender=self._sender,
@@ -559,16 +541,10 @@ class TunnelSession:
                         interval=float(self._cfg.ping_interval),
                     )
                     keepalive_task = asyncio.create_task(
-                        keepalive.run(),
-                        name="tun-keepalive",
+                        keepalive.run(), name="tun-keepalive"
                     )
 
-                    all_tasks = {
-                        recv_task,
-                        send_task,
-                        socks_task,
-                        keepalive_task,
-                    }
+                    all_tasks = {recv_task, send_task, socks_task, keepalive_task}
 
                     try:
                         async with aspan("session.serve"):
@@ -576,17 +552,13 @@ class TunnelSession:
                                 all_tasks,
                                 return_when=asyncio.FIRST_COMPLETED,
                             )
-                            # Surface the first non-cancelled exception.
                             for task in done:
                                 if task.cancelled():
                                     continue
                                 exc = task.exception()
                                 if exc is None:
                                     continue
-                                metrics_inc(
-                                    "session.task.error",
-                                    task=task.get_name(),
-                                )
+                                metrics_inc("session.task.error", task=task.get_name())
                                 if isinstance(exc, ExecTunnelError):
                                     logger.error(
                                         "task %s failed [%s]: %s (error_id=%s)",
@@ -598,18 +570,12 @@ class TunnelSession:
                                     )
                                 else:
                                     logger.error(
-                                        "task %s failed: %s",
-                                        task.get_name(),
-                                        exc,
+                                        "task %s failed: %s", task.get_name(), exc
                                     )
                                 logger.debug(
                                     "task %s traceback",
                                     task.get_name(),
-                                    exc_info=(
-                                        type(exc),
-                                        exc,
-                                        exc.__traceback__,
-                                    ),
+                                    exc_info=(type(exc), exc, exc.__traceback__),
                                 )
                                 if first_exc is None:
                                     first_exc = exc
@@ -621,18 +587,14 @@ class TunnelSession:
 
                         await self._sender.stop()
 
-                        await asyncio.gather(
-                            *all_tasks,
-                            return_exceptions=True,
-                        )
+                        await asyncio.gather(*all_tasks, return_exceptions=True)
 
                         for task in list(self._request_tasks):
                             if not task.done():
                                 task.cancel()
                         if self._request_tasks:
                             await asyncio.gather(
-                                *self._request_tasks,
-                                return_exceptions=True,
+                                *self._request_tasks, return_exceptions=True
                             )
 
                         if self._dispatcher is not None:
@@ -645,9 +607,8 @@ class TunnelSession:
         except BaseException as socks_exit_exc:
             if first_exc is not None and socks_exit_exc is not first_exc:
                 logger.error(
-                    "Socks5Server cleanup raised %s while handling "
-                    "session exception — original exception takes "
-                    "precedence: %s",
+                    "Socks5Server cleanup raised %s while handling session "
+                    "exception — original exception takes precedence: %s",
                     socks_exit_exc,
                     first_exc,
                 )
@@ -658,13 +619,21 @@ class TunnelSession:
             raise first_exc
 
     async def _accept_loop(self, socks: Socks5Server) -> None:
-        """Accept SOCKS5 requests and dispatch each as an independent task."""
+        """Accept SOCKS5 requests and dispatch each as an independent task.
+
+        Args:
+            socks: Running SOCKS5 server to iterate.
+
+        Raises:
+            RuntimeError: If called before :meth:`_start_session` has
+                          initialised ``_dispatcher``.
+        """
         if self._dispatcher is None:
             raise RuntimeError(
-                "_accept_loop called before _dispatcher was initialised.",
+                "_accept_loop called before _dispatcher was initialised."
             )
         async for req in socks:
-            safe_host = re.sub(r"[^a-zA-Z0-9_.\-]", "_", req.host)[:40]
+            safe_host = _SAFE_HOST_RE.sub("_", req.host)[:40]
             task = asyncio.create_task(
                 self._handle_request(req),
                 name=f"req-{req.cmd.name}-{safe_host}_{req.port}",
@@ -676,7 +645,11 @@ class TunnelSession:
         logger.debug("socks5 accept loop ended")
 
     def _on_request_task_done(self, task: asyncio.Task[None]) -> None:
-        """Callback invoked when a request task completes."""
+        """Callback invoked when a request task completes.
+
+        Args:
+            task: The completed request task.
+        """
         self._request_tasks.discard(task)
         self._emit_registry_gauges()
 
@@ -686,10 +659,7 @@ class TunnelSession:
         if exc is None:
             return
 
-        metrics_inc(
-            "session.request.error",
-            error=type(exc).__name__,
-        )
+        metrics_inc("session.request.error", error=type(exc).__name__)
         if isinstance(exc, ExecTunnelError):
             logger.error(
                 "request task %s failed [%s]: %s (error_id=%s)",
@@ -700,27 +670,27 @@ class TunnelSession:
                 extra=exc.to_dict(),
             )
         elif isinstance(exc, OSError):
-            logger.warning(
-                "request task %s failed: %s",
-                task.get_name(),
-                exc,
-            )
+            logger.warning("request task %s failed: %s", task.get_name(), exc)
         else:
-            logger.error(
-                "request task %s failed: %s",
-                task.get_name(),
-                exc,
-            )
+            logger.error("request task %s failed: %s", task.get_name(), exc)
         logger.debug(
             "request task %s traceback",
             task.get_name(),
             exc_info=(type(exc), exc, exc.__traceback__),
         )
 
-    async def _handle_request(self, req: Socks5Request) -> None:
-        """Dispatch a single SOCKS5 request to the appropriate handler."""
+    async def _handle_request(self, req: TCPRelay) -> None:
+        """Dispatch a single SOCKS5 request to the appropriate handler.
+
+        Args:
+            req: Completed SOCKS5 handshake to dispatch.
+
+        Raises:
+            RuntimeError: If called before :meth:`_start_session` has
+                          initialised ``_dispatcher``.
+        """
         if self._dispatcher is None:
             raise RuntimeError(
-                "_handle_request called before _dispatcher was initialised.",
+                "_handle_request called before _dispatcher was initialised."
             )
         await self._dispatcher.dispatch(req)
