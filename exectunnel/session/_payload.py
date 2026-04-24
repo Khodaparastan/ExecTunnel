@@ -1,12 +1,14 @@
 """Agent payload loading helpers for the session layer.
 
-``load_agent_b64`` / ``load_go_agent_b64`` are called once per process
-lifetime (cached).  Both return URL-safe base64 with standard ``=``
-padding so callers need only convert ``- → +`` and ``_ → /`` before
-decoding on the remote.
+:func:`load_agent_b64`, :func:`load_go_agent_b64`, and
+:func:`load_pod_echo_b64` are called once per process lifetime and their
+results are cached via :func:`functools.lru_cache`.  Both Python and Go
+payloads are returned as URL-safe base64 strings with standard ``=``
+padding so callers need only convert ``-`` → ``+`` and ``_`` → ``/``
+before decoding on the remote.
 
-Call ``clear_caches()`` to force a reload (useful during development or
-after a hot-swap of the payload on disk).
+Call :func:`clear_caches` to force a reload from disk — useful during
+development or after a hot-swap of the payload.
 """
 
 from __future__ import annotations
@@ -24,18 +26,31 @@ __all__ = [
     "clear_caches",
     "load_agent_b64",
     "load_go_agent_b64",
+    "load_pod_echo_b64",
 ]
 
 logger = logging.getLogger(__name__)
 
-# Minimum payload sizes (bytes) to catch empty / truncated resources early.
-_MIN_PYTHON_AGENT_SIZE: Final[int] = 256
-# Static Go binaries are always several MB; 512 KB is a safe lower bound
-# that catches stubs/placeholders while allowing stripped minimal builds.
-_MIN_GO_AGENT_SIZE: Final[int] = 524_288  # 512 KiB
+# ── Size guards ───────────────────────────────────────────────────────────────
 
-# Protects lru_cache clear + re-prime against concurrent callers.
+_MIN_PYTHON_AGENT_SIZE: Final[int] = 256
+"""Minimum acceptable size in bytes for the Python agent payload."""
+
+_MIN_GO_AGENT_SIZE: Final[int] = 524_288
+"""Minimum acceptable size in bytes for the Go agent binary (512 KiB)."""
+
+_MIN_POD_ECHO_SIZE: Final[int] = 262_144
+"""Minimum acceptable size in bytes for the pod_echo helper binary (256 KiB)."""
+
+# ── Supported architectures ───────────────────────────────────────────────────
+
+_POD_ECHO_ARCHES: Final[frozenset[str]] = frozenset({"amd64", "arm64"})
+"""Supported Linux architectures for the pod_echo helper binary."""
+
+# ── Cache synchronisation ─────────────────────────────────────────────────────
+
 _CACHE_LOCK: threading.Lock = threading.Lock()
+"""Protects :func:`lru_cache` clear + re-prime against concurrent callers."""
 
 
 # ── Private helpers ───────────────────────────────────────────────────────────
@@ -51,19 +66,21 @@ def _load_resource_bytes(
     """Load a package resource and return its raw bytes.
 
     Args:
-        resource_path:      Non-empty path components relative to the
-                            ``exectunnel`` package root.
-        error_code_prefix:  Prefix for ``ConfigurationError.error_code``.
-        not_found_message:  Human-readable message for ``FileNotFoundError``.
-        not_found_hint:     Hint string for ``FileNotFoundError``.
-        min_size:           Minimum expected byte count.  A resource smaller
-                            than this is treated as corrupt/truncated.
+        resource_path:     Non-empty path components relative to the
+                           ``exectunnel`` package root.
+        error_code_prefix: Prefix for :attr:`~exectunnel.exceptions.ExecTunnelError.error_code`.
+        not_found_message: Human-readable message used when the resource is absent.
+        not_found_hint:    Hint string used when the resource is absent.
+        min_size:          Minimum expected byte count.  A resource smaller than
+                           this is treated as corrupt or truncated.
 
     Returns:
         The raw resource bytes.
 
     Raises:
-        ConfigurationError: On any I/O or validation failure.
+        ConfigurationError: On any I/O or validation failure, including missing
+                            resource, permission denied, unexpected OS error, or
+                            payload smaller than *min_size*.
         ValueError:         If *resource_path* is empty.
     """
     if not resource_path:
@@ -74,7 +91,6 @@ def _load_resource_bytes(
     for part in resource_path:
         node /= part
 
-    # Used only for logging / error messages — not for actual I/O.
     resource_str = "/".join(("exectunnel", *resource_path))
 
     try:
@@ -121,14 +137,15 @@ def _load_resource_bytes(
 
 
 def _encode_urlsafe_b64(data: bytes) -> str:
-    """Encode *data* as URL-safe base64 **with standard ``=`` padding**.
+    """Encode *data* as URL-safe base64 with standard ``=`` padding.
 
     URL-safe base64 uses ``-`` instead of ``+`` and ``_`` instead of ``/``,
     making the string safe for ``printf '%s'`` in all POSIX shells.
+    Standard ``=`` padding is preserved so the bootstrapper can decode with
+    ``sed 's/-/+/g; s/_/\\//g' | base64 -d`` without recomputing padding.
 
-    Standard padding (``=``) is preserved so the bootstrapper can decode
-    with ``sed 's/-/+/g; s/_/\\//g' | base64 -d`` without needing to
-    re-compute padding characters.
+    Args:
+        data: Raw bytes to encode.
 
     Returns:
         An ASCII string containing only ``[A-Za-z0-9_\\-=]``.
@@ -147,13 +164,14 @@ def load_agent_b64() -> str:
     changes at runtime.  Call :func:`clear_caches` to force a reload.
 
     Returns:
-        The agent source as a padded URL-safe base64 string.
+        The agent source encoded as a padded URL-safe base64 string.
 
     Raises:
-        ConfigurationError:
+        ConfigurationError: With one of the following error codes:
+
             * ``config.agent_payload_missing``           — resource not found.
-            * ``config.agent_payload_truncated``         — too small.
-            * ``config.agent_payload_permission_denied`` — unreadable.
+            * ``config.agent_payload_truncated``         — payload too small.
+            * ``config.agent_payload_permission_denied`` — resource unreadable.
             * ``config.agent_payload_load_failed``       — any other I/O error.
     """
     data = _load_resource_bytes(
@@ -190,13 +208,14 @@ def load_go_agent_b64() -> str:
     and placed at ``payload/go_agent/agent_linux_amd64`` inside the package.
 
     Returns:
-        The binary as a padded URL-safe base64 string.
+        The binary encoded as a padded URL-safe base64 string.
 
     Raises:
-        ConfigurationError:
+        ConfigurationError: With one of the following error codes:
+
             * ``config.go_agent_payload_missing``           — binary not found.
-            * ``config.go_agent_payload_truncated``         — too small (< 512 KiB).
-            * ``config.go_agent_payload_permission_denied`` — unreadable.
+            * ``config.go_agent_payload_truncated``         — binary < 512 KiB.
+            * ``config.go_agent_payload_permission_denied`` — binary unreadable.
             * ``config.go_agent_payload_load_failed``       — any other I/O error.
     """
     data = _load_resource_bytes(
@@ -222,12 +241,68 @@ def load_go_agent_b64() -> str:
     return result
 
 
-def clear_caches() -> None:
-    """Evict cached payloads so the next call reloads from disk.
+@functools.lru_cache(maxsize=2)  # exactly 2 supported arches: amd64, arm64
+def load_pod_echo_b64(arch: str = "amd64") -> str:
+    """Load the pre-built ``pod_echo`` helper binary as a padded URL-safe base64 string.
 
-    Thread-safe: acquires an internal lock so that a concurrent
-    ``load_*`` call cannot observe a partially-cleared cache.
+    The binary is produced by ``tools/pod_echo/Makefile`` and placed at
+    ``exectunnel/payload/pod_echo/pod_echo_linux_<arch>`` inside the package.
+    See ``tools/pod_echo/README.md`` for build instructions.
+
+    Args:
+        arch: Target Linux architecture.  Must be one of ``"amd64"`` or ``"arm64"``.
+
+    Returns:
+        The binary encoded as a padded URL-safe base64 string.
+
+    Raises:
+        ConfigurationError: With one of the following error codes:
+
+            * ``config.pod_echo_payload_invalid_arch``      — unknown *arch*.
+            * ``config.pod_echo_payload_missing``           — binary not found.
+            * ``config.pod_echo_payload_truncated``         — binary too small.
+            * ``config.pod_echo_payload_permission_denied`` — binary unreadable.
+            * ``config.pod_echo_payload_load_failed``       — any other I/O error.
+    """
+    if arch not in _POD_ECHO_ARCHES:
+        raise ConfigurationError(
+            f"Unsupported pod_echo architecture {arch!r}.",
+            error_code="config.pod_echo_payload_invalid_arch",
+            details={"arch": arch, "supported": sorted(_POD_ECHO_ARCHES)},
+            hint="Use one of: " + ", ".join(sorted(_POD_ECHO_ARCHES)),
+        )
+    binary_name = f"pod_echo_linux_{arch}"
+    data = _load_resource_bytes(
+        resource_path=("payload", "pod_echo", binary_name),
+        error_code_prefix="config.pod_echo_payload",
+        not_found_message=(
+            f"pod_echo helper binary ({binary_name}) not found in package "
+            "resources — build it first with: make build-pod-echo"
+        ),
+        not_found_hint=(
+            "Run 'make build-pod-echo' from the project root to cross-compile "
+            "the helper for linux/amd64 and linux/arm64. See "
+            "tools/pod_echo/README.md for details."
+        ),
+        min_size=_MIN_POD_ECHO_SIZE,
+    )
+    result = _encode_urlsafe_b64(data)
+    logger.debug(
+        "loaded pod_echo payload (%s): %d bytes → %d base64 chars",
+        arch,
+        len(data),
+        len(result),
+    )
+    return result
+
+
+def clear_caches() -> None:
+    """Evict all cached payloads so the next call reloads from disk.
+
+    Thread-safe: acquires an internal lock so that a concurrent ``load_*``
+    call cannot observe a partially-cleared cache.
     """
     with _CACHE_LOCK:
         load_agent_b64.cache_clear()
         load_go_agent_b64.cache_clear()
+        load_pod_echo_b64.cache_clear()
