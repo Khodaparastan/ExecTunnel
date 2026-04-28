@@ -175,20 +175,47 @@ class TcpConnection:
 
         self._started = True
 
+        inbound_cap = self._inbound.maxsize
+        if inbound_cap > 0 and len(self._pre_ack_buffer) > inbound_cap:
+            self._drop_count += len(self._pre_ack_buffer) - inbound_cap
+            metrics_inc("tcp.connection.pre_ack_flush.overflow")
+            self._schedule_cleanup()
+            raise TransportError(
+                f"conn {self._id!r}: pre-ACK buffer contains "
+                f"{len(self._pre_ack_buffer)} chunks but inbound queue capacity "
+                f"is {inbound_cap}; refusing to drop TCP data.",
+                error_code="transport.pre_ack_flush_overflow",
+                details={
+                    "conn_id": self._id,
+                    "pre_ack_chunks": len(self._pre_ack_buffer),
+                    "inbound_queue_cap": inbound_cap,
+                    "pre_ack_bytes": self._pre_ack_buffer_bytes,
+                },
+                hint=(
+                    "Increase TCP_INBOUND_QUEUE_CAP or reduce the remote "
+                    "pre-ACK response burst."
+                ),
+            )
+
         for chunk in self._pre_ack_buffer:
             try:
                 self._inbound.put_nowait(chunk)
             except asyncio.QueueFull:
-                self._drop_count += 1
-                metrics_inc("tcp.connection.pre_ack_buffer.overflow")
-                _log.warning(
-                    "conn %s: pre-ACK queue full during flush, dropping %d bytes "
-                    "(total_drops=%d)",
-                    self._id,
-                    len(chunk),
-                    self._drop_count,
-                    extra={"conn_id": self._id},
-                )
+                metrics_inc("tcp.connection.pre_ack_flush.overflow")
+                self._schedule_cleanup()
+                raise TransportError(
+                    f"conn {self._id!r}: inbound queue filled during pre-ACK flush.",
+                    error_code="transport.pre_ack_flush_overflow",
+                    details={
+                        "conn_id": self._id,
+                        "inbound_queue_cap": Defaults.TCP_INBOUND_QUEUE_CAP,
+                        "pre_ack_bytes": self._pre_ack_buffer_bytes,
+                    },
+                    hint=(
+                        "TCP data would be lost. Increase inbound queue capacity "
+                        "or investigate local downstream latency."
+                    ),
+                ) from None
         self._pre_ack_buffer.clear()
         self._pre_ack_buffer_bytes = 0
 
@@ -241,6 +268,10 @@ class TcpConnection:
 
         Idempotent — cancelling an already-done task is a no-op.
         """
+        if not self._started:
+            self._schedule_cleanup()
+            return
+
         for task in (self._upstream_task, self._downstream_task):
             if task is not None and not task.done():
                 task.cancel()
@@ -258,6 +289,9 @@ class TcpConnection:
             The session layer must type-narrow to :class:`TcpConnection`
             before calling.
         """
+        if not self._started:
+            self._schedule_cleanup()
+            return
         if self._upstream_task is not None and not self._upstream_task.done():
             self._upstream_task.cancel()
 
@@ -271,6 +305,9 @@ class TcpConnection:
             The session layer must type-narrow to :class:`TcpConnection`
             before calling.
         """
+        if not self._started:
+            self._schedule_cleanup()
+            return
         if self._downstream_task is not None and not self._downstream_task.done():
             self._downstream_task.cancel()
 
@@ -310,6 +347,7 @@ class TcpConnection:
         except asyncio.QueueFull:
             metrics_inc("tcp.connection.inbound_queue.drop")
             self._drop_count += 1
+            self._schedule_cleanup()
             raise TransportError(
                 f"conn {self._id!r}: inbound queue full; chunk dropped.",
                 error_code="transport.inbound_queue_full",
@@ -347,11 +385,7 @@ class TcpConnection:
                 pending,
                 extra={"conn_id": self._id},
             )
-            if self._cleanup_task is None:
-                self._cleanup_task = asyncio.create_task(
-                    self._cleanup(), name=f"tcp-cleanup-{self._id}"
-                )
-                self._cleanup_task.add_done_callback(self._on_cleanup_done)
+            self._schedule_cleanup()
             raise TransportError(
                 f"conn {self._id!r}: pre-ACK buffer full; connection closed.",
                 error_code="transport.pre_ack_buffer_overflow",
@@ -367,6 +401,16 @@ class TcpConnection:
             )
         self._pre_ack_buffer.append(data)
         self._pre_ack_buffer_bytes = pending
+
+    def _schedule_cleanup(self) -> None:
+        """Schedule cleanup exactly once."""
+        if self._cleanup_task is not None or self._closed.is_set():
+            return
+        self._cleanup_task = asyncio.create_task(
+            self._cleanup(),
+            name=f"tcp-cleanup-{self._id}",
+        )
+        self._cleanup_task.add_done_callback(self._on_cleanup_done)
 
     def try_feed(self, data: bytes) -> bool:
         """Non-blocking post-ACK enqueue — returns ``False`` on queue full.
@@ -662,14 +706,24 @@ class TcpConnection:
     async def _send_close_frame_once(self) -> None:
         """Send ``CONN_CLOSE`` exactly once via the protocol helper.
 
-        Idempotent via ``_conn_close_sent``. All exceptions are caught
-        and logged — teardown must complete regardless of send failures.
+        Ordering note:
+            This normal close frame is deliberately enqueued on the data FIFO
+            with ``must_queue=True`` instead of the priority control queue.
+            The sender prioritizes control frames over data frames; sending a
+            normal ``CONN_CLOSE`` as control can overtake earlier ``DATA`` for
+            the same connection and cause the agent to drop those late bytes.
+            Hard-abort paths may still use control frames from the session
+            receiver because data loss is intentional there.
         """
         if self._conn_close_sent:
             return
         self._conn_close_sent = True
         try:
-            await self._ws_send(encode_conn_close_frame(self._id), control=True)
+            await self._ws_send(
+                encode_conn_close_frame(self._id),
+                must_queue=True,
+                control=False,
+            )
         except WebSocketSendTimeoutError as exc:
             metrics_inc("tcp.connection.conn_close.error", error="ws_send_timeout")
             _log.warning(
@@ -741,11 +795,8 @@ class TcpConnection:
         both_done = (self._upstream_task is None or self._upstream_task.done()) and (
             self._downstream_task is None or self._downstream_task.done()
         )
-        if both_done and not self._closed.is_set() and self._cleanup_task is None:
-            self._cleanup_task = asyncio.create_task(
-                self._cleanup(), name=f"tcp-cleanup-{self._id}"
-            )
-            self._cleanup_task.add_done_callback(self._on_cleanup_done)
+        if both_done:
+            self._schedule_cleanup()
 
     @staticmethod
     def _on_cleanup_done(task: asyncio.Task[None]) -> None:
@@ -783,7 +834,7 @@ class TcpConnection:
                 continue
             if not task.done():
                 task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
 
         await self._send_close_frame_once()
