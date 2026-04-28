@@ -375,7 +375,7 @@ class DnsForwarder:
                 metrics_inc("dns.query.bytes.in.total", value=len(query))
                 metrics_observe("dns.query.bytes.in", float(len(query)))
 
-                await handler.send_datagram(query)
+                await handler.send_datagram(query, must_queue=True)
 
                 response = await self._recv_response(handler, client_addr, flow_id)
                 if response is None:
