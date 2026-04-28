@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import contextlib
 import logging
 import math
 import os
@@ -100,7 +101,9 @@ from ._constants import (
     MARKER_YES,
     MAX_STASH_LINES,
     MIN_FENCE_TIMEOUT_SECS,
+    MIN_REMOTE_PYTHON_VERSION,
     PYTHON_CANDIDATES,
+    UPLOAD_FENCE_EVERY_CHUNKS,
     UPLOAD_PROGRESS_LOG_INTERVAL,
     VALID_DELIVERY_MODES,
     WS_DECODE_ERRORS,
@@ -210,39 +213,62 @@ class AgentBootstrapper:
 
     @staticmethod
     def _validate_shell_literals(tun_cfg: TunnelConfig) -> None:
-        """Validate semantic constraints for shell-bound configuration values.
+        """Validate shell-bound configuration values.
 
-        Checks that each path/URL value used verbatim in shell commands is
-        non-empty (after stripping whitespace) and contains no NUL bytes,
-        both of which would silently corrupt the generated shell commands.
-
-        Args:
-            tun_cfg: Tunnel configuration to validate.
-
-        Raises:
-            BootstrapError: If any shell-bound value is empty or contains a
-                            NUL byte.
+        ``bootstrap_fetch_url`` is required only when fetch delivery is selected.
+        This keeps upload mode usable in fully restricted pods.
         """
-        values_to_check: tuple[tuple[str, str], ...] = (
-            ("bootstrap_agent_path", tun_cfg.bootstrap_agent_path),
-            ("bootstrap_go_agent_path", tun_cfg.bootstrap_go_agent_path),
-            ("bootstrap_syntax_ok_sentinel", tun_cfg.bootstrap_syntax_ok_sentinel),
-            ("bootstrap_fetch_url", tun_cfg.bootstrap_fetch_url),
-        )
-        for attr, value in values_to_check:
+
+        def check_value(attr: str, value: str | None, *, required: bool) -> None:
+            if value is None:
+                if required:
+                    raise BootstrapError(
+                        f"Configuration {attr} must not be None.",
+                        details={"attr": attr, "value": None},
+                        hint=f"Set a non-empty value for {attr}.",
+                    )
+                return
+
             if not value.strip():
-                raise BootstrapError(
-                    f"Configuration {attr} must not be empty.",
-                    details={"attr": attr, "value": value},
-                    hint=f"Set a non-empty value for {attr}.",
-                )
+                if required:
+                    raise BootstrapError(
+                        f"Configuration {attr} must not be empty.",
+                        details={"attr": attr, "value": value},
+                        hint=f"Set a non-empty value for {attr}.",
+                    )
+                return
+
             if "\x00" in value:
                 raise BootstrapError(
-                    f"Configuration {attr} contains a NUL byte, which is "
-                    "invalid for shell command construction.",
+                    f"Configuration {attr} contains a NUL byte, which is invalid "
+                    "for shell command construction.",
                     details={"attr": attr, "value": value},
                     hint=f"Remove NUL bytes from {attr}.",
                 )
+
+        check_value("bootstrap_agent_path", tun_cfg.bootstrap_agent_path, required=True)
+        check_value(
+            "bootstrap_go_agent_path", tun_cfg.bootstrap_go_agent_path, required=True
+        )
+
+        if tun_cfg.bootstrap_syntax_check:
+            check_value(
+                "bootstrap_syntax_ok_sentinel",
+                tun_cfg.bootstrap_syntax_ok_sentinel,
+                required=True,
+            )
+        else:
+            check_value(
+                "bootstrap_syntax_ok_sentinel",
+                tun_cfg.bootstrap_syntax_ok_sentinel,
+                required=False,
+            )
+
+        check_value(
+            "bootstrap_fetch_url",
+            tun_cfg.bootstrap_fetch_url,
+            required=tun_cfg.bootstrap_delivery == "fetch",
+        )
 
     @staticmethod
     def _shq(value: str) -> str:
@@ -450,7 +476,7 @@ class AgentBootstrapper:
             py=None,
         )
 
-        await self._send_fenced_command(f"chmod +x {self._shq(go_path)}")
+        await self._send_checked_fenced_command(f"chmod +x {self._shq(go_path)}")
         await self._send_command(f"exec {self._shq(go_path)}")
 
     # ── Unified delivery orchestration ────────────────────────────────────────
@@ -496,6 +522,9 @@ class AgentBootstrapper:
             )
             metrics_inc(f"bootstrap.{label}.skip_delivery")
             return False
+
+        agent_dir = os.path.dirname(agent_path) or "."
+        await self._send_checked_fenced_command(f"mkdir -p {self._shq(agent_dir)}")
 
         if agent_present:
             logger.info(
@@ -616,6 +645,101 @@ class AgentBootstrapper:
             f"WebSocket closed while waiting for command fence ({cmd[:40]!r}).",
             details={
                 "command": cmd[:80],
+                "host": self._cfg.wss_url,
+                "elapsed_s": self._elapsed,
+            },
+            hint="Check that the remote shell is still alive.",
+        )
+
+    async def _send_checked_fenced_command(
+        self,
+        cmd: str,
+        timeout: float = FENCE_TIMEOUT_SECS,
+    ) -> None:
+        """Run *cmd*, wait for a status fence, and fail if the exit code is non-zero."""
+
+        effective_timeout = max(MIN_FENCE_TIMEOUT_SECS, timeout)
+        fence_id = uuid.uuid4().hex[:12]
+        status_prefix = f"{FENCE_PREFIX}:RC:{fence_id}:"
+
+        wrapped = (
+            f"({cmd}); __exectunnel_rc=$?; "
+            f"printf '%s%s\\n' {self._shq(status_prefix)} \"$__exectunnel_rc\""
+        )
+
+        await self._send_command(wrapped)
+
+        buf = self._stash_carry
+        self._stash_carry = ""
+
+        try:
+            async with asyncio.timeout(effective_timeout):
+                async for msg in self._ws:
+                    chunk = self._decode_ws_message(msg)
+                    buf += chunk
+
+                    while "\n" in buf:
+                        line, buf = buf.split("\n", 1)
+                        stripped = _strip_ansi(line).strip()
+
+                        if stripped.startswith(status_prefix):
+                            self._stash_carry = buf
+                            rc_text = stripped[len(status_prefix) :].strip()
+
+                            try:
+                                rc = int(rc_text, 10)
+                            except ValueError as exc:
+                                raise BootstrapError(
+                                    "Remote command returned an invalid status marker.",
+                                    details={
+                                        "command": cmd[:120],
+                                        "status_text": rc_text,
+                                        "host": self._cfg.wss_url,
+                                        "elapsed_s": self._elapsed,
+                                    },
+                                    hint="The remote shell may be corrupting output.",
+                                ) from exc
+
+                            if rc != 0:
+                                raise BootstrapError(
+                                    f"Remote command failed with exit status {rc}.",
+                                    details={
+                                        "command": cmd[:200],
+                                        "exit_status": rc,
+                                        "host": self._cfg.wss_url,
+                                        "elapsed_s": self._elapsed,
+                                        "diag": list(self._diag),
+                                    },
+                                    hint="Check pod shell utilities and file permissions.",
+                                )
+
+                            return
+
+                        if stripped:
+                            logger.debug(
+                                "bootstrap checked-command output: %s", stripped
+                            )
+                            self._diag.append(stripped)
+                            self._stash_lines.append(line)
+
+        except TimeoutError as exc:
+            self._stash_carry = buf
+            raise BootstrapError(
+                f"Timed out after {effective_timeout}s waiting for checked command "
+                f"status ({cmd[:40]!r}).",
+                details={
+                    "command": cmd[:120],
+                    "host": self._cfg.wss_url,
+                    "elapsed_s": self._elapsed,
+                    "timeout_s": effective_timeout,
+                },
+                hint="The remote shell did not emit the command status marker in time.",
+            ) from exc
+
+        raise BootstrapError(
+            f"WebSocket closed while waiting for checked command status ({cmd[:40]!r}).",
+            details={
+                "command": cmd[:120],
                 "host": self._cfg.wss_url,
                 "elapsed_s": self._elapsed,
             },
@@ -779,6 +903,14 @@ class AgentBootstrapper:
         for idx, offset in enumerate(range(0, len(b64_data), chunk_size)):
             chunk = b64_data[offset : offset + chunk_size]
             await self._send_command(f"printf '%s' {self._shq(chunk)} >> {b64_path_q}")
+
+            # Raw PTYs have finite input queues. Without periodic fences, a
+            # large upload can overrun the remote shell and silently corrupt
+            # the staging file. Fencing every small batch trades a little
+            # bootstrap latency for correctness.
+            if (idx + 1) % UPLOAD_FENCE_EVERY_CHUNKS == 0:
+                await self._send_fenced_command(":")
+
             if (idx + 1) % UPLOAD_PROGRESS_LOG_INTERVAL == 0:
                 logger.debug(
                     "bootstrap(%s): upload progress %d/%d chunks",
@@ -790,12 +922,18 @@ class AgentBootstrapper:
         await self._send_fenced_command(f"sync {b64_path_q} 2>/dev/null || true")
         metrics_inc(f"bootstrap.{label}.upload_done")
 
-        decode_cmd = (
-            f"(sed 's/-/+/g; s/_/\\//g' {b64_path_q} | base64 -d > {agent_path_q}) "
-            f"|| {py_q} -c "
-            f"{self._shq(f'import base64; open({agent_path!r},"wb").write(base64.urlsafe_b64decode(open({b64_path!r},"rb").read()))')}"
+        fallback_py = self._shq(
+            f"import base64; "
+            f'open({agent_path!r},"wb").write('
+            f'base64.urlsafe_b64decode(open({b64_path!r},"rb").read()))'
         )
-        await self._send_fenced_command(decode_cmd)
+        decode_cmd = (
+            f"rm -f {agent_path_q}; "
+            f"( sed 's/-/+/g; s/_/\\//g' {b64_path_q} | base64 -d > {agent_path_q} ) "
+            f"|| {py_q} -c {fallback_py}; "
+            f"test -s {agent_path_q}"
+        )
+        await self._send_checked_fenced_command(decode_cmd)
         metrics_inc(f"bootstrap.{label}.decode_done")
 
         await self._send_fenced_command(f"rm -f {b64_path_q}")
@@ -805,90 +943,51 @@ class AgentBootstrapper:
     async def _deliver_via_fetch(
         self,
         agent_path: str,
-        url: str,
+        url: str | None,
         label: str,
     ) -> None:
-        """Fetch the agent inside the pod from a URL using curl or wget.
+        """Fetch the agent atomically inside the pod using curl or wget.
 
-        Sends the fetch command (unfenced) then polls for the output file
-        using :meth:`_check_file_exists` until the file appears or the
-        deadline (:attr:`~exectunnel.defaults.Defaults.BOOTSTRAP_FETCH_FETCH_DELAY_SECS`)
-        is reached.  If the deadline expires without the file appearing a
-        warning is logged and execution continues — the download may still
-        be in flight and the subsequent ``exec`` will fail with a clear error
-        if the file is truly absent.
-
-        Args:
-            agent_path: Absolute destination path on the remote pod.
-            url:        HTTP/HTTPS URL to fetch the agent from.  Must be
-                        reachable from inside the pod.
-            label:      ``"python"`` or ``"go"`` for metrics and log context.
+        Downloads to a unique temp file, verifies it is non-empty, then atomically
+        renames it into place.
         """
-        logger.info("bootstrap(%s/fetch): fetching agent from %s", label, url)
+
+        url_value = (url or "").strip()
+        if not url_value:
+            raise BootstrapError(
+                "bootstrap_fetch_url is required when bootstrap_delivery='fetch'.",
+                details={"label": label, "bootstrap_fetch_url": url},
+                hint="Set a fetch URL or use bootstrap_delivery='upload'.",
+            )
+
+        logger.info("bootstrap(%s/fetch): fetching agent from %s", label, url_value)
+
+        tmp_path = f"{agent_path}.fetch.{uuid.uuid4().hex}.tmp"
+        tmp_path_q = self._shq(tmp_path)
         agent_path_q = self._shq(agent_path)
-        url_q = self._shq(url)
+        url_q = self._shq(url_value)
 
         fetch_cmd = (
-            f"curl -fsSL {url_q} -o {agent_path_q} 2>/dev/null"
-            f" || wget -qO {agent_path_q} {url_q}"
+            f"rm -f {tmp_path_q}; "
+            f"(curl -fsSL {url_q} -o {tmp_path_q} 2>/dev/null "
+            f"|| wget -qO {tmp_path_q} {url_q}); "
+            f"test -s {tmp_path_q}; "
+            f"mv -f {tmp_path_q} {agent_path_q}"
         )
-        await self._send_command(fetch_cmd)
+
+        timeout = max(FENCE_TIMEOUT_SECS, Defaults.BOOTSTRAP_FETCH_FETCH_DELAY_SECS)
+
         metrics_inc(f"bootstrap.{label}.fetch_started")
 
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + Defaults.BOOTSTRAP_FETCH_FETCH_DELAY_SECS
-
-        while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                logger.warning(
-                    "bootstrap(%s/fetch): agent file %r not found after %.0f s — "
-                    "proceeding anyway (download may still be in progress)",
-                    label,
-                    agent_path,
-                    Defaults.BOOTSTRAP_FETCH_FETCH_DELAY_SECS,
+        try:
+            await self._send_checked_fenced_command(fetch_cmd, timeout=timeout)
+        except BootstrapError:
+            with contextlib.suppress(Exception):
+                await self._send_fenced_command(
+                    f"rm -f {tmp_path_q}",
+                    timeout=MIN_FENCE_TIMEOUT_SECS,
                 )
-                break
-
-            probe_timeout = max(MIN_FENCE_TIMEOUT_SECS, remaining)
-            try:
-                if await self._check_file_exists(agent_path, timeout=probe_timeout):
-                    break
-            except BootstrapError:
-                logger.debug(
-                    "bootstrap(%s/fetch): file probe timed out after %.1fs "
-                    "(remaining=%.1fs) — retrying",
-                    label,
-                    probe_timeout,
-                    deadline - loop.time(),
-                )
-                # Re-check deadline immediately before sleeping.
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    logger.warning(
-                        "bootstrap(%s/fetch): agent file %r not found after %.0f s — "
-                        "proceeding anyway (download may still be in progress)",
-                        label,
-                        agent_path,
-                        Defaults.BOOTSTRAP_FETCH_FETCH_DELAY_SECS,
-                    )
-                    break
-                continue
-
-            # File not yet present — wait before next probe.
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                logger.warning(
-                    "bootstrap(%s/fetch): agent file %r not found after %.0f s — "
-                    "proceeding anyway (download may still be in progress)",
-                    label,
-                    agent_path,
-                    Defaults.BOOTSTRAP_FETCH_FETCH_DELAY_SECS,
-                )
-                break
-            await asyncio.sleep(
-                min(Defaults.BOOTSTRAP_FETCH_FETCH_POLL_SECS, remaining)
-            )
+            raise
 
         metrics_inc(f"bootstrap.{label}.fetch_done")
 
@@ -920,10 +1019,16 @@ class AgentBootstrapper:
             py:            Python interpreter path on the remote pod.
         """
         metrics_inc("bootstrap.syntax_started")
-        check_cmd = (
-            f"{self._shq(py)} -c "
-            f"{self._shq(f'import ast, sys; ast.parse(open({agent_path!r}).read()); print("SYNTAX_OK"); sys.stdout.flush(); open({sentinel_path!r}, "w").close()')}"
+
+        syntax_py = (
+            "import ast, sys; "
+            f"ast.parse(open({agent_path!r}).read()); "
+            "print('SYNTAX_OK'); "
+            "sys.stdout.flush(); "
+            f"open({sentinel_path!r}, 'w').close()"
         )
+        check_cmd = f"{self._shq(py)} -c {self._shq(syntax_py)}"
+
         await self._send_fenced_command(check_cmd)
 
     async def _resolve_remote_python(self) -> str:
@@ -951,8 +1056,14 @@ class AgentBootstrapper:
         """
         for candidate in PYTHON_CANDIDATES:
             marker = f"{FENCE_PREFIX}:PY:{candidate}"
+            min_major, min_minor = MIN_REMOTE_PYTHON_VERSION
+            version_probe = self._shq(
+                "import sys; "
+                f"raise SystemExit(0 if sys.version_info >= ({min_major}, {min_minor}) else 1)"
+            )
             cmd = (
                 f"command -v {candidate} >/dev/null 2>&1 "
+                f"&& {candidate} -c {version_probe} >/dev/null 2>&1 "
                 f"&& printf '%s\\n' {self._shq(marker)} || true"
             )
             await self._send_command(cmd)
