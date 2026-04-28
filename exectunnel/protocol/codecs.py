@@ -192,8 +192,9 @@ def parse_host_port(payload: str) -> tuple[str, int]:
         FrameDecodingError: If the payload is malformed.
     """
     raw_hex = _hex_preview(payload)
+    bracketed = payload.startswith("[")
 
-    if payload.startswith("["):
+    if bracketed:
         bracket_end = payload.find("]")
         if bracket_end == -1 or payload[bracket_end + 1 : bracket_end + 2] != ":":
             raise FrameDecodingError(
@@ -231,6 +232,36 @@ def parse_host_port(payload: str) -> tuple[str, int]:
             f"in OPEN frame payload: {payload!r}",
             details={"raw_bytes": raw_hex, "codec": "host:port"},
         )
+
+    if bracketed:
+        try:
+            addr = ipaddress.ip_address(host)
+        except ValueError as exc:
+            raise FrameDecodingError(
+                f"Bracketed host {host!r} in OPEN frame payload is not an IP address.",
+                details={"raw_bytes": raw_hex, "codec": "host:port"},
+            ) from exc
+        if not isinstance(addr, ipaddress.IPv6Address):
+            raise FrameDecodingError(
+                f"Bracketed host {host!r} in OPEN frame payload is not IPv6.",
+                details={"raw_bytes": raw_hex, "codec": "host:port"},
+            )
+    elif ":" in host:
+        raise FrameDecodingError(
+            f"Unbracketed host {host!r} contains ':' in OPEN frame payload. "
+            "IPv6 addresses must use [addr]:port form.",
+            details={"raw_bytes": raw_hex, "codec": "host:port"},
+        )
+
+    try:
+        # Reuse the encoder-side validator so decode accepts only the canonical
+        # host/port domain that this protocol can generate.
+        encode_host_port(host, port)
+    except ProtocolError as exc:
+        raise FrameDecodingError(
+            f"Invalid host {host!r} in OPEN frame payload: {payload!r}",
+            details={"raw_bytes": raw_hex, "codec": "host:port"},
+        ) from exc
 
     return host, port
 

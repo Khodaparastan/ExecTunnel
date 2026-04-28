@@ -15,10 +15,9 @@ Nothing in this module performs I/O, imports from siblings other than
 
 Note:
     ``STATS`` is listed in :data:`VALID_MSG_TYPES` and
-    :data:`NO_CONN_ID_WITH_PAYLOAD_TYPES` but intentionally has no public
-    encoder in :mod:`exectunnel.protocol.encoders`. It is produced inside
-    the in-pod agent via the low-level ``_encode_frame`` path from the
-    bench/observability module and consumed via :func:`parse_frame`.
+    :data:`NO_CONN_ID_WITH_PAYLOAD_TYPES`. It is session-scoped, carries a
+    base64url JSON payload, and is encoded through
+    :func:`exectunnel.protocol.encoders.encode_stats_frame`.
 """
 
 from __future__ import annotations
@@ -81,19 +80,11 @@ MAX_TUNNEL_FRAME_CHARS: Final[int] = int(
 _CONN_FLOW_ID_CHARS: Final[int] = 25
 
 DATA_FRAME_OVERHEAD_CHARS: Final[int] = (
-    len(FRAME_PREFIX)
-    + len("DATA")
-    + 2
-    + _CONN_FLOW_ID_CHARS
-    + len(FRAME_SUFFIX)
+    len(FRAME_PREFIX) + len("DATA") + 2 + _CONN_FLOW_ID_CHARS + len(FRAME_SUFFIX)
 )
 
 UDP_DATA_FRAME_OVERHEAD_CHARS: Final[int] = (
-    len(FRAME_PREFIX)
-    + len("UDP_DATA")
-    + 2
-    + _CONN_FLOW_ID_CHARS
-    + len(FRAME_SUFFIX)
+    len(FRAME_PREFIX) + len("UDP_DATA") + 2 + _CONN_FLOW_ID_CHARS + len(FRAME_SUFFIX)
 )
 
 

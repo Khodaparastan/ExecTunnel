@@ -21,8 +21,8 @@ from .constants import (
     FRAME_SUFFIX,
     KEEPALIVE_FRAME,
     MAX_TUNNEL_FRAME_CHARS,
-    NO_CONN_ID_WITH_PAYLOAD_TYPES,
     NO_CONN_ID_TYPES,
+    NO_CONN_ID_WITH_PAYLOAD_TYPES,
     PAYLOAD_FORBIDDEN_TYPES,
     PAYLOAD_REQUIRED_TYPES,
     READY_FRAME,
@@ -229,12 +229,23 @@ def encode_stats_frame(json_payload: bytes) -> str:
     Returns:
         Newline-terminated STATS frame.
     """
+
+    if not isinstance(json_payload, bytes):
+        raise ProtocolError(
+            "STATS frame payload must be bytes.",
+            details={
+                "frame_type": "STATS",
+                "expected": "bytes",
+                "got": type(json_payload).__name__,
+            },
+        )
+
     if not json_payload:
         raise ProtocolError(
             "STATS frame payload must not be empty.",
             details={"frame_type": "STATS", "expected": "non-empty JSON bytes"},
         )
-    return f"{FRAME_PREFIX}STATS:{encode_binary_payload(json_payload)}{FRAME_SUFFIX}\n"
+    return _encode_frame("STATS", None, encode_binary_payload(json_payload))
 
 
 # ── Public encoders — TCP connection frames ───────────────────────────────────

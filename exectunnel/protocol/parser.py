@@ -68,7 +68,13 @@ def _strip_proxy_suffix(line: str) -> tuple[str, bool]:
     """
     if not line.startswith(FRAME_PREFIX):
         return line, False
-    suffix_pos = line.rfind(FRAME_SUFFIX)
+
+    # Strip everything after the first complete tunnel frame. Some reverse
+    # proxies / exec adapters append textual status material after the frame;
+    # using rfind() keeps that material when it itself contains ">>>", turning
+    # an otherwise valid frame into a corrupt one.
+    suffix_pos = line.find(FRAME_SUFFIX)
+
     if suffix_pos != -1:
         line = line[: suffix_pos + len(FRAME_SUFFIX)]
     return line, line.endswith(FRAME_SUFFIX)
