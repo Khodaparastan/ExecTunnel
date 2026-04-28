@@ -28,6 +28,7 @@ __all__ = [
     "build_socks5_reply",
     "build_udp_header",
     "parse_socks5_addr_buf",
+    "build_udp_header_for_host",
     "parse_udp_header",
     "validate_socks5_domain",
 ]
@@ -302,20 +303,34 @@ def _parse_domain(data: bytes, offset: int, context: str) -> tuple[str, int]:
 
     raw_domain = data[offset : offset + dlen]
     try:
-        host = raw_domain.decode()
+        host = raw_domain.decode("ascii")
     except UnicodeDecodeError as exc:
         raise ProtocolError(
-            f"{context} DOMAIN address bytes are not valid UTF-8.",
+            f"{context} DOMAIN address bytes are not valid ASCII/IDNA.",
             details={
                 "socks5_field": "DST.ADDR",
                 "raw_bytes": raw_domain.hex()[:_RAW_HEX_PREVIEW_LEN],
-                "codec": "utf-8",
+                "codec": "ascii",
             },
             hint=(
                 f"The {context} client sent a domain name that cannot be "
-                "decoded as UTF-8. Only ASCII/UTF-8 hostnames are supported."
+                "decoded as ASCII. Use IDNA/punycode for non-ASCII names."
             ),
         ) from exc
+
+    # RFC-style FQDN notation is accepted from SOCKS clients, but the tunnel
+    # protocol intentionally does not carry trailing-dot hostnames. Normalize
+    # here so SOCKS validation and tunnel encoding agree.
+    host = host.rstrip(".")
+    if not host:
+        raise ProtocolError(
+            f"{context} DOMAIN address is empty after FQDN normalization.",
+            details={
+                "socks5_field": "DST.ADDR",
+                "expected": "non-empty domain name",
+            },
+            hint="Do not send '.' as a SOCKS5 destination domain.",
+        )
 
     validate_socks5_domain(host)
     return host, offset + dlen
@@ -441,6 +456,56 @@ def build_udp_header(atyp: AddrType, addr_packed: bytes, port: int) -> bytes:
         )
 
     return b"\x00\x00\x00" + bytes([int(atyp)]) + addr_packed + struct.pack("!H", port)
+
+
+def build_udp_header_for_host(host: str, port: int) -> bytes:
+    """Build a SOCKS5 UDP header for an IPv4, IPv6, or DOMAIN host.
+
+    Args:
+        host: IPv4, IPv6, or validated SOCKS5 domain name.
+        port: Port number in ``[0, 65535]``.
+
+    Returns:
+        SOCKS5 UDP header bytes.
+
+    Raises:
+        ConfigurationError: If *port* is out of range.
+        ProtocolError: If *host* is not a valid SOCKS5 domain and not an IP.
+    """
+    if not (0 <= port <= MAX_TCP_UDP_PORT):
+        raise ConfigurationError(
+            f"build_udp_header_for_host: port {port!r} is out of range [0, 65535].",
+            details={
+                "field": "port",
+                "value": port,
+                "expected": "integer in [0, 65535]",
+            },
+            hint="Ensure the UDP source port is a valid port number.",
+        )
+
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        validate_socks5_domain(host)
+        raw = host.encode("ascii")
+        if not (1 <= len(raw) <= 255):
+            raise ProtocolError(
+                f"SOCKS5 UDP domain wire length is invalid: {len(raw)}.",
+                details={
+                    "socks5_field": "DST.ADDR",
+                    "expected": "domain wire length in [1, 255]",
+                },
+                hint="Use a valid SOCKS5 domain name.",
+            )
+        return (
+            b"\x00\x00\x00"
+            + bytes([int(AddrType.DOMAIN), len(raw)])
+            + raw
+            + struct.pack("!H", port)
+        )
+
+    atyp = AddrType.IPV4 if addr.version == 4 else AddrType.IPV6
+    return build_udp_header(atyp, addr.packed, port)
 
 
 def build_socks5_reply(
