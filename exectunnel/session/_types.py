@@ -10,7 +10,7 @@ parameters and ``TypeAlias`` for callable aliases.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from typing import Any, TypeAlias, TypeVar
+from typing import Any, TypeVar
 
 # ── Generic type parameters ───────────────────────────────────────────────────
 
@@ -38,6 +38,18 @@ listener that aggregates snapshots into benchmark reports.
 
 type ReconnectCallable = Callable[[str], Awaitable[None]]
 """Signature of the optional callback used to request a session reconnect.
-
 The single argument is a short human-readable reason string.
 """
+
+type AgentRecentlyActiveCallable = Callable[[], bool]
+"""Signature of the predicate used by the dispatcher to ask the session whether
+the remote agent has emitted any frame within the configured grace window.
+
+When the predicate returns ``True``, the dispatcher must suppress ACK-timeout
+based forced reconnects: the agent is alive and what is observed is tunnel
+congestion, not a wedged agent.
+"""
+
+type MarkAgentRxCallable = Callable[[], None]
+"""Signature of the callback fired by the receiver on each inbound WebSocket
+chunk to refresh the shared agent activity timestamp."""

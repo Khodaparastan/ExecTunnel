@@ -48,6 +48,7 @@ MAX_STASH_LINES: Final[int] = 256
 PYTHON_CANDIDATES: Final[tuple[str, ...]] = (
     "python3.13",
     "python3.12",
+    "python3.11",
     "python3",
     "python",
 )
@@ -55,6 +56,10 @@ PYTHON_CANDIDATES: Final[tuple[str, ...]] = (
 
 Includes ``python3.13`` first to match the py313+ deployment target.
 """
+MIN_REMOTE_PYTHON_VERSION: Final[tuple[int, int]] = (3, 11)
+"""Minimum Python version required by the Python pod agent."""
+UPLOAD_FENCE_EVERY_CHUNKS: Final[int] = 8
+"""Fence every N upload chunks to avoid overrunning raw PTY input buffers."""
 
 # ── WebSocket decode ──────────────────────────────────────────────────────────
 
