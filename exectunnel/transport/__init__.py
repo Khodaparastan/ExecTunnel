@@ -48,13 +48,14 @@ the stability contract.
 
 from __future__ import annotations
 
-from ._constants import MAX_DATA_CHUNK_BYTES
+from ._constants import MAX_DATA_CHUNK_BYTES, MAX_UDP_DATA_CHUNK_BYTES
 from ._types import TcpRegistry, TransportHandler, UdpRegistry, WsSendCallable
 from .tcp import TcpConnection
 from .udp import UdpFlow
 
 __all__ = [
     "MAX_DATA_CHUNK_BYTES",
+    "MAX_UDP_DATA_CHUNK_BYTES",
     "TcpConnection",
     "TransportHandler",
     "UdpFlow",

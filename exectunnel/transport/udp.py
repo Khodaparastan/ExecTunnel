@@ -18,7 +18,6 @@ Lifecycle:
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from typing import Final
 
@@ -35,6 +34,7 @@ from exectunnel.protocol import (
     encode_udp_open_frame,
 )
 
+from ._constants import MAX_UDP_DATA_CHUNK_BYTES
 from ._types import UdpRegistry, WsSendCallable
 from ._validation import require_bytes
 from ._waiting import wait_first
@@ -69,6 +69,7 @@ class UdpFlow:
         "_registry",
         "_inbound",
         "_closed_event",
+        "_state_lock",
         "_opened",
         "_closed",
         "_drop_count",
@@ -94,6 +95,7 @@ class UdpFlow:
             maxsize=Defaults.UDP_INBOUND_QUEUE_CAP
         )
         self._closed_event = asyncio.Event()
+        self._state_lock = asyncio.Lock()
 
         self._opened = False
         self._closed = False
@@ -127,34 +129,39 @@ class UdpFlow:
             ConnectionClosedError: If the WebSocket connection is already
                 closed.
         """
-        if self._opened:
-            return
+        async with self._state_lock:
+            if self._opened:
+                return
 
-        if self._closed:
-            raise TransportError(
-                f"UDP flow {self._id!r}: open() called on a closed flow.",
-                error_code="transport.udp_open_on_closed",
-                details={"flow_id": self._id},
-                hint="A closed flow cannot be reopened. Create a new UdpFlow instead.",
-            )
+            if self._closed:
+                raise TransportError(
+                    f"UDP flow {self._id!r}: open() called on a closed flow.",
+                    error_code="transport.udp_open_on_closed",
+                    details={"flow_id": self._id},
+                    hint="A closed flow cannot be reopened. Create a new UdpFlow instead.",
+                )
 
-        frame = encode_udp_open_frame(self._id, self._host, self._port)
+            frame = encode_udp_open_frame(self._id, self._host, self._port)
 
-        try:
-            await self._ws_send(frame, control=True)
-        except (WebSocketSendTimeoutError, ConnectionClosedError):
-            raise
-        except Exception as exc:
-            raise TransportError(
-                f"UDP flow {self._id!r}: failed to send UDP_OPEN frame.",
-                error_code="transport.udp_open_failed",
-                details={"flow_id": self._id, "host": self._host, "port": self._port},
-                hint="Check WebSocket connectivity to the remote agent.",
-            ) from exc
+            try:
+                await self._ws_send(frame, control=True)
+            except (WebSocketSendTimeoutError, ConnectionClosedError):
+                raise
+            except Exception as exc:
+                raise TransportError(
+                    f"UDP flow {self._id!r}: failed to send UDP_OPEN frame.",
+                    error_code="transport.udp_open_failed",
+                    details={
+                        "flow_id": self._id,
+                        "host": self._host,
+                        "port": self._port,
+                    },
+                    hint="Check WebSocket connectivity to the remote agent.",
+                ) from exc
 
-        self._opened = True
-        metrics_inc("udp.flow.opened")
-        _log.debug("udp flow %s opened → %s:%d", self._id, self._host, self._port)
+            self._opened = True
+            metrics_inc("udp.flow.opened")
+            _log.debug("udp flow %s opened → %s:%d", self._id, self._host, self._port)
 
     async def close(self) -> None:
         """Evict this flow from the registry and send the ``UDP_CLOSE`` frame.
@@ -171,37 +178,43 @@ class UdpFlow:
             TransportError: For any other send failure (``error_code``
                 ``"transport.udp_close_failed"``).
         """
-        if self._closed:
-            return
-        self._closed = True
-        self._closed_event.set()
-        self._evict()
-        metrics_inc("udp.flow.closed")
-        _log.debug("udp flow %s closing (local)", self._id)
+        async with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._closed_event.set()
+            self._evict()
+            metrics_inc("udp.flow.closed")
+            _log.debug("udp flow %s closing (local)", self._id)
 
-        if not self._opened:
-            _log.debug(
-                "udp flow %s: skipping UDP_CLOSE — open() never completed", self._id
-            )
-            return
+            if not self._opened:
+                _log.debug(
+                    "udp flow %s: skipping UDP_CLOSE — open() never completed",
+                    self._id,
+                )
+                return
 
-        try:
-            await self._ws_send(encode_udp_close_frame(self._id), control=True)
-        except ConnectionClosedError:
-            metrics_inc("udp.flow.close.connection_already_closed")
-            _log.debug(
-                "udp flow %s: connection already closed while sending UDP_CLOSE",
-                self._id,
-            )
-        except WebSocketSendTimeoutError:
-            raise
-        except Exception as exc:
-            raise TransportError(
-                f"UDP flow {self._id!r}: failed to send UDP_CLOSE frame.",
-                error_code="transport.udp_close_failed",
-                details={"flow_id": self._id},
-                hint="The remote agent will time out the flow independently.",
-            ) from exc
+            try:
+                await self._ws_send(
+                    encode_udp_close_frame(self._id),
+                    must_queue=True,
+                    control=False,
+                )
+            except ConnectionClosedError:
+                metrics_inc("udp.flow.close.connection_already_closed")
+                _log.debug(
+                    "udp flow %s: connection already closed while sending UDP_CLOSE",
+                    self._id,
+                )
+            except WebSocketSendTimeoutError:
+                raise
+            except Exception as exc:
+                raise TransportError(
+                    f"UDP flow {self._id!r}: failed to send UDP_CLOSE frame.",
+                    error_code="transport.udp_close_failed",
+                    details={"flow_id": self._id},
+                    hint="The remote agent will time out the flow independently.",
+                ) from exc
 
     def on_remote_closed(self) -> None:
         """Signal that the agent has closed its side of the flow.
@@ -297,56 +310,83 @@ class UdpFlow:
 
     # ── Outbound (local → remote) ─────────────────────────────────────────────
 
-    async def send_datagram(self, data: bytes) -> None:
+    async def send_datagram(self, data: bytes, *, must_queue: bool = False) -> None:
         """Encode *data* as a ``UDP_DATA`` frame and forward it to the agent.
 
         One datagram = one frame. The caller must ensure *data* fits
         within the protocol payload budget
-        (:data:`~exectunnel.transport._constants.MAX_DATA_CHUNK_BYTES`
+        (:data:`~exectunnel.transport._constants.MAX_UDP_DATA_CHUNK_BYTES`
         raw bytes). No-op if the flow is already closed.
 
         Args:
             data: Raw datagram bytes to forward to the agent.
+            must_queue: When ``True``, wait until the frame is enqueued under
+                sender backpressure. Use this for DNS and request/response UDP.
+                Leave ``False`` for best-effort high-rate SOCKS5 UDP.
 
         Raises:
-            TransportError: If *data* is not a :class:`bytes` instance
-                (``"transport.invalid_payload_type"``), if :meth:`open`
-                has not completed (``"transport.udp_send_before_open"``),
-                or for any other send failure
-                (``"transport.udp_data_send_failed"``).
-            WebSocketSendTimeoutError: If the send stalls beyond the
-                timeout.
-            ConnectionClosedError: If the connection is closed before
-                sending.
+            TransportError: If *data* is too large, or for any other send failure.
+            ConnectionClosedError: If the tunnel connection is closed.
         """
         require_bytes(data, self._id, "send_datagram")
 
-        if self._closed:
-            return
-
-        if not self._opened:
+        if not data:
             raise TransportError(
-                f"UDP flow {self._id!r}: send_datagram() called before "
-                "open() completed.",
-                error_code="transport.udp_send_before_open",
+                f"UDP flow {self._id!r}: zero-length UDP datagrams are not "
+                "representable by the current UDP_DATA frame format.",
+                error_code="transport.udp_empty_datagram",
                 details={"flow_id": self._id},
-                hint="Await open() before sending datagrams.",
+                hint="Drop zero-length UDP datagrams or add an explicit empty-datagram frame type.",
             )
 
-        try:
-            await self._ws_send(encode_udp_data_frame(self._id, data))
-        except (WebSocketSendTimeoutError, ConnectionClosedError):
-            raise
-        except Exception as exc:
-            raise TransportError(
-                f"UDP flow {self._id!r}: failed to send UDP_DATA frame.",
-                error_code="transport.udp_data_send_failed",
-                details={"flow_id": self._id, "payload_bytes": len(data)},
-                hint="Check WebSocket connectivity; datagram has been dropped.",
-            ) from exc
+        async with self._state_lock:
+            if self._closed:
+                return
 
-        self._bytes_sent += len(data)
-        metrics_inc("udp.flow.datagram.sent")
+            if len(data) > MAX_UDP_DATA_CHUNK_BYTES:
+                raise TransportError(
+                    f"UDP flow {self._id!r}: datagram is too large for one "
+                    f"UDP_DATA frame ({len(data)} bytes > {MAX_UDP_DATA_CHUNK_BYTES}).",
+                    error_code="transport.udp_datagram_too_large",
+                    details={
+                        "flow_id": self._id,
+                        "payload_bytes": len(data),
+                        "max_payload_bytes": MAX_UDP_DATA_CHUNK_BYTES,
+                    },
+                    hint=(
+                        "Reduce the SOCKS5 UDP payload cap or implement UDP "
+                        "fragmentation/reassembly above the tunnel layer."
+                    ),
+                )
+
+            if not self._opened:
+                raise TransportError(
+                    f"UDP flow {self._id!r}: send_datagram() called before "
+                    "open() completed.",
+                    error_code="transport.udp_send_before_open",
+                    details={"flow_id": self._id},
+                    hint="Await open() before sending datagrams.",
+                )
+
+            try:
+                await self._ws_send(
+                    encode_udp_data_frame(self._id, data),
+                    must_queue=must_queue,
+                )
+            except (WebSocketSendTimeoutError, ConnectionClosedError):
+                raise
+            except Exception as exc:
+                raise TransportError(
+                    f"UDP flow {self._id!r}: failed to send UDP_DATA frame.",
+                    error_code="transport.udp_data_send_failed",
+                    details={"flow_id": self._id, "payload_bytes": len(data)},
+                    hint="Check WebSocket connectivity; datagram has been dropped.",
+                ) from exc
+
+            self._bytes_sent += len(data)
+            metrics_inc("udp.flow.datagram.submitted")
+            if must_queue:
+                metrics_inc("udp.flow.datagram.enqueued_required")
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -361,6 +401,16 @@ class UdpFlow:
     def flow_id(self) -> str:
         """The stable identifier for this UDP flow."""
         return self._id
+
+    @property
+    def host(self) -> str:
+        """Destination host for this UDP flow."""
+        return self._host
+
+    @property
+    def port(self) -> int:
+        """Destination port for this UDP flow."""
+        return self._port
 
     @property
     def is_opened(self) -> bool:
