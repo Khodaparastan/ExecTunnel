@@ -1,289 +1,259 @@
-"""All numeric/string constants, split by domain.
+"""All numeric/string defaults, split by domain.
 
 Design rules
 ------------
 * Every constant is typed explicitly.
-* Units are encoded in the name (``_SECS``, ``_MS``, ``_BYTES``, ``_CHARS``).
-* Dead / stale constants are removed.
-* Values are derived from first principles — see inline comments.
-* No constant depends on another constant at module level (avoids import-order
-  issues and makes each value independently readable).
+* Units are encoded in the name: ``_SECS``, ``_MS``, ``_BYTES``, ``_CHARS``.
+* Values are chosen for Kubernetes exec/WebSocket tunnels, where all streams
+  share one constrained stdout/stdin path.
+* No constant value is derived from another constant at module import time.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import ClassVar, Literal
+
+__all__ = ["Defaults"]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Defaults:
-    # ── WebSocket / Bridge ────────────────────────────────────────────────────────
+    # ── WebSocket / bridge ────────────────────────────────────────────────────
 
-    # Application-level keepalive interval sent through _keepalive_loop.
-    # The websockets built-in ping is disabled (ping_interval=None) because its
-    # background task competes for the internal write lock under sustained load.
-    # 20 s is well below the standard NAT/proxy idle timeout floor (30–60 s) and
-    # gives a small safety margin versus WS_SEND_TIMEOUT_SECS (15 s),
-    # preventing a slow ping send from spuriously triggering a tunnel teardown.
-    WS_PING_INTERVAL_SECS: float = 20.0
+    # Application-level keepalive interval sent through the tunnel.
+    #
+    # websockets' built-in ping is disabled in the session layer because its
+    # background task can compete with tunnel frames for the internal write lock
+    # under sustained load.
+    #
+    # 20s is below common proxy/NAT idle floors of 30–60s while remaining above
+    # WS_SEND_TIMEOUT_SECS so a slow keepalive send does not dominate teardown.
+    WS_PING_INTERVAL_SECS: ClassVar[float] = 20.0
 
-    # Maximum time to wait for a single WebSocket frame send to complete.
-    # Over a kubectl exec channel, a stalled send indicates a dead tunnel.
-    # 15 s is enough to survive brief API server hiccups while still
-    # detecting stalled tunnels promptly.
-    WS_SEND_TIMEOUT_SECS: float = 15.0
+    # Maximum time for one WebSocket frame send.
+    #
+    # Over Kubernetes exec or a reverse-proxied exec bridge, a single send
+    # taking longer than 15s usually indicates a wedged downstream path.
+    WS_SEND_TIMEOUT_SECS: ClassVar[float] = 15.0
 
-    # Bounded outbound data queue.  Control frames use a separate unbounded queue.
-    # 512 items × ~4 KiB/frame ≈ 2 MiB peak in-flight before backpressure.
-    # Sized to absorb one full TCP window of data without stalling the upstream
-    # reader while the send loop drains.
-    WS_SEND_QUEUE_CAP: int = 512
+    # Bounded outbound data-frame queue.
+    #
+    # Control frames use a separate unbounded priority queue. With the default
+    # PIPE_READ_CHUNK_BYTES of 8192, this is approximately 4 MiB of raw payload,
+    # plus base64/string overhead, which is acceptable for a local client.
+    WS_SEND_QUEUE_CAP: ClassVar[int] = 512
 
-    # Reconnect policy — exponential backoff with jitter.
-    # 10 retries × max_delay 15 s ≈ roughly ~2 min of retry window with
-    # backoff+jitter.
-    # Enough to survive a rolling API server restart without giving up.
-    WS_RECONNECT_MAX_RETRIES: int = 10
-    WS_RECONNECT_BASE_DELAY_SECS: float = 1.0
-    WS_RECONNECT_MAX_DELAY_SECS: float = 15.0
+    # Reconnect policy.
+    #
+    # 10 retries with exponential backoff capped at 15s gives roughly a couple
+    # of minutes of recovery window with jitter, enough for transient API server
+    # restarts and proxy reloads.
+    WS_RECONNECT_MAX_RETRIES: ClassVar[int] = 10
+    WS_RECONNECT_BASE_DELAY_SECS: ClassVar[float] = 1.0
+    WS_RECONNECT_MAX_DELAY_SECS: ClassVar[float] = 15.0
 
-    # RFC 6455 close code 1011 — "server encountered an unexpected condition".
-    # Used when the agent appears unhealthy (ACK timeout surge) to force a clean
-    # WebSocket close and trigger the reconnect loop.
-    WS_CLOSE_CODE_UNHEALTHY: int = 1011
+    # Private-use RFC 6455 close code.
+    #
+    # 4001 means this client intentionally closed the tunnel because the agent
+    # health policy requested a reconnect. Do not use 1011 here; 1011 implies
+    # a remote/internal server failure and makes logs misleading.
+    WS_CLOSE_CODE_UNHEALTHY: ClassVar[int] = 4001
 
-    # ── TCP connection / ACK hardening ────────────────────────────────────────────
+    # ── Tunnel frame sizing ───────────────────────────────────────────────────
 
-    # How often to emit a warning log when ACK timeouts accumulate.
-    # Suppresses log spam on sustained tunnel degradation while still providing
-    # a signal every N failures.
-    ACK_TIMEOUT_WARN_EVERY: int = 10
+    # Maximum full tunnel frame line length accepted by the client parser.
+    #
+    # 32 KiB TCP payload → ~43.7 KiB base64 frame.
+    # 65,535-byte UDP payload → ~87.5 KiB base64 frame.
+    # 262 KiB leaves safe headroom while still bounding memory exposure.
+    TUNNEL_MAX_FRAME_CHARS: ClassVar[int] = 262_144
 
-    # Sliding window for counting ACK timeouts before triggering a reconnect.
-    # With CONN_ACK_TIMEOUT_SECS = 10 s and threshold = 5, the trigger fires
-    # when 5 connections time out within 60 s — roughly one per 12 s average.
-    # This indicates sustained tunnel degradation, not a transient blip.
-    ACK_TIMEOUT_WINDOW_SECS: float = 30.0
+    # Maximum unterminated receive buffer before the receiver treats it as a
+    # protocol violation. Must be at least TUNNEL_MAX_FRAME_CHARS in practice;
+    # kept as an independent literal by design.
+    TUNNEL_MAX_UNTERMINATED_CHARS: ClassVar[int] = 262_144
 
-    # Number of ACK timeouts within ACK_TIMEOUT_WINDOW_SECS that triggers a
-    # forced reconnect.  5 is enough to distinguish a degraded tunnel from
-    # normal variance (1–2 timeouts per window is expected on busy clusters).
-    ACK_TIMEOUT_RECONNECT_THRESHOLD: int = 5
+    # ── TCP connection / ACK hardening ────────────────────────────────────────
 
-    # Global semaphore cap on concurrent in-flight CONN_OPEN frames.
-    # Prevents thundering-herd on reconnect and limits tunnel frame burst.
-    # 128 concurrent connects × ~200 bytes/CONN_OPEN = ~25 KiB burst.
-    CONNECT_MAX_PENDING: int = 128
+    # Warning cadence for ACK failures. Code should suppress WS_CLOSED storms
+    # separately; this value applies to real pre-close ACK failures.
+    ACK_TIMEOUT_WARN_EVERY: ClassVar[int] = 10
 
-    # Per-host semaphore cap.  Prevents a single destination from consuming
-    # all global slots (e.g. a misconfigured client hammering one host).
-    CONNECT_MAX_PENDING_PER_HOST: int = 16
+    # Sliding window for timeout-burst detection.
+    #
+    # A shorter 30s window avoids carrying stale transient timeouts forward for
+    # two minutes. This pairs with threshold 20 below.
+    ACK_TIMEOUT_WINDOW_SECS: ClassVar[float] = 30.0
 
-    # Log a warning every N connect failures per host.
-    # Suppresses spam for persistently unreachable hosts.
-    CONNECT_FAILURE_WARN_EVERY: int = 10
+    # Number of ACK timeout or agent-error events inside the sliding window
+    # before forcing reconnect.
+    #
+    # Five was too aggressive for browser/connect storms over exec/WebSocket.
+    # Twenty still detects a wedged agent quickly while avoiding false positives
+    # during momentary stdout/data head-of-line blocking.
+    ACK_TIMEOUT_RECONNECT_THRESHOLD: ClassVar[int] = 20
 
-    # Cloudflare challenge endpoint pacing — minimum ms between CONN_OPENs.
-    # challenges.cloudflare.com rate-limits aggressively; 120 ms ≈ 8 req/s,
-    # well within their documented threshold.
-    # Stored in milliseconds (integer) for direct use in connect_pace_cf_ms.
-    CONNECT_PACE_CF_MS: int = 120
+    # Recent-activity grace window for ACK-timeout health reconnect.
+    #
+    # If the agent has sent any frame within this many seconds, do not force a
+    # session reconnect on accumulated ACK timeouts — the agent is still alive
+    # and what we are seeing is tunnel congestion, not a wedged agent.
+    ACK_HEALTH_ACTIVITY_GRACE_SECS: ClassVar[float] = 10.0
 
-    # Maximum random jitter added on top of the pacing interval.
-    # Kept small (20 ms) to avoid introducing noticeable latency while still
-    # preventing perfectly synchronised bursts from multiple coroutines.
-    CONNECT_PACE_JITTER_CAP_SECS: float = 0.02
+    # Global cap on simultaneous in-flight CONN_OPEN frames.
+    #
+    # Kubernetes exec/WebSocket is a single multiplexed pipe; 128+ pending opens
+    # creates ACK storms and worsens stdout head-of-line blocking. 64 is a safer
+    # production default. Browser-heavy deployments may prefer 32.
+    CONNECT_MAX_PENDING: ClassVar[int] = 64
 
-    # Minimum seconds between successive CONN_OPEN frames to the same host.
-    # Prevents thundering-herd bursts to a single destination on reconnect.
-    # 0 disables pacing entirely (default — pacing caused SSL handshake aborts
-    # for tools like aria2 that open many parallel connections to the same host,
-    # because connections 2-N were delayed 3 s each before CONN_OPEN was sent).
-    CONNECT_PACE_INTERVAL_SECS: float = 0.0
+    # Per-host in-flight CONN_OPEN cap.
+    #
+    # Prevents one destination from consuming all global slots.
+    CONNECT_MAX_PENDING_PER_HOST: ClassVar[int] = 8
+
+    # Small per-host pacing interval for CONN_OPEN frames.
+    #
+    # 20ms smooths connection bursts without adding meaningful latency. This is
+    # intentionally not a multi-second delay.
+    CONNECT_PACE_INTERVAL_SECS: ClassVar[float] = 0.02
+
+    # Maximum random jitter added to per-host pacing.
+    CONNECT_PACE_JITTER_CAP_SECS: ClassVar[float] = 0.02
 
     # Timeout waiting for the agent to ACK a CONN_OPEN.
-    # The agent should ACK within one tunnel RTT (50–500 ms on healthy clusters).
-    # 10 s is generous enough to survive a congested cluster (3× worst-case RTT
-    # of ~2 s + DNS resolution + TCP connect on the agent side) while still
-    # detecting stalled connections promptly.
     #
-    # Cross-check with ACK hardening:
-    #   ACK_TIMEOUT_RECONNECT_THRESHOLD = 5 timeouts
-    #   ACK_TIMEOUT_WINDOW_SECS = 30 s
-    # This intentionally detects repeated failures quickly on degraded tunnels.
-    CONN_ACK_TIMEOUT_SECS: float = 30.0
+    # ACK includes agent-side DNS resolution and TCP connect from inside the pod.
+    # Must be greater than agent TCP connect timeout plus tunnel/proxy latency.
+    CONN_ACK_TIMEOUT_SECS: ClassVar[float] = 30.0
 
-    # Pre-ACK buffer: bytes buffered before the agent ACKs CONN_OPEN.
-    # 64 KiB = 16 × PIPE_READ_CHUNK_BYTES — holds a full TLS ClientHello +
-    # HTTP request without stalling the upstream reader.
-    # On flush this becomes 16 queue items, well within TCP_INBOUND_QUEUE_CAP.
-    PRE_ACK_BUFFER_CAP_BYTES: int = 64 * 1024  # 65,536 bytes
-
-    # asyncio.Queue capacity for DATA frames waiting to be written to the local
-    # TCP socket.  256 items × 4 KiB/item ≈ 1 MiB per connection before
-    # backpressure engages on the WebSocket recv loop.
-    TCP_INBOUND_QUEUE_CAP: int = 256
-
-    # ── SOCKS5 handshake ──────────────────────────────────────────────────────────
-
-    # Maximum time for the full SOCKS5 handshake (greeting + method selection +
-    # request).  All I/O is local loopback — no tunnel involvement.
-    # 30 s matches OpenSSH DynamicForward / Dante / 3proxy industry standard.
-    HANDSHAKE_TIMEOUT_SECS: float = 30.0
-
-    # ── Bootstrap timing ─────────────────────────────────────────────────────────
-
-    # Maximum time to wait for AGENT_READY after exec'ing the agent script.
-    # Breakdown of what happens after `exec python3 agent.py`:
-    #   Python startup + import:        ~200–500 ms
-    #   Agent initialisation:           ~50–100 ms
-    #   AGENT_READY write + flush:      ~10 ms
-    #   Tunnel RTT back to client:      50–500 ms
-    #   Total healthy:                  ~300 ms – 1.1 s
-    #   Slow cluster / large agent:     up to ~5 s
+    # Bytes buffered from the local client before CONN_ACK arrives.
     #
-    # 30 s provides 6× headroom over the worst realistic case and matches the
-    # SOCKS5 handshake timeout for operational consistency.
+    # 64 KiB covers TLS ClientHello plus early HTTP request data without allowing
+    # unbounded pre-ACK memory growth.
+    PRE_ACK_BUFFER_CAP_BYTES: ClassVar[int] = 65_536
+
+    # Per-connection queue capacity for decoded DATA frames waiting to be written
+    # to the local TCP socket.
     #
-    # Previous value was 15 s — too tight for slow clusters or large agent
-    # scripts where Python startup alone can take 2–3 s.
-    READY_TIMEOUT_SECS: float = 30.0
+    # With 8 KiB chunks, 128 items is about 1 MiB per connection before local
+    # backpressure/teardown policy engages.
+    TCP_INBOUND_QUEUE_CAP: ClassVar[int] = 128
 
-    # Fixed sleep after `stty raw -echo` to let the terminal mode change take
-    # effect before sending the first printf command.  200 ms is empirically
-    # sufficient across all tested shell implementations (bash, sh, busybox ash).
-    BOOTSTRAP_STTY_DELAY_SECS: float = 0.2
+    # ── SOCKS5 handshake / listener ───────────────────────────────────────────
 
-    # Fixed sleep after `rm -f` to ensure the shell has processed the command
-    # before the next printf appends to the (now-deleted) file.  50 ms is
-    # sufficient because rm is synchronous in all POSIX shells.
-    BOOTSTRAP_RM_DELAY_SECS: float = 0.05
-
-    # Fixed sleep after the sed | base64 -d pipeline to let the decode complete
-    # before the syntax-check reads the output file.  100 ms is sufficient for
-    # agent scripts up to ~500 KiB; increase if using a very large agent.
-    BOOTSTRAP_DECODE_DELAY_SECS: float = 0.1
-
-    # Maximum number of pre-ready diagnostic lines to retain for error reporting.
-    # 20 lines is enough to capture a full Python traceback (typically 10–15
-    # lines) plus a few lines of context.
-    BOOTSTRAP_DIAG_MAX_LINES: int = 20
-
-    # ── Session / frame constants ─────────────────────────────────────────────────
-
-    # Base64 chunk size for agent upload.
-    # 200 chars is safely under the POSIX minimum shell input buffer (512 bytes)
-    # and avoids splitting multi-byte sequences in the base64 alphabet.
-    BOOTSTRAP_CHUNK_SIZE_CHARS: int = 200
-
-    # Default fetch raw URL used to fetch the agent when bootstrap_delivery="fetch".
-    # Points to the main branch of the canonical repository.  Override via
-    # EXECTUNNEL_FETCH_AGENT_URL to pin a specific commit or use a fork.
-    BOOTSTRAP_FETCH_AGENT_URL: str = "https://raw.githubusercontent.com/Khodaparastan/ExecTunnel/refs/heads/develop/exectunnel/payload/agent.py"
-
-    # Maximum time to wait for the curl/wget fetch to complete before proceeding.
-    # The bootstrapper polls for file existence every BOOTSTRAP_FETCH_FETCH_POLL_SECS
-    # and gives up after this many seconds (logging a warning and continuing).
-    # 10 s is generous for a ~50 KiB file over a typical cluster egress path
-    # (1–5 Mbit/s).  Increase via EXECTUNNEL_BOOTSTRAP_FETCH_FETCH_DELAY if
-    # the pod's egress is unusually slow.
-    BOOTSTRAP_FETCH_FETCH_DELAY_SECS: float = 10.0
-
-    # Polling interval when waiting for the fetch-fetched agent file to appear.
-    # 0.5 s gives sub-second detection on fast clusters without busy-looping.
-    BOOTSTRAP_FETCH_FETCH_POLL_SECS: float = 0.5
-
-    # Path of the sentinel file written inside the pod after a successful syntax
-    # check.  When bootstrap_skip_if_present=True and bootstrap_syntax_check=True,
-    # the bootstrapper checks for this file before running the syntax check again.
-    # Avoids re-parsing a large agent script on every reconnect.
-    BOOTSTRAP_SYNTAX_OK_SENTINEL: str = "/tmp/exectunnel_agent.syntax_ok"  # noqa: S108
-
-    # Path of the agent script inside the pod.
-    BOOTSTRAP_AGENT_PATH: str = "/tmp/exectunnel_agent.py"  # noqa: S108
-
-    # Path of the Go agent binary inside the pod.
-    # The Go agent is a static Linux/amd64 binary that replaces the Python script.
-    # Override via EXECTUNNEL_BOOTSTRAP_GO_AGENT_PATH if /tmp is noexec.
-    BOOTSTRAP_GO_AGENT_PATH: str = "/tmp/agent"  # noqa: S108
-
-    # TCP read chunk size for upstream copy and direct pipe.
-    # 4 KiB is the standard Linux socket buffer quantum and matches the typical
-    # TLS record size, minimising partial-record reads.
-    PIPE_READ_CHUNK_BYTES: int = 4_096
-
-    # ── UDP / DNS ─────────────────────────────────────────────────────────────────
-
-    # asyncio.Queue capacity for decoded UDP datagrams in UdpFlowHandler.
-    # 32 items absorbs DNS response bursts and short QUIC handshake exchanges.
-    # Worst-case memory: 32 × 8,192 B ≈ 256 KiB per flow.
-    UDP_INBOUND_QUEUE_CAP: int = 32
-
-    # asyncio.Queue capacity for parsed (payload, host, port) tuples in UDPRelay.
-    # The consumer (UDP ASSOCIATE handler) is blocked on tunnel I/O (50–500 ms).
-    # At 100 datagrams/s and 500 ms RTT, steady-state depth ≈ 50 items.
-    # 64 provides headroom above the 50-item steady-state for QUIC bursts.
-    UDP_RELAY_QUEUE_CAP: int = 64
-
-    # Emit a logger.warning every N drops after the first (which always warns).
-    # At ~1,000 datagrams/s burst rate, this yields ~1 warning/s under pressure.
-    UDP_WARN_EVERY: int = 1_000
-
-    # Polling interval for the UDP ASSOCIATE pump loop.
-    # The pump calls relay.recv() with this timeout so it can periodically check
-    # req.reader.at_eof() to detect client disconnection.
-    # 1 s is short enough to detect disconnection promptly without busy-looping.
-    UDP_PUMP_POLL_TIMEOUT_SECS: float = 1.0
-
-    # Timeout for receiving a UDP response on directly-connected (excluded) hosts.
-    # 2 s covers slow LAN responses while failing fast enough to not block the
-    # pump loop for a full UDP_PUMP_POLL_TIMEOUT_SECS cycle.
-    UDP_DIRECT_RECV_TIMEOUT_SECS: float = 2.0
-
-    # Local port for the DNS forwarder UDP socket.
-    # 5300 is an unprivileged port (> 1024) that avoids conflicts with system
-    # DNS resolvers on port 53.  Override via EXECTUNNEL_DNS_LOCAL_PORT.
-    DNS_LOCAL_PORT: int = 5300
-
-    # Standard DNS port (RFC 1035 §4.2.1).
-    DNS_UPSTREAM_PORT: int = 53
-
-    # End-to-end DNS query timeout through the tunnel.
-    # T_total = 3 × T_tunnel + T_dns
-    # Healthy cluster:   3 × 100 ms + 10 ms  =  310 ms
-    # Congested cluster: 3 × 500 ms + 50 ms  = 1,550 ms
-    # 5 s matches the RFC 1035 DNS client retry interval (glibc/musl/Go default)
-    # so a timeout causes a clean client retry rather than a duplicate in-flight.
-    DNS_QUERY_TIMEOUT_SECS: float = 8.0
-
-    # Maximum concurrent in-flight DNS queries.
-    # At 100 q/s × 5 s timeout = 500 inflight at steady state.
-    # 512 covers this with a small safety margin; memory ≈ 512 × 4 KiB ≈ 2 MiB.
-    DNS_MAX_INFLIGHT: int = 1_024
-
-    # ── Send / Metrics ────────────────────────────────────────────────────────────
-
-    # Log a warning every N dropped send frames.
-    # Matches UDP_WARN_EVERY (1,000) for consistent log volume across all
-    # drop-counting paths.  At 1,000 drops/s this yields ~1 warning/s.
-    SEND_DROP_LOG_EVERY: int = 1_000
-
-    # Interval at which the observability layer reports aggregated metrics.
-    METRICS_REPORT_INTERVAL_SECS: float = 60.0
-
-    # ── SOCKS5 defaults ───────────────────────────────────────────────────────────
+    # Maximum time for local SOCKS5 greeting and request negotiation.
+    HANDSHAKE_TIMEOUT_SECS: ClassVar[float] = 30.0
 
     # Default bind address for the local SOCKS5 proxy.
-    # Loopback-only by default — prevents accidental open-proxy exposure.
-    # Override via EXECTUNNEL_SOCKS_HOST (with a warning if non-loopback).
-    SOCKS_DEFAULT_HOST: str = "127.0.0.1"
+    #
+    # Loopback-only by default to avoid accidental open-proxy exposure.
+    SOCKS_DEFAULT_HOST: ClassVar[str] = "127.0.0.1"
 
-    # Default SOCKS5 listen port.  1080 is the IANA-registered SOCKS port.
-    SOCKS_DEFAULT_PORT: int = 1080
-    # asyncio.Queue capacity for completed SOCKS5 handshakes awaiting dispatch.
-    # 256 absorbs short bursts of parallel browser connections (Chrome opens
-    # up to 6 connections per host × ~40 tabs = ~240 simultaneous handshakes).
-    SOCKS_REQUEST_QUEUE_CAP: int = 256
-    # Max seconds to enqueue a completed handshake before dropping it.
-    # 5 s matches the default TCP connect timeout on most OS stacks.
-    SOCKS_QUEUE_PUT_TIMEOUT_SECS: float = 5.0
+    # IANA-registered SOCKS port.
+    SOCKS_DEFAULT_PORT: ClassVar[int] = 1080
+
+    # Completed SOCKS5 handshakes awaiting dispatch.
+    #
+    # 256 absorbs short browser bursts without allowing unbounded local memory
+    # growth if the tunnel is slow.
+    SOCKS_REQUEST_QUEUE_CAP: ClassVar[int] = 256
+
+    # Maximum time to enqueue a completed SOCKS request before dropping it.
+    SOCKS_QUEUE_PUT_TIMEOUT_SECS: ClassVar[float] = 5.0
+
+    # ── Bootstrap ─────────────────────────────────────────────────────────────
+
+    # Maximum time to wait for AGENT_READY after exec.
+    READY_TIMEOUT_SECS: ClassVar[float] = 30.0
+
+    # Maximum number of pre-ready diagnostic lines retained for errors.
+    BOOTSTRAP_DIAG_MAX_LINES: ClassVar[int] = 20
+
+    # Base64 upload chunk size for shell delivery.
+    #
+    # 512 chars keeps each printf command small enough for busybox ash, raw PTY
+    # mode, and conservative exec proxies while cutting command count versus
+    # 200-char chunks.
+    BOOTSTRAP_CHUNK_SIZE_CHARS: ClassVar[int] = 512
+
+    # Restricted-environment safe default.
+    #
+    # "upload" requires only shell + Python/base64 fallback inside the pod.
+    # "fetch" requires pod egress and should be opt-in.
+    BOOTSTRAP_DELIVERY: ClassVar[Literal["fetch", "upload"]] = "fetch"
+
+    # Optional raw URL used when BOOTSTRAP_DELIVERY is "fetch".
+    #
+    # Production deployments should pin this to an immutable commit/object URL
+    # or serve it from an internal trusted bucket.
+    BOOTSTRAP_FETCH_AGENT_URL: ClassVar[str] = (
+        "https://pub-0047b2c90ee14a2fbbcb586f5f1ebbef.r2.dev/agent.py"
+    )
+
+    # Kept for compatibility with the current bootstrapper fetch polling path.
+    # If using the atomic checked-fetch bootstrap refactor, use this as the
+    # total fetch command timeout.
+    BOOTSTRAP_FETCH_FETCH_DELAY_SECS: ClassVar[float] = 30.0
+
+    # Kept for compatibility with the current polling fetch path.
+    BOOTSTRAP_FETCH_FETCH_POLL_SECS: ClassVar[float] = 0.5
+
+    # Path of the syntax-OK sentinel inside the pod.
+    BOOTSTRAP_SYNTAX_OK_SENTINEL: ClassVar[str] = "/tmp/exectunnel_agent.syntax_ok"  # noqa: S108
+
+    # Path of the Python agent inside the pod.
+    BOOTSTRAP_AGENT_PATH: ClassVar[str] = "/tmp/exectunnel_agent.py"  # noqa: S108
+
+    # Path of the optional Go agent binary inside the pod.
+    BOOTSTRAP_GO_AGENT_PATH: ClassVar[str] = "/tmp/exectunnel_agent"  # noqa: S108
+
+    # ── TCP pipe sizing ───────────────────────────────────────────────────────
+
+    # Read size for local upstream copy and direct TCP pipe.
+    #
+    # 8192 bytes produces ~10.9 KiB DATA frames after base64, small enough to
+    # avoid severe exec/WebSocket stdout head-of-line blocking while preserving
+    # reasonable throughput. The old 6108-byte value only made sense with an
+    # 8192-character parser limit.
+    PIPE_READ_CHUNK_BYTES: ClassVar[int] = 8_192
+
+    # ── UDP / DNS ─────────────────────────────────────────────────────────────
+
+    # Per-UDP-flow inbound queue capacity.
+    #
+    # 32 items absorbs DNS response bursts and short QUIC handshake bursts.
+    UDP_INBOUND_QUEUE_CAP: ClassVar[int] = 32
+
+    # Queue capacity for parsed SOCKS5 UDP datagrams awaiting tunnel dispatch.
+    UDP_RELAY_QUEUE_CAP: ClassVar[int] = 64
+
+    # Emit one warning for the first drop and every N drops afterward.
+    UDP_WARN_EVERY: ClassVar[int] = 1_000
+
+    # Poll interval for UDP ASSOCIATE pump EOF checks.
+    UDP_PUMP_POLL_TIMEOUT_SECS: ClassVar[float] = 1.0
+
+    # Timeout for directly-connected UDP responses on excluded hosts.
+    UDP_DIRECT_RECV_TIMEOUT_SECS: ClassVar[float] = 2.0
+
+    # Local DNS forwarder bind port.
+    DNS_LOCAL_PORT: ClassVar[int] = 5300
+
+    # Standard DNS upstream port.
+    DNS_UPSTREAM_PORT: ClassVar[int] = 53
+
+    # End-to-end DNS timeout through the tunnel.
+    DNS_QUERY_TIMEOUT_SECS: ClassVar[float] = 8.0
+
+    # Maximum concurrent DNS queries.
+    DNS_MAX_INFLIGHT: ClassVar[int] = 1_024
+
+    # ── Send / metrics ────────────────────────────────────────────────────────
+
+    # Warning cadence for dropped outbound data frames.
+    SEND_DROP_LOG_EVERY: ClassVar[int] = 1_000
+
+    # Metrics reporting interval.
+    METRICS_REPORT_INTERVAL_SECS: ClassVar[float] = 60.0

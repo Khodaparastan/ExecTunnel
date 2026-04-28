@@ -143,8 +143,28 @@ class ExecTunnelError(Exception):
 
     def to_dict(self) -> dict[str, Any]:
         """
-        Return a fully serialisable representation suitable for structured
-        logging, Sentry ``extra``, or an OpenTelemetry span attribute.
+        Return a fully serialisable representation of this error.
+
+        The returned mapping is a **wire/serialisation payload**, intended for:
+
+        * JSON wire transport (e.g. agent ↔ session error envelopes);
+        * ``sentry_sdk.set_extra("error", exc.to_dict())`` — Sentry nests it
+          under a single key, so internal field names are free of constraints;
+        * OpenTelemetry span attributes — flat namespace, no reserved names;
+        * ``ExecTunnelError.from_dict(...)`` round-trips for cross-process
+          reconstruction (e.g. remote-agent errors, message queues).
+
+        It deliberately includes top-level keys such as ``message``, ``type``,
+        and (via ``details``) caller-supplied fields. Several of these names
+        collide with reserved attributes on :class:`logging.LogRecord`
+        (``message``, ``asctime``, ``name``, ``msg``, ``args``, ...).
+
+        .. warning::
+            **Do not** pass this payload as ``extra=`` to stdlib ``logging``.
+            ``Logger.makeRecord`` flat-splats ``extra`` onto ``LogRecord``
+            and raises ``KeyError`` on any reserved-name collision. When
+            logging an :class:`ExecTunnelError`, namespace the payload
+            instead, e.g. ``logger.error(..., extra={"error": exc.to_dict()})``.
         """
         cause = self.__cause__ or self.__context__
         active_traceback = traceback.format_exc()

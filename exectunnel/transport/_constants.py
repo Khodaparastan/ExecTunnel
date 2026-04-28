@@ -77,6 +77,6 @@ if Defaults.PIPE_READ_CHUNK_BYTES > MAX_DATA_CHUNK_BYTES:
     )
 if MAX_UDP_DATA_CHUNK_BYTES <= 0:
     raise RuntimeError(
-            "MAX_UDP_DATA_CHUNK_BYTES computed to a non-positive value. "
-            "Increase MAX_TUNNEL_FRAME_CHARS or reduce UDP frame overhead."
-        )
+        "MAX_UDP_DATA_CHUNK_BYTES computed to a non-positive value. "
+        "Increase MAX_TUNNEL_FRAME_CHARS or reduce UDP frame overhead."
+    )
