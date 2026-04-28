@@ -20,6 +20,7 @@ from typing import Final
 from exectunnel.exceptions import ProtocolError
 from exectunnel.protocol import AddrType
 
+from ._constants import DEFAULT_WRITER_CLOSE_TIMEOUT
 from ._wire import parse_socks5_addr_buf
 
 __all__ = [
@@ -119,15 +120,20 @@ async def read_socks5_addr(
     return host, port
 
 
-async def close_writer(writer: asyncio.StreamWriter) -> None:
+async def close_writer(
+    writer: asyncio.StreamWriter,
+    timeout: float = DEFAULT_WRITER_CLOSE_TIMEOUT,
+) -> None:
     """Close *writer*, suppressing :exc:`OSError` and :exc:`RuntimeError`.
 
     Args:
         writer: The asyncio stream writer to close.
+        timeout: Maximum seconds to wait for ``wait_closed``.
     """
-    with contextlib.suppress(OSError, RuntimeError):
+    with contextlib.suppress(OSError, RuntimeError, TimeoutError):
         writer.close()
-        await writer.wait_closed()
+        async with asyncio.timeout(timeout):
+            await writer.wait_closed()
 
 
 async def write_and_drain_silent(writer: asyncio.StreamWriter, data: bytes) -> None:
@@ -137,6 +143,7 @@ async def write_and_drain_silent(writer: asyncio.StreamWriter, data: bytes) -> N
         writer: The asyncio stream writer to write to.
         data: Raw bytes to write.
     """
-    with contextlib.suppress(OSError):
+    with contextlib.suppress(OSError, RuntimeError, TimeoutError):
         writer.write(data)
-        await writer.drain()
+        async with asyncio.timeout(DEFAULT_WRITER_CLOSE_TIMEOUT):
+            await writer.drain()

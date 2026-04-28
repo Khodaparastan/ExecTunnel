@@ -15,6 +15,7 @@ from exectunnel.exceptions import ProtocolError
 from exectunnel.observability import metrics_inc
 from exectunnel.protocol import Cmd, Reply
 
+from ._io import close_writer
 from ._wire import build_socks5_reply
 from .udp_relay import UDPRelay
 
@@ -69,9 +70,7 @@ class TCPRelay:
         if self.udp_relay is not None:
             self.udp_relay.close()
 
-        with contextlib.suppress(OSError, RuntimeError):
-            self.writer.close()
-            await self.writer.wait_closed()
+        await close_writer(self.writer)
 
     # ── Query properties ──────────────────────────────────────────────────────
 
@@ -147,8 +146,9 @@ class TCPRelay:
                     "sent. This is usually benign."
                 ),
             )
+        packet = build_socks5_reply(Reply.SUCCESS, bind_host, bind_port)
         self._consume_reply_slot()
-        self.writer.write(build_socks5_reply(Reply.SUCCESS, bind_host, bind_port))
+        self.writer.write(packet)
         await self.writer.drain()
         metrics_inc("socks5.replies.success", cmd=self.cmd.name)
 
@@ -171,9 +171,10 @@ class TCPRelay:
             ConfigurationError: Invalid *reply* code — always a caller
                 bug.
         """
+        packet: bytes | None = None
         try:
-            self._consume_reply_slot()
             packet = build_socks5_reply(reply)
+            self._consume_reply_slot()
             with contextlib.suppress(OSError):
                 self.writer.write(packet)
             metrics_inc("socks5.replies.error", reply=reply.name, cmd=self.cmd.name)

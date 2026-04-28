@@ -32,8 +32,12 @@ async def negotiate(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
     *,
+    udp_associate_enabled: bool,
     udp_relay_queue_capacity: int,
+    udp_max_payload_bytes: int,
     udp_drop_warn_interval: int,
+    udp_bind_host: str,
+    udp_advertise_host: str,
 ) -> TCPRelay | None:
     """Perform the full SOCKS5 handshake and return a ready :class:`TCPRelay`.
 
@@ -47,6 +51,8 @@ async def negotiate(
             any spawned :class:`UDPRelay`.
         udp_drop_warn_interval: Drop-warning throttle for any spawned
             :class:`UDPRelay`.
+        udp_bind_host: Local address used by UDP relays.
+        udp_advertise_host: Address advertised in UDP_ASSOCIATE replies.
 
     Returns:
         A fully-negotiated :class:`TCPRelay`, or ``None`` for ``BIND``.
@@ -63,6 +69,15 @@ async def negotiate(
         return TCPRelay(cmd=cmd, host=host, port=port, reader=reader, writer=writer)
 
     if cmd is Cmd.UDP_ASSOCIATE:
+        if not udp_associate_enabled:
+            metrics_inc("socks5.commands.udp_associate_rejected")
+            await write_and_drain_silent(
+                writer,
+                build_socks5_reply(Reply.CMD_NOT_SUPPORTED),
+            )
+            _log.debug("socks5 UDP_ASSOCIATE rejected because UDP support is disabled")
+            return None
+
         metrics_inc("socks5.commands.udp_associate")
         return await _build_udp_request(
             reader=reader,
@@ -70,7 +85,10 @@ async def negotiate(
             host=host,
             port=port,
             queue_capacity=udp_relay_queue_capacity,
+            max_payload_bytes=udp_max_payload_bytes,
             drop_warn_interval=udp_drop_warn_interval,
+            udp_bind_host=udp_bind_host,
+            udp_advertise_host=udp_advertise_host,
         )
 
     # BIND — the only remaining variant after strict Cmd construction.
@@ -210,11 +228,29 @@ async def _read_request(
             ),
         ) from exc
 
-    host, port = await read_socks5_addr(
-        reader,
-        allow_port_zero=cmd in (Cmd.UDP_ASSOCIATE, Cmd.BIND),
-    )
+    try:
+        host, port = await read_socks5_addr(
+            reader,
+            allow_port_zero=cmd in (Cmd.UDP_ASSOCIATE, Cmd.BIND),
+        )
+    except ProtocolError as exc:
+        await write_and_drain_silent(
+            writer, build_socks5_reply(_reply_for_addr_error(exc))
+        )
+        raise
+
     return cmd, host, port
+
+
+def _reply_for_addr_error(exc: ProtocolError) -> Reply:
+    """Map address-parse failures to the best SOCKS5 reply code."""
+    details = getattr(exc, "details", {}) or {}
+    field = str(details.get("socks5_field", ""))
+
+    if field == "ATYP" or field.startswith("DST.ADDR"):
+        return Reply.ADDR_NOT_SUPPORTED
+
+    return Reply.GENERAL_FAILURE
 
 
 async def _build_udp_request(
@@ -224,7 +260,10 @@ async def _build_udp_request(
     host: str,
     port: int,
     queue_capacity: int,
+    max_payload_bytes: int,
     drop_warn_interval: int,
+    udp_bind_host: str,
+    udp_advertise_host: str,
 ) -> TCPRelay:
     """Spawn a :class:`UDPRelay` and return the associated :class:`TCPRelay`.
 
@@ -236,6 +275,8 @@ async def _build_udp_request(
         queue_capacity: Inbound datagram queue capacity for the new
             relay.
         drop_warn_interval: Drop-warning throttle for the new relay.
+        udp_bind_host: Local address used by the UDP relay.
+        udp_advertise_host: Address advertised in the SOCKS5 reply.
 
     Returns:
         A :class:`TCPRelay` with ``udp_relay`` bound to the new
@@ -248,10 +289,20 @@ async def _build_udp_request(
     """
     relay = UDPRelay(
         queue_capacity=queue_capacity,
+        max_payload_bytes=max_payload_bytes,
         drop_warn_interval=drop_warn_interval,
+        bind_host=udp_bind_host,
+        advertise_host=udp_advertise_host,
     )
+    peername = writer.get_extra_info("peername")
+    tcp_peer_host: str | None = None
+    if isinstance(peername, tuple) and len(peername) >= 2:
+        tcp_peer_host = str(peername[0])
     try:
-        await relay.start(expected_client_addr=(host, port) if port != 0 else None)
+        await relay.start(
+            expected_client_addr=(host, port) if port != 0 else None,
+            expected_client_host=tcp_peer_host,
+        )
     except Exception:
         relay.close()
         await write_and_drain_silent(writer, build_socks5_reply(Reply.GENERAL_FAILURE))
