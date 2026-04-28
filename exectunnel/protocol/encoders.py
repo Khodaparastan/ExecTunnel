@@ -21,7 +21,10 @@ from .constants import (
     FRAME_SUFFIX,
     KEEPALIVE_FRAME,
     MAX_TUNNEL_FRAME_CHARS,
+    NO_CONN_ID_WITH_PAYLOAD_TYPES,
     NO_CONN_ID_TYPES,
+    PAYLOAD_FORBIDDEN_TYPES,
+    PAYLOAD_REQUIRED_TYPES,
     READY_FRAME,
     VALID_MSG_TYPES,
 )
@@ -35,6 +38,7 @@ __all__ = [
     "encode_data_frame",
     "encode_error_frame",
     "encode_keepalive_frame",
+    "encode_stats_frame",
     "encode_udp_close_frame",
     "encode_udp_data_frame",
     "encode_udp_open_frame",
@@ -128,6 +132,17 @@ def _encode_frame(msg_type: str, conn_id: str | None, payload: str = "") -> str:
                 f"{msg_type} must not carry a payload, got {payload!r}.",
                 details={"frame_type": msg_type, "expected": "no payload"},
             )
+    elif msg_type in NO_CONN_ID_WITH_PAYLOAD_TYPES:
+        if conn_id is not None:
+            raise ProtocolError(
+                f"{msg_type} must not carry a conn_id, got {conn_id!r}.",
+                details={"frame_type": msg_type, "expected": "conn_id=None"},
+            )
+        if not payload:
+            raise ProtocolError(
+                f"{msg_type} requires a payload.",
+                details={"frame_type": msg_type, "expected": "non-empty payload"},
+            )
     else:
         if not conn_id:
             raise ProtocolError(
@@ -135,6 +150,18 @@ def _encode_frame(msg_type: str, conn_id: str | None, payload: str = "") -> str:
                 details={"frame_type": msg_type, "expected": "[cu][0-9a-f]{24}"},
             )
         _validate_conn_id(conn_id, frame_type=msg_type)
+
+    if msg_type in PAYLOAD_REQUIRED_TYPES and not payload:
+        raise ProtocolError(
+            f"{msg_type} requires a non-empty payload.",
+            details={"frame_type": msg_type, "expected": "non-empty payload"},
+        )
+
+    if msg_type in PAYLOAD_FORBIDDEN_TYPES and payload:
+        raise ProtocolError(
+            f"{msg_type} must not carry a payload.",
+            details={"frame_type": msg_type, "expected": "empty payload"},
+        )
 
     for forbidden, description in _PAYLOAD_INJECTION_GUARDS:
         if forbidden in payload:
@@ -191,6 +218,23 @@ def encode_keepalive_frame() -> str:
         Newline-terminated frame string.
     """
     return KEEPALIVE_FRAME
+
+
+def encode_stats_frame(json_payload: bytes) -> str:
+    """Encode a session-scoped STATS frame.
+
+    Args:
+        json_payload: UTF-8 JSON bytes.
+
+    Returns:
+        Newline-terminated STATS frame.
+    """
+    if not json_payload:
+        raise ProtocolError(
+            "STATS frame payload must not be empty.",
+            details={"frame_type": "STATS", "expected": "non-empty JSON bytes"},
+        )
+    return f"{FRAME_PREFIX}STATS:{encode_binary_payload(json_payload)}{FRAME_SUFFIX}\n"
 
 
 # ── Public encoders — TCP connection frames ───────────────────────────────────
