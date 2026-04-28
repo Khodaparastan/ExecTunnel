@@ -13,7 +13,7 @@ import asyncio
 import contextlib
 from collections.abc import Awaitable
 
-__all__ = ["wait_first"]
+__all__ = ["wait_first", "wait_first_suppress_loser"]
 
 
 async def wait_first[T](
@@ -81,5 +81,47 @@ async def wait_first[T](
 
     primary_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
+        await primary_task
+    return False, None
+
+
+async def wait_first_suppress_loser[T](
+    primary: Awaitable[T],
+    event: asyncio.Event,
+    *,
+    primary_name: str,
+    event_name: str,
+) -> tuple[bool, T | None]:
+    """Race *primary* against *event*, suppressing loser exceptions.
+
+    Use this for benign queue-vs-close races where the losing awaitable is
+    irrelevant once the close event wins.
+    """
+    primary_task = asyncio.ensure_future(primary)
+    primary_task.set_name(primary_name)
+    event_task = asyncio.create_task(event.wait(), name=event_name)
+
+    try:
+        done, _ = await asyncio.wait(
+            {primary_task, event_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    except asyncio.CancelledError:
+        primary_task.cancel()
+        event_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await primary_task
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await event_task
+        raise
+
+    if primary_task in done and not primary_task.cancelled():
+        event_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await event_task
+        return True, primary_task.result()
+
+    primary_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
         await primary_task
     return False, None

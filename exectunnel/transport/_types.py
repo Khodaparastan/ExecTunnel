@@ -34,6 +34,13 @@ class WsSendCallable(Protocol):
     * ``control`` — priority frame that bypasses flow-control ordering;
       when ``True``, ``must_queue`` is ignored.
 
+    Ordering contract:
+        Frames for a single TCP connection or UDP flow that require FIFO
+        ordering must be enqueued through the same queue class. In particular,
+        normal ``CONN_CLOSE`` and ``UDP_CLOSE`` must not be sent with
+        ``control=True`` after data frames, because a priority sender may
+        deliver close before already-enqueued data.
+
     ``@runtime_checkable`` is applied so dependency-injection layers may
     verify conformance in tests via :func:`isinstance`.
     """
