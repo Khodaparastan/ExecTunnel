@@ -93,12 +93,16 @@ from .codecs import (
     parse_host_port,
 )
 from .constants import (
+    DATA_FRAME_OVERHEAD_CHARS,
     FRAME_PREFIX,
     FRAME_SUFFIX,
+    MAX_DATA_PAYLOAD_BYTES,
     MAX_TUNNEL_FRAME_CHARS,
+    MAX_UDP_DATA_PAYLOAD_BYTES,
     PORT_UNSPECIFIED,
     READY_FRAME,
     SESSION_CONN_ID,
+    UDP_DATA_FRAME_OVERHEAD_CHARS,
 )
 from .encoders import (
     encode_agent_ready_frame,
@@ -132,12 +136,16 @@ from .types import ParsedFrame
 
 __all__ = [
     # ── Frame constants ──────────────────────────────────────────────────────
+    "DATA_FRAME_OVERHEAD_CHARS",
     "FRAME_PREFIX",
     "FRAME_SUFFIX",
+    "MAX_DATA_PAYLOAD_BYTES",
     "MAX_TUNNEL_FRAME_CHARS",
+    "MAX_UDP_DATA_PAYLOAD_BYTES",
     "PORT_UNSPECIFIED",
     "READY_FRAME",
     "SESSION_CONN_ID",
+    "UDP_DATA_FRAME_OVERHEAD_CHARS",
     # ── SOCKS5 enums ─────────────────────────────────────────────────────────
     "AddrType",
     "AuthMethod",

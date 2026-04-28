@@ -29,10 +29,13 @@ from typing import Final
 from .ids import SESSION_CONN_ID as _SESSION_CONN_ID
 
 __all__ = [
+    "DATA_FRAME_OVERHEAD_CHARS",
     "FRAME_PREFIX",
     "FRAME_SUFFIX",
     "KEEPALIVE_FRAME",
+    "MAX_DATA_PAYLOAD_BYTES",
     "MAX_TUNNEL_FRAME_CHARS",
+    "MAX_UDP_DATA_PAYLOAD_BYTES",
     "MAX_TCP_UDP_PORT",
     "MIN_TCP_UDP_PORT",
     "NO_CONN_ID_TYPES",
@@ -43,6 +46,7 @@ __all__ = [
     "PORT_UNSPECIFIED",
     "READY_FRAME",
     "SESSION_CONN_ID",
+    "UDP_DATA_FRAME_OVERHEAD_CHARS",
     "VALID_MSG_TYPES",
 ]
 
@@ -69,8 +73,47 @@ FRAME_SUFFIX: Final[str] = ">>>"
 #:               = 8192 - 48
 #:               = 8144 base64url characters
 #:     max raw bytes = floor(8144 * 3 / 4) = 6108 bytes
-DEFAULT_MAX_TUNNEL_FRAME_CHARS=262144
-MAX_TUNNEL_FRAME_CHARS = int(os.getenv("EXECTUNNEL_MAX_TUNNEL_FRAME_CHARS",DEFAULT_MAX_TUNNEL_FRAME_CHARS ))
+DEFAULT_MAX_TUNNEL_FRAME_CHARS: Final[int] = 262_144
+MAX_TUNNEL_FRAME_CHARS: Final[int] = int(
+    os.getenv("EXECTUNNEL_MAX_TUNNEL_FRAME_CHARS", DEFAULT_MAX_TUNNEL_FRAME_CHARS)
+)
+
+_CONN_FLOW_ID_CHARS: Final[int] = 25
+
+DATA_FRAME_OVERHEAD_CHARS: Final[int] = (
+    len(FRAME_PREFIX)
+    + len("DATA")
+    + 2
+    + _CONN_FLOW_ID_CHARS
+    + len(FRAME_SUFFIX)
+)
+
+UDP_DATA_FRAME_OVERHEAD_CHARS: Final[int] = (
+    len(FRAME_PREFIX)
+    + len("UDP_DATA")
+    + 2
+    + _CONN_FLOW_ID_CHARS
+    + len(FRAME_SUFFIX)
+)
+
+
+def _max_binary_payload_bytes(frame_overhead_chars: int) -> int:
+    available_chars = MAX_TUNNEL_FRAME_CHARS - frame_overhead_chars
+    return max(0, available_chars * 3 // 4)
+
+
+MAX_DATA_PAYLOAD_BYTES: Final[int] = _max_binary_payload_bytes(
+    DATA_FRAME_OVERHEAD_CHARS
+)
+
+MAX_UDP_DATA_PAYLOAD_BYTES: Final[int] = _max_binary_payload_bytes(
+    UDP_DATA_FRAME_OVERHEAD_CHARS
+)
+
+if MAX_DATA_PAYLOAD_BYTES <= 0 or MAX_UDP_DATA_PAYLOAD_BYTES <= 0:
+    raise RuntimeError(
+        "EXECTUNNEL_MAX_TUNNEL_FRAME_CHARS is too small for DATA/UDP_DATA frames."
+    )
 
 #: Number of characters of a malformed payload included in error telemetry.
 PAYLOAD_PREVIEW_LEN: Final[int] = 64
