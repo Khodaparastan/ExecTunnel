@@ -25,8 +25,6 @@ Frame dispatch table
 """
 
 import asyncio
-import base64
-import binascii
 import json
 import logging
 
@@ -41,9 +39,13 @@ from exectunnel.exceptions import (
 )
 from exectunnel.observability import aspan, metrics_inc, metrics_observe
 from exectunnel.protocol import (
+    FRAME_PREFIX,
+    FRAME_SUFFIX,
+    MAX_TUNNEL_FRAME_CHARS,
     SESSION_CONN_ID,
     decode_binary_payload,
     decode_error_payload,
+    encode_conn_close_frame,
     encode_error_frame,
     parse_frame,
 )
@@ -56,9 +58,27 @@ from ._constants import (
     WS_CLOSE_CODE_PROTOCOL_ERROR,
 )
 from ._state import AckStatus, PendingConnect
-from ._types import AgentStatsCallable
+from ._types import AgentStatsCallable, MarkAgentRxCallable
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_frame_line(line: str) -> str | None:
+    """Extract one tunnel frame from a potentially noisy shell line."""
+
+    stripped = line.strip()
+    if not stripped:
+        return None
+
+    start = stripped.find(FRAME_PREFIX)
+    if start < 0:
+        return None
+
+    end = stripped.find(FRAME_SUFFIX, start + len(FRAME_PREFIX))
+    if end < 0:
+        return None
+
+    return stripped[start : end + len(FRAME_SUFFIX)]
 
 
 class FrameReceiver:
@@ -93,6 +113,7 @@ class FrameReceiver:
         "_pre_ready_carry",
         "_ws_send",
         "_on_agent_stats_cb",
+        "_mark_agent_rx",
     )
 
     def __init__(
@@ -106,6 +127,7 @@ class FrameReceiver:
         pre_ready_carry: str,
         ws_send: WsSendCallable | None = None,
         on_agent_stats: AgentStatsCallable | None = None,
+        mark_agent_rx: MarkAgentRxCallable | None = None,
     ) -> None:
         self._ws = ws
         self._ws_closed = ws_closed
@@ -116,6 +138,34 @@ class FrameReceiver:
         self._pre_ready_carry = pre_ready_carry
         self._ws_send = ws_send
         self._on_agent_stats_cb = on_agent_stats
+        self._mark_agent_rx = mark_agent_rx
+
+    # Local Utils
+    async def _notify_agent_conn_closed(self, conn_id: str, reason: str) -> None:
+        """Tell the agent to close a TCP connection.
+
+        The Python agent does not consume inbound ERROR frames, so CONN_CLOSE is
+        mandatory. ERROR is still sent first for future agents that understand it.
+        """
+
+        if self._ws_send is None:
+            return
+
+        frames = (
+            encode_error_frame(conn_id, reason),
+            encode_conn_close_frame(conn_id),
+        )
+
+        for frame in frames:
+            try:
+                await self._ws_send(frame, control=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "conn %s: failed to emit local-close notification frame: %s",
+                    conn_id,
+                    exc,
+                    extra={"conn_id": conn_id},
+                )
 
     # ── Entry point ───────────────────────────────────────────────────────────
 
@@ -136,15 +186,18 @@ class FrameReceiver:
                                    ``CONN_OPEN``, or ``UDP_OPEN`` received from
                                    the agent post-bootstrap.
         """
+        close_exc: ConnectionClosed | None = None
+
         async with aspan("session.recv_loop"):
-            for line in self._post_ready_lines:
-                await self._dispatch_frame(line)
-            self._post_ready_lines.clear()
-
-            buf = self._pre_ready_carry
-            self._pre_ready_carry = ""
-
             try:
+                for line in self._post_ready_lines:
+                    self._check_line_size(line)
+                    await self._dispatch_frame(line)
+                self._post_ready_lines.clear()
+
+                buf = self._pre_ready_carry
+                self._pre_ready_carry = ""
+
                 async for msg in self._ws:
                     if isinstance(msg, str):
                         chunk = msg
@@ -160,24 +213,85 @@ class FrameReceiver:
                                     "close_reason": "non_utf8_frame_bytes",
                                 },
                             ) from exc
+
+                    # Refresh the shared agent-activity timestamp on every
+                    # inbound chunk so the dispatcher can distinguish tunnel
+                    # congestion from a wedged agent before declaring the
+                    # session unhealthy.
+                    if self._mark_agent_rx is not None:
+                        self._mark_agent_rx()
+
                     buf += chunk
+                    if len(buf) > MAX_TUNNEL_FRAME_CHARS and "\n" not in buf:
+                        metrics_inc("session.recv.oversized_unterminated_frame")
+                        raise ConnectionClosedError(
+                            "Agent sent an oversized unterminated tunnel frame.",
+                            details={
+                                "close_code": WS_CLOSE_CODE_PROTOCOL_ERROR,
+                                "close_reason": "oversized_unterminated_frame",
+                                "buffer_chars": len(buf),
+                                "limit": MAX_TUNNEL_FRAME_CHARS,
+                            },
+                        )
+
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
+                        self._check_line_size(line)
                         await self._dispatch_frame(line)
-            except ConnectionClosed:
-                pass
-            finally:
+
                 if buf.strip():
                     logger.debug(
-                        "recv: WebSocket closed with %d chars of residual data dropped: %r",
+                        "recv: WebSocket ended with %d chars of residual data dropped: %r",
                         len(buf),
                         buf[:120],
                     )
                     metrics_inc("session.recv.trailing_partial_frame")
                     metrics_observe("session.recv.residual_bytes", float(len(buf)))
 
+            except ConnectionClosed as exc:
+                close_exc = exc
+
+            finally:
                 self._ws_closed.set()
                 self._force_cleanup()
+
+        if close_exc is not None:
+            raise ConnectionClosedError(
+                "WebSocket closed while receiving agent frames.",
+                details={
+                    "close_code": getattr(getattr(close_exc, "rcvd", None), "code", 0)
+                    or 0,
+                    "close_reason": getattr(
+                        getattr(close_exc, "rcvd", None), "reason", ""
+                    )
+                    or "",
+                },
+            ) from close_exc
+
+        raise ConnectionClosedError(
+            "WebSocket receive loop ended.",
+            details={
+                "close_code": 0,
+                "close_reason": "recv_loop_ended",
+            },
+        )
+
+    @staticmethod
+    def _check_line_size(line: str) -> None:
+        """Reject a single newline-terminated frame line that is too large."""
+        if len(line) <= MAX_TUNNEL_FRAME_CHARS:
+            return
+
+        metrics_inc("session.recv.oversized_frame_line")
+        raise ConnectionClosedError(
+            "Agent sent an oversized tunnel frame line.",
+            details={
+                "close_code": WS_CLOSE_CODE_PROTOCOL_ERROR,
+                "close_reason": "oversized_frame_line",
+                "line_chars": len(line),
+                "limit": MAX_TUNNEL_FRAME_CHARS,
+            },
+        )
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
 
@@ -231,8 +345,14 @@ class FrameReceiver:
             ConnectionClosedError: On corrupt frame structure or payload.
             UnexpectedFrameError:  On unexpected frame type.
         """
+        extracted = _extract_frame_line(line)
+        if extracted is None:
+            logger.debug("recv: non-frame line ignored: %r", line[:80])
+            metrics_inc("session.frames.noise")
+            return
+
         try:
-            frame = parse_frame(line)
+            frame = parse_frame(extracted)
         except FrameDecodingError as exc:
             metrics_inc("session.frames.decode_error")
             raise ConnectionClosedError(
@@ -244,7 +364,10 @@ class FrameReceiver:
             ) from exc
 
         if frame is None:
-            logger.debug("recv: non-frame line ignored: %r", line[:80])
+            logger.debug(
+                "recv: parse_frame returned None for extracted frame: %r",
+                extracted[:80],
+            )
             metrics_inc("session.frames.noise")
             return
 
@@ -412,9 +535,8 @@ class FrameReceiver:
                 extra={"conn_id": conn_id},
             )
             try:
-                await self._ws_send(
-                    encode_error_frame(conn_id, "client inbound saturated"),
-                    control=True,
+                await self._notify_agent_conn_closed(
+                    conn_id, "client inbound saturated"
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.debug(
@@ -489,12 +611,9 @@ class FrameReceiver:
         if self._on_agent_stats_cb is None:
             return
         try:
-            # STATS uses URL-safe base64 without padding (same as DATA); add
-            # padding before decoding.
-            padding = (4 - len(payload) % 4) % 4
-            raw = base64.urlsafe_b64decode(payload + "=" * padding)
+            raw = decode_binary_payload(payload)
             snapshot = json.loads(raw.decode("utf-8"))
-        except (binascii.Error, ValueError, UnicodeDecodeError) as exc:
+        except (FrameDecodingError, ValueError, UnicodeDecodeError) as exc:
             metrics_inc("session.frames.stats_decode_error")
             logger.debug("recv: failed to decode STATS payload: %s", exc)
             return

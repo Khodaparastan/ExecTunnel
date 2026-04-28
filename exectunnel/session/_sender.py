@@ -6,9 +6,11 @@ that owns the WebSocket write path.
 
 Priority model
 --------------
-Control frames (``control=True``) are enqueued into an unbounded queue and
-are never dropped.  Data frames use a bounded queue; when full they are either
-dropped silently or block the caller (``must_queue=True``).
+Control frames (``control=True``) are enqueued into a bounded priority queue.
+They are never silently dropped: if the control queue overflows, the session is
+declared unhealthy and callers receive ``ConnectionClosedError``. Data frames
+use a bounded queue; when full they are either dropped silently or block the
+caller (``must_queue=True``).
 
 The :meth:`WsSender._run` loop drains the control queue before the data queue
 on every iteration, guaranteeing that ``CONN_CLOSE`` / ``UDP_CLOSE`` /
@@ -144,7 +146,9 @@ class WsSender:
         self._cfg = session_cfg
         self._ws_closed = ws_closed
 
-        self._ctrl_queue: asyncio.Queue[_SendQueueItem] = asyncio.Queue()
+        self._ctrl_queue: asyncio.Queue[_SendQueueItem] = asyncio.Queue(
+            maxsize=session_cfg.control_queue_cap
+        )
         self._data_queue: asyncio.Queue[_SendQueueItem] = asyncio.Queue(
             maxsize=session_cfg.send_queue_cap,
         )
@@ -154,6 +158,17 @@ class WsSender:
         self._send_drop_count: int = 0
         self._started: bool = False
         self._stopped: bool = False
+
+    # -- Helper -------------------------------
+
+    def _closed_enqueue_error(self, reason: str) -> ConnectionClosedError:
+        return ConnectionClosedError(
+            "WebSocket sender is closed — cannot enqueue frame.",
+            details={
+                "close_code": 0,
+                "close_reason": reason,
+            },
+        )
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -183,8 +198,8 @@ class WsSender:
         if self._stopped:
             return
         self._stopped = True
-
-        self._ctrl_queue.put_nowait(_QUEUE_STOP)
+        with contextlib.suppress(asyncio.QueueFull):
+            self._ctrl_queue.put_nowait(_QUEUE_STOP)
         self._frame_ready.set()
 
         if self._loop_task is not None and not self._loop_task.done():
@@ -233,8 +248,37 @@ class WsSender:
                                    is already closed or closes while waiting to
                                    enqueue.
         """
+        if self._stopped:
+            metrics_inc("session.send.after_stop_drop")
+            if must_queue:
+                raise self._closed_enqueue_error("sender_stopped")
+            return
+
+        if self._ws_closed.is_set():
+            metrics_inc("session.send.after_ws_closed_drop")
+            if must_queue:
+                raise self._closed_enqueue_error("ws_closed_before_enqueue")
+            return
+
         if control:
-            self._ctrl_queue.put_nowait(frame)
+            try:
+                self._ctrl_queue.put_nowait(frame)
+            except asyncio.QueueFull as exc:
+                metrics_inc("session.send.ctrl_queue_full")
+                self._ws_closed.set()
+                raise ConnectionClosedError(
+                    "WebSocket control queue is full — declaring session unhealthy.",
+                    details={
+                        "close_code": 0,
+                        "close_reason": "control_queue_full",
+                        "control_queue_cap": self._cfg.control_queue_cap,
+                    },
+                    hint=(
+                        "The WebSocket is not draining control frames fast enough. "
+                        "Reconnect the tunnel and inspect proxy/WebSocket latency."
+                    ),
+                ) from exc
+
             self._frame_ready.set()
             self._emit_queue_gauges()
             return
@@ -373,6 +417,8 @@ class WsSender:
                         self._frame_ready.clear()
                         item = self._try_dequeue()
                         if item is None:
+                            if self._stopped:
+                                return
                             await self._frame_ready.wait()
                             continue
 
@@ -408,6 +454,18 @@ class WsSender:
                         ) from exc
 
                     except ConnectionClosed as exc:
+                        # If the sender has already been asked to stop, or
+                        # the receiver has already declared the WebSocket
+                        # closed, this is teardown noise — the recv task
+                        # is the authoritative reporter for the close
+                        # cause.  Exit cleanly instead of raising and
+                        # producing duplicate primary-failure logs.
+                        if self._stopped or self._ws_closed.is_set():
+                            metrics_inc(
+                                "session.frames.outbound.ws_closed_during_shutdown"
+                            )
+                            return
+
                         unexpected_exit = True
                         metrics_inc("session.frames.outbound.ws_closed")
                         raise ConnectionClosedError(
