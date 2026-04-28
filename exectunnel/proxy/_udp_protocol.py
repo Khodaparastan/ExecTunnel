@@ -28,9 +28,11 @@ class RelayDatagramProtocol(asyncio.DatagramProtocol):
     def __init__(self, relay: UDPRelay) -> None:
         self._relay = relay
 
-    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+    def datagram_received(self, data: bytes, addr: tuple) -> None:
         """Forward *data* from *addr* to the owning relay."""
-        self._relay.on_datagram(data, addr)
+        # IPv4 addr is (host, port). IPv6 addr is commonly
+        # (host, port, flowinfo, scopeid). UDPRelay only needs host/port.
+        self._relay.on_datagram(data, (addr[0], addr[1]))
 
     def error_received(self, exc: Exception) -> None:
         """Log non-fatal transport errors reported by asyncio."""

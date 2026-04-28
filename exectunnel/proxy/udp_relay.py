@@ -14,7 +14,7 @@ import ipaddress
 import logging
 from typing import Final
 
-from exectunnel.exceptions import ProtocolError, TransportError
+from exectunnel.exceptions import ConfigurationError, ProtocolError, TransportError
 from exectunnel.observability import (
     metrics_gauge_dec,
     metrics_gauge_inc,
@@ -27,10 +27,11 @@ from ._constants import (
     DEFAULT_DROP_WARN_INTERVAL,
     DEFAULT_UDP_QUEUE_CAPACITY,
     MAX_TCP_UDP_PORT,
+    MAX_TUNNEL_UDP_PAYLOAD_BYTES,
     MAX_UDP_PAYLOAD_BYTES,
 )
 from ._udp_protocol import RelayDatagramProtocol
-from ._wire import build_udp_header, parse_udp_header
+from ._wire import build_udp_header_for_host, parse_udp_header
 
 __all__ = ["UDPRelay"]
 
@@ -55,7 +56,10 @@ class UDPRelay:
 
     __slots__ = (
         "_queue_capacity",
+        "_max_payload_bytes",
         "_drop_warn_interval",
+        "_bind_host",
+        "_advertise_host",
         "_transport",
         "_queue",
         "_close_event",
@@ -64,8 +68,11 @@ class UDPRelay:
         "_started",
         "_client_addr",
         "_expected_client_addr",
+        "_expected_client_host",
         "_close_wait_task",
+        "_active_metric_emitted",
         "_drop_count",
+        "_send_drop_count",
         "_foreign_client_count",
         "_accepted_count",
     )
@@ -74,10 +81,45 @@ class UDPRelay:
         self,
         *,
         queue_capacity: int = DEFAULT_UDP_QUEUE_CAPACITY,
+        max_payload_bytes: int = MAX_TUNNEL_UDP_PAYLOAD_BYTES,
         drop_warn_interval: int = DEFAULT_DROP_WARN_INTERVAL,
+        bind_host: str = "127.0.0.1",
+        advertise_host: str | None = None,
     ) -> None:
+
+        if not isinstance(queue_capacity, int) or queue_capacity < 1:
+            raise ConfigurationError(
+                f"UDPRelay.queue_capacity must be an integer >= 1, got {queue_capacity!r}.",
+                details={"field": "queue_capacity", "value": queue_capacity},
+                hint="Set udp_relay_queue_capacity to at least 1.",
+            )
+        if not isinstance(max_payload_bytes, int) or not (
+            1 <= max_payload_bytes <= MAX_TUNNEL_UDP_PAYLOAD_BYTES
+        ):
+            raise ConfigurationError(
+                f"UDPRelay.max_payload_bytes must be in [1, {MAX_TUNNEL_UDP_PAYLOAD_BYTES}], "
+                f"got {max_payload_bytes!r}.",
+                details={"field": "max_payload_bytes", "value": max_payload_bytes},
+                hint="Use a payload cap compatible with the tunnel frame budget.",
+            )
+        if not isinstance(drop_warn_interval, int) or drop_warn_interval < 1:
+            raise ConfigurationError(
+                "UDPRelay.drop_warn_interval must be an integer >= 1.",
+                details={"field": "drop_warn_interval", "value": drop_warn_interval},
+                hint="Set udp_drop_warn_interval to at least 1.",
+            )
+        if not bind_host:
+            raise ConfigurationError(
+                "UDPRelay.bind_host must not be empty.",
+                details={"field": "bind_host", "value": bind_host},
+                hint="Use a bind host such as 127.0.0.1.",
+            )
+
         self._queue_capacity = queue_capacity
+        self._max_payload_bytes = max_payload_bytes
         self._drop_warn_interval = drop_warn_interval
+        self._bind_host = bind_host
+        self._advertise_host = advertise_host or bind_host
 
         self._transport: asyncio.DatagramTransport | None = None
         self._queue: asyncio.Queue[tuple[bytes, str, int]] | None = None
@@ -89,10 +131,13 @@ class UDPRelay:
 
         self._client_addr: tuple[str, int] | None = None
         self._expected_client_addr: tuple[str, int] | None = None
+        self._expected_client_host: str | None = None
 
         self._close_wait_task: asyncio.Task[None] | None = None
 
+        self._active_metric_emitted: bool = False
         self._drop_count: int = 0
+        self._send_drop_count: int = 0
         self._foreign_client_count: int = 0
         self._accepted_count: int = 0
 
@@ -108,6 +153,7 @@ class UDPRelay:
     async def start(
         self,
         expected_client_addr: tuple[str, int] | None = None,
+        expected_client_host: str | None = None,
     ) -> int:
         """Bind the UDP socket and return the local port.
 
@@ -115,6 +161,9 @@ class UDPRelay:
             expected_client_addr: Optional ``(host, port)`` hint from
                 the ``UDP_ASSOCIATE`` request. Ignored when the host is
                 unspecified (``0.0.0.0`` / ``::``) or the port is ``0``.
+            expected_client_host: TCP peer host observed on the control
+                connection. Used as a weaker admission hint when the SOCKS5
+                request used an unspecified UDP port.
 
         Returns:
             The ephemeral port the relay is bound to on ``127.0.0.1``.
@@ -132,34 +181,96 @@ class UDPRelay:
         self._queue = asyncio.Queue(self._queue_capacity)
         self._close_event = asyncio.Event()
 
-        self._bind_expected_client(expected_client_addr)
+        self._validate_advertise_host()
+        self._bind_expected_client(expected_client_addr, expected_client_host)
         await self._bind_datagram_endpoint()
 
         metrics_gauge_inc("socks5.udp.relays_active")
+        self._active_metric_emitted = True
         return self._local_port
 
+    def _validate_advertise_host(self) -> None:
+        """Validate the UDP_ASSOCIATE advertised address."""
+        try:
+            addr = ipaddress.ip_address(self._advertise_host)
+        except ValueError as exc:
+            raise TransportError(
+                f"UDP relay advertise_host {self._advertise_host!r} is not an IP address.",
+                error_code="proxy.udp_relay.invalid_advertise_host",
+                details={
+                    "advertise_host": self._advertise_host,
+                    "expected": "IPv4 or IPv6 address string",
+                },
+                hint=(
+                    "Set udp_advertise_host to an IP address reachable by the "
+                    "SOCKS5 client."
+                ),
+            ) from exc
+
+        if addr.is_unspecified:
+            raise TransportError(
+                f"UDP relay advertise_host {self._advertise_host!r} is unspecified.",
+                error_code="proxy.udp_relay.unspecified_advertise_host",
+                details={"advertise_host": self._advertise_host},
+                hint="Advertise a concrete IP address, not 0.0.0.0 or ::.",
+            )
+
+    @staticmethod
+    def _normalise_host_for_compare(host: str) -> str:
+        try:
+            return ipaddress.ip_address(host).compressed
+        except ValueError:
+            return host
+
+    @classmethod
+    def _addr_key(cls, addr: tuple[str, int]) -> tuple[str, int]:
+        return cls._normalise_host_for_compare(addr[0]), addr[1]
+
     def _bind_expected_client(
-        self, expected_client_addr: tuple[str, int] | None
+        self,
+        expected_client_addr: tuple[str, int] | None,
+        expected_client_host: str | None,
     ) -> None:
         """Record *expected_client_addr* when specific and routable.
 
         Args:
             expected_client_addr: Optional client-address hint from the
                 ``UDP_ASSOCIATE`` request.
+            expected_client_host: TCP peer host observed on the control
+                connection. Used as a weaker admission hint when the SOCKS5
+                request used an unspecified UDP port.
         """
+        if expected_client_host:
+            try:
+                peer_ip = ipaddress.ip_address(expected_client_host)
+            except ValueError:
+                _log.debug(
+                    "udp relay: ignoring malformed TCP peer host %r",
+                    expected_client_host,
+                )
+            else:
+                if not peer_ip.is_unspecified:
+                    self._expected_client_host = peer_ip.compressed
+
         if expected_client_addr is None:
             return
+
         hint_host, hint_port = expected_client_addr
         try:
-            is_unspecified = ipaddress.ip_address(hint_host).is_unspecified
+            hint_ip = ipaddress.ip_address(hint_host)
+            is_unspecified = hint_ip.is_unspecified
         except ValueError:
             _log.debug(
                 "udp relay: ignoring malformed expected_client_addr host %r",
                 hint_host,
             )
             return
+
         if not is_unspecified and hint_port != 0:
-            self._expected_client_addr = expected_client_addr
+            self._expected_client_addr = (hint_ip.compressed, hint_port)
+            self._expected_client_host = hint_ip.compressed
+        elif not is_unspecified:
+            self._expected_client_host = hint_ip.compressed
 
     async def _bind_datagram_endpoint(self) -> None:
         """Create the local asyncio datagram endpoint on ``127.0.0.1:0``.
@@ -172,16 +283,20 @@ class UDPRelay:
         try:
             transport, _ = await loop.create_datagram_endpoint(
                 lambda: RelayDatagramProtocol(self),
-                local_addr=("127.0.0.1", 0),
+                local_addr=(self._bind_host, 0),
             )
         except OSError as exc:
             raise TransportError(
                 "UDP relay failed to bind a local datagram endpoint.",
-                details={"host": "127.0.0.1", "port": 0, "url": "udp://127.0.0.1:0"},
+                details={
+                    "host": self._bind_host,
+                    "port": 0,
+                    "url": f"udp://{self._bind_host}:0",
+                },
                 hint=(
                     "Check that the ephemeral port range is not exhausted and "
                     "that the process has permission to bind UDP sockets on "
-                    "127.0.0.1."
+                    f"{self._bind_host}."
                 ),
             ) from exc
 
@@ -189,13 +304,17 @@ class UDPRelay:
             transport.close()
             raise TransportError(
                 "UDP relay received an unexpected transport type from asyncio.",
-                details={"host": "127.0.0.1", "port": 0, "url": "udp://127.0.0.1:0"},
+                details={
+                    "host": self._bind_host,
+                    "port": 0,
+                    "url": f"udp://{self._bind_host}:0",
+                },
                 hint="This is an asyncio internal error. Please report it.",
             )
 
         self._transport = transport
         self._local_port = transport.get_extra_info("sockname")[1]
-        _log.debug("udp relay bound on 127.0.0.1:%d", self._local_port)
+        _log.debug("udp relay bound on %s:%d", self._bind_host, self._local_port)
 
     def close(self) -> None:
         """Close the relay and unblock any coroutine awaiting :meth:`recv`.
@@ -207,8 +326,9 @@ class UDPRelay:
         self._closed = True
         _log.debug("udp relay closing (port=%d)", self._local_port)
 
-        if self._started:
+        if self._active_metric_emitted:
             metrics_gauge_dec("socks5.udp.relays_active")
+            self._active_metric_emitted = False
 
         if self._transport is not None:
             self._transport.close()
@@ -237,6 +357,18 @@ class UDPRelay:
         if not self._check_and_bind_client(addr):
             return
 
+        if len(data) > MAX_UDP_PAYLOAD_BYTES:
+            metrics_inc("socks5.udp.datagrams_dropped")
+            metrics_inc("socks5.udp.datagrams_oversized")
+            _log.debug(
+                "udp relay dropping oversized datagram from %s:%d (%d bytes > %d)",
+                addr[0],
+                addr[1],
+                len(data),
+                MAX_UDP_PAYLOAD_BYTES,
+            )
+            return
+
         try:
             payload, host, port = parse_udp_header(data)
         except ProtocolError as exc:
@@ -248,14 +380,24 @@ class UDPRelay:
                 exc.message,
             )
             return
-
-        if len(payload) > MAX_UDP_PAYLOAD_BYTES:
+        if not payload:
+            metrics_inc("socks5.udp.datagrams_dropped")
+            metrics_inc("socks5.udp.datagrams_empty")
             _log.debug(
-                "udp relay dropping oversized payload from %s:%d (%d bytes > %d)",
+                "udp relay dropping zero-length payload from %s:%d",
+                addr[0],
+                addr[1],
+            )
+            return
+        if len(payload) > self._max_payload_bytes:
+            metrics_inc("socks5.udp.datagrams_dropped")
+            metrics_inc("socks5.udp.datagrams_payload_cap")
+            _log.debug(
+                "udp relay dropping payload from %s:%d (%d bytes > cap %d)",
                 addr[0],
                 addr[1],
                 len(payload),
-                MAX_UDP_PAYLOAD_BYTES,
+                self._max_payload_bytes,
             )
             return
 
@@ -279,13 +421,23 @@ class UDPRelay:
             ``True`` if the datagram should be processed further;
             ``False`` if it has been dropped as foreign.
         """
+        addr_key = self._addr_key(addr)
+
         if self._client_addr is None:
             if (
                 self._expected_client_addr is not None
-                and addr != self._expected_client_addr
+                and addr_key != self._expected_client_addr
             ):
                 self._record_foreign_drop(addr, pre_bind=True)
                 return False
+
+            if (
+                self._expected_client_host is not None
+                and addr_key[0] != self._expected_client_host
+            ):
+                self._record_foreign_drop(addr, pre_bind=True)
+                return False
+
             self._client_addr = addr
             _log.debug(
                 "udp relay client bound to %s:%d (port=%d)",
@@ -295,7 +447,7 @@ class UDPRelay:
             )
             return True
 
-        if addr != self._client_addr:
+        if addr_key != self._addr_key(self._client_addr):
             self._record_foreign_drop(addr, pre_bind=False)
             return False
         return True
@@ -398,7 +550,9 @@ class UDPRelay:
             self._queue.get()
         )
         if self._close_wait_task is None or self._close_wait_task.done():
-            self._close_wait_task = asyncio.create_task(self._close_event.wait())
+            # _close_wait_task is Task[None] | None, but Event.wait() returns
+            # Task[Literal[True]]. This is a harmless type mismatch.
+            self._close_wait_task = asyncio.create_task(self._close_event.wait())  # type: ignore[assignment]
         close_task = self._close_wait_task
 
         try:
@@ -428,19 +582,16 @@ class UDPRelay:
     def send_to_client(self, payload: bytes, src_host: str, src_port: int) -> None:
         """Wrap *payload* in a SOCKS5 UDP header and send it to the client.
 
-        Non-IP ``src_host`` values are silently dropped because RFC 1928
-        §7 requires an IP address in the UDP reply header.
+        ``src_host`` may be IPv4, IPv6, or a SOCKS5 DOMAIN address. RFC 1928
+        UDP headers carry the same ATYP forms as TCP request addresses.
 
         Args:
             payload: Raw datagram bytes to deliver to the client.
-            src_host: Source IP address string (IPv4 or IPv6).
+            src_host: Source IPv4, IPv6, or domain string.
             src_port: Source port in ``[0, 65535]``.
 
         Raises:
-            TransportError: *payload* is not :class:`bytes`
-                (``error_code=`` ``"proxy.udp_send.invalid_payload_type"``),
-                or *src_port* is out of range
-                (``error_code=`` ``"proxy.udp_send.port_out_of_range"``).
+            TransportError: If *payload* is not bytes.
         """
         if not isinstance(payload, bytes):
             raise TransportError(
@@ -451,13 +602,54 @@ class UDPRelay:
                 hint="This is a caller bug in the session layer.",
             )
 
-        if not (0 <= src_port <= MAX_TCP_UDP_PORT):
-            raise TransportError(
-                f"send_to_client() src_port {src_port!r} is out of range [0, 65535].",
-                error_code="proxy.udp_send.port_out_of_range",
-                details={"field": "src_port", "expected": "integer in [0, 65535]"},
-                hint="This is a caller bug in the session layer.",
+        try:
+            header = build_udp_header_for_host(src_host, src_port)
+        except (ConfigurationError, ProtocolError, UnicodeEncodeError) as exc:
+            metrics_inc("socks5.udp.reply_dropped", reason="bad_source_host")
+            _log.debug(
+                "udp relay: dropping reply with invalid src_host=%r src_port=%d: %s",
+                src_host,
+                src_port,
+                exc,
             )
+            return
+
+        datagram = header + payload
+        if len(datagram) > MAX_UDP_PAYLOAD_BYTES:
+            self._send_drop_count += 1
+            metrics_inc("socks5.udp.reply_dropped", reason="oversized")
+            if (
+                self._send_drop_count == 1
+                or self._send_drop_count % self._drop_warn_interval == 0
+            ):
+                _log.warning(
+                    "udp relay dropping oversized reply for %s:%d "
+                    "(datagram=%d bytes > %d, drops=%d, port=%d)",
+                    src_host,
+                    src_port,
+                    len(datagram),
+                    MAX_UDP_PAYLOAD_BYTES,
+                    self._send_drop_count,
+                    self._local_port,
+                )
+            return
+
+        if len(payload) > self._max_payload_bytes:
+            self._send_drop_count += 1
+            metrics_inc("socks5.udp.reply_dropped", reason="payload_cap")
+            if (
+                self._send_drop_count == 1
+                or self._send_drop_count % self._drop_warn_interval == 0
+            ):
+                _log.warning(
+                    "udp relay dropping reply for %s:%d (%d bytes > cap %d, drops=%d)",
+                    src_host,
+                    src_port,
+                    len(payload),
+                    self._max_payload_bytes,
+                    self._send_drop_count,
+                )
+            return
 
         if self._transport is None or self._closed:
             return
@@ -472,26 +664,25 @@ class UDPRelay:
             )
             return
 
-        try:
-            addr = ipaddress.ip_address(src_host)
-        except ValueError:
-            _log.debug(
-                "udp relay: dropping reply with non-IP src_host %r (RFC 1928 §7)",
-                src_host,
-            )
-            return
-
-        atyp = AddrType.IPV4 if addr.version == 4 else AddrType.IPV6
-        header = build_udp_header(atyp, addr.packed, src_port)
         with contextlib.suppress(OSError):
-            self._transport.sendto(header + payload, self._client_addr)
+            self._transport.sendto(datagram, self._client_addr)
 
     # ── Properties ────────────────────────────────────────────────────────────
 
     @property
     def local_port(self) -> int:
-        """The ephemeral port the relay is bound to on ``127.0.0.1``."""
+        """The ephemeral port the relay is bound to."""
         return self._local_port
+
+    @property
+    def bind_host(self) -> str:
+        """The local UDP bind host."""
+        return self._bind_host
+
+    @property
+    def advertise_host(self) -> str:
+        """The UDP address to advertise in the SOCKS5 UDP_ASSOCIATE reply."""
+        return self._advertise_host
 
     @property
     def is_running(self) -> bool:
