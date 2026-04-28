@@ -5,7 +5,7 @@ protocol layer relies on:
 
 * Frame delimiters (``FRAME_PREFIX``, ``FRAME_SUFFIX``).
 * The agent-ready sentinel (``READY_FRAME``).
-* Size ceilings (``MAX_FRAME_LEN``).
+* Size ceilings (``MAX_TUNNEL_FRAME_CHARS``).
 * Reserved port values (``PORT_UNSPECIFIED``).
 * The closed sets of message-type strings and their role classification
   (requires payload, forbids payload, carries no conn_id, …).
@@ -23,6 +23,7 @@ Note:
 
 from __future__ import annotations
 
+import os
 from typing import Final
 
 from .ids import SESSION_CONN_ID as _SESSION_CONN_ID
@@ -31,7 +32,7 @@ __all__ = [
     "FRAME_PREFIX",
     "FRAME_SUFFIX",
     "KEEPALIVE_FRAME",
-    "MAX_FRAME_LEN",
+    "MAX_TUNNEL_FRAME_CHARS",
     "MAX_TCP_UDP_PORT",
     "MIN_TCP_UDP_PORT",
     "NO_CONN_ID_TYPES",
@@ -59,7 +60,7 @@ FRAME_SUFFIX: Final[str] = ">>>"
 #:
 #: Derivation of the safe DATA payload budget::
 #:
-#:     available = MAX_FRAME_LEN
+#:     available = MAX_TUNNEL_FRAME_CHARS
 #:               - len(FRAME_PREFIX)        # 14
 #:               - len("DATA")              #  4
 #:               - 2 * len(":")             #  2
@@ -68,7 +69,8 @@ FRAME_SUFFIX: Final[str] = ">>>"
 #:               = 8192 - 48
 #:               = 8144 base64url characters
 #:     max raw bytes = floor(8144 * 3 / 4) = 6108 bytes
-MAX_FRAME_LEN: Final[int] = 8_192
+DEFAULT_MAX_TUNNEL_FRAME_CHARS=262144
+MAX_TUNNEL_FRAME_CHARS = int(os.getenv("EXECTUNNEL_MAX_TUNNEL_FRAME_CHARS",DEFAULT_MAX_TUNNEL_FRAME_CHARS ))
 
 #: Number of characters of a malformed payload included in error telemetry.
 PAYLOAD_PREVIEW_LEN: Final[int] = 64

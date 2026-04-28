@@ -20,7 +20,7 @@ from .constants import (
     FRAME_PREFIX,
     FRAME_SUFFIX,
     KEEPALIVE_FRAME,
-    MAX_FRAME_LEN,
+    MAX_TUNNEL_FRAME_CHARS,
     NO_CONN_ID_TYPES,
     READY_FRAME,
     VALID_MSG_TYPES,
@@ -154,13 +154,13 @@ def _encode_frame(msg_type: str, conn_id: str | None, payload: str = "") -> str:
     else:
         content = f"{FRAME_PREFIX}{msg_type}{FRAME_SUFFIX}"
 
-    if len(content) > MAX_FRAME_LEN:
+    if len(content) > MAX_TUNNEL_FRAME_CHARS:
         raise ProtocolError(
             f"Encoded frame length {len(content)} exceeds "
-            f"MAX_FRAME_LEN={MAX_FRAME_LEN}.",
+            f"MAX_TUNNEL_FRAME_CHARS={MAX_TUNNEL_FRAME_CHARS}.",
             details={
                 "frame_type": msg_type,
-                "expected": f"frame content ≤ {MAX_FRAME_LEN} chars",
+                "expected": f"frame content ≤ {MAX_TUNNEL_FRAME_CHARS} chars",
                 "got": len(content),
             },
         )
@@ -260,7 +260,7 @@ def encode_data_frame(conn_id: str, data: bytes) -> str:
     Raises:
         ProtocolError: If *conn_id* is invalid, *data* is empty, or the
             encoded frame exceeds
-            :data:`exectunnel.protocol.constants.MAX_FRAME_LEN`.
+            :data:`exectunnel.protocol.constants.MAX_TUNNEL_FRAME_CHARS`.
     """
     if not data:
         raise ProtocolError(
@@ -305,7 +305,7 @@ def encode_udp_data_frame(flow_id: str, data: bytes) -> str:
     Raises:
         ProtocolError: If *flow_id* is invalid, *data* is empty, or the
             encoded frame exceeds
-            :data:`exectunnel.protocol.constants.MAX_FRAME_LEN`.
+            :data:`exectunnel.protocol.constants.MAX_TUNNEL_FRAME_CHARS`.
     """
     if not data:
         raise ProtocolError(
@@ -348,6 +348,6 @@ def encode_error_frame(conn_id: str, message: str) -> str:
 
     Raises:
         ProtocolError: If *conn_id* is invalid or the encoded frame
-            exceeds :data:`exectunnel.protocol.constants.MAX_FRAME_LEN`.
+            exceeds :data:`exectunnel.protocol.constants.MAX_TUNNEL_FRAME_CHARS`.
     """
     return _encode_frame("ERROR", conn_id, encode_binary_payload(message.encode()))

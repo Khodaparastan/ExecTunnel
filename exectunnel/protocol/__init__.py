@@ -6,7 +6,7 @@ The package exposes everything a caller needs to speak the ExecTunnel
 wire protocol, grouped by role:
 
 * **Frame constants** — :data:`FRAME_PREFIX`, :data:`FRAME_SUFFIX`,
-  :data:`READY_FRAME`, :data:`SESSION_CONN_ID`, :data:`MAX_FRAME_LEN`,
+  :data:`READY_FRAME`, :data:`SESSION_CONN_ID`, :data:`MAX_TUNNEL_FRAME_CHARS`,
   :data:`PORT_UNSPECIFIED`.
 * **Frame encoders** — one typed function per frame type; all raise
   :exc:`exectunnel.exceptions.ProtocolError` on invalid arguments.
@@ -95,7 +95,7 @@ from .codecs import (
 from .constants import (
     FRAME_PREFIX,
     FRAME_SUFFIX,
-    MAX_FRAME_LEN,
+    MAX_TUNNEL_FRAME_CHARS,
     PORT_UNSPECIFIED,
     READY_FRAME,
     SESSION_CONN_ID,
@@ -134,7 +134,7 @@ __all__ = [
     # ── Frame constants ──────────────────────────────────────────────────────
     "FRAME_PREFIX",
     "FRAME_SUFFIX",
-    "MAX_FRAME_LEN",
+    "MAX_TUNNEL_FRAME_CHARS",
     "PORT_UNSPECIFIED",
     "READY_FRAME",
     "SESSION_CONN_ID",

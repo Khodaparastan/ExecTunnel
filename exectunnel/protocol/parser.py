@@ -27,7 +27,7 @@ from .codecs import _hex_preview  # noqa: PLC2701 — sibling-module helper
 from .constants import (
     FRAME_PREFIX,
     FRAME_SUFFIX,
-    MAX_FRAME_LEN,
+    MAX_TUNNEL_FRAME_CHARS,
     NO_CONN_ID_TYPES,
     NO_CONN_ID_WITH_PAYLOAD_TYPES,
     PAYLOAD_FORBIDDEN_TYPES,
@@ -101,16 +101,16 @@ def parse_frame(line: str) -> ParsedFrame | None:
     line, is_tunnel_frame = _strip_proxy_suffix(line)
 
     if not is_tunnel_frame:
-        if len(line) > MAX_FRAME_LEN:
+        if len(line) > MAX_TUNNEL_FRAME_CHARS:
             _log.debug(
                 "parse_frame: dropping oversized non-frame line (%d chars)",
                 len(line),
             )
         return None
 
-    if len(line) > MAX_FRAME_LEN:
+    if len(line) > MAX_TUNNEL_FRAME_CHARS:
         raise FrameDecodingError(
-            f"Oversized tunnel frame ({len(line)} chars, limit {MAX_FRAME_LEN}). "
+            f"Oversized tunnel frame ({len(line)} chars, limit {MAX_TUNNEL_FRAME_CHARS}). "
             "Possible memory-exhaustion or injection attempt.",
             details={"raw_bytes": _hex_preview(line), "codec": "frame"},
         )
