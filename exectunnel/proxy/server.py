@@ -22,7 +22,7 @@ import asyncio
 import contextlib
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable
 from typing import Final
 
 from exectunnel.exceptions import TransportError
@@ -90,7 +90,10 @@ class Socks5Server:
         cfg = self._config
         try:
             self._server = await asyncio.start_server(
-                self._handle_client, cfg.host, cfg.port
+                self._handle_client,
+                cfg.host,
+                cfg.port,
+                backlog=cfg.listen_backlog,
             )
         except OSError as exc:
             raise TransportError(
@@ -127,20 +130,35 @@ class Socks5Server:
         if self._server is not None:
             self._server.close()
 
-        self._close_active_writers()
+        await self._close_active_writers()
         await self._cancel_handshake_tasks()
-        self._drain_pending_requests()
+        await self._drain_pending_requests()
 
         if self._server is not None:
             await self._server.wait_closed()
 
-        self._queue.put_nowait(None)
+        await self._enqueue_stop_sentinel()
 
-    def _close_active_writers(self) -> None:
-        """Force-close every writer currently mid-handshake."""
-        for writer in tuple(self._active_writers):
-            with contextlib.suppress(OSError, RuntimeError):
-                writer.close()
+    async def _enqueue_stop_sentinel(self) -> None:
+        """Enqueue the async-iterator stop sentinel after draining capacity."""
+        while True:
+            try:
+                self._queue.put_nowait(None)
+                return
+            except asyncio.QueueFull:
+                await self._drain_pending_requests()
+                await asyncio.sleep(0)
+
+    async def _close_active_writers(self) -> None:
+        """Force-close every writer currently mid-handshake and drain close."""
+        if not self._active_writers:
+            return
+
+        pending = tuple(self._active_writers)
+        await asyncio.gather(
+            *(close_writer(writer) for writer in pending),
+            return_exceptions=True,
+        )
 
     async def _cancel_handshake_tasks(self) -> None:
         """Cancel and await every in-flight handshake task."""
@@ -152,18 +170,21 @@ class Socks5Server:
         await asyncio.gather(*pending, return_exceptions=True)
         self._handshake_tasks.clear()
 
-    def _drain_pending_requests(self) -> None:
+    async def _drain_pending_requests(self) -> None:
         """Close any fully-negotiated requests still queued at stop time."""
+        close_tasks: list[Awaitable[None]] = []
         while True:
             try:
                 req = self._queue.get_nowait()
             except asyncio.QueueEmpty:
-                return
+                break
             if isinstance(req, TCPRelay):
                 if req.udp_relay is not None:
                     req.udp_relay.close()
-                with contextlib.suppress(OSError, RuntimeError):
-                    req.writer.close()
+                close_tasks.append(close_writer(req.writer))
+
+        if close_tasks:
+            await asyncio.gather(*close_tasks, return_exceptions=True)
 
     async def __aenter__(self) -> Socks5Server:
         await self.start()
@@ -203,6 +224,23 @@ class Socks5Server:
         """
         start_trace()
         metrics_inc("socks5.connections.accepted")
+
+        if self._stopped:
+            metrics_inc("socks5.connections.rejected")
+            metrics_inc("socks5.handshakes.error", reason="server_stopped")
+            await close_writer(writer)
+            return
+
+        if len(self._handshake_tasks) >= self._config.max_concurrent_handshakes:
+            metrics_inc("socks5.connections.rejected")
+            metrics_inc("socks5.handshakes.error", reason="handshake_cap")
+            _log.warning(
+                "socks5 handshake cap reached (%d) — rejecting new client",
+                self._config.max_concurrent_handshakes,
+            )
+            await close_writer(writer)
+            return
+
         metrics_gauge_inc("socks5.connections.active")
 
         task = asyncio.current_task()
@@ -242,8 +280,12 @@ class Socks5Server:
                     req = await negotiate(
                         reader,
                         writer,
+                        udp_associate_enabled=self._config.udp_associate_enabled,
                         udp_relay_queue_capacity=self._config.udp_relay_queue_capacity,
+                        udp_max_payload_bytes=self._config.udp_max_payload_bytes,
                         udp_drop_warn_interval=self._config.udp_drop_warn_interval,
+                        udp_bind_host=self._config.udp_bind_host,
+                        udp_advertise_host=self._config.effective_udp_advertise_host,
                     )
             except (TimeoutError, Exception) as exc:  # noqa: BLE001
                 await self._handle_handshake_failure(exc, writer, handshake_start)
@@ -300,6 +342,13 @@ class Socks5Server:
             handshake_start: ``time.monotonic()`` stamp from the start
                 of the handshake.
         """
+        if self._stopped:
+            metrics_inc("socks5.handshakes.error", reason="server_stopped")
+            metrics_inc("socks5.connections.rejected")
+            with contextlib.suppress(Exception):
+                await req.send_reply_error(Reply.GENERAL_FAILURE)
+            return
+
         try:
             async with asyncio.timeout(self._config.queue_put_timeout):
                 await self._queue.put(req)
