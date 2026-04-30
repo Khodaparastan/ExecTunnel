@@ -1,0 +1,23 @@
+[global]
+log_level = "info"
+log_format = "text"
+reconnect_max_retries = 10
+reconnect_base_delay = 1.0
+reconnect_max_delay = 60.0
+socks_host = "127.0.0.1"
+bootstrap_delivery = "fetch"
+bootstrap_fetch_url = "https://releases.example.com/agent.py"
+
+[[tunnels]]
+name = "prod-gateway"
+wss_url = "wss://k8s.prod.example.com/api/v1/namespaces/prod/pods/gateway/exec"
+socks_port = 1080
+dns_upstream = "10.96.0.10"
+
+[[tunnels]]
+name = "staging-db"
+wss_url = "wss://k8s.staging.example.com/api/v1/namespaces/staging/pods/db/exec"
+socks_port = 1081
+enabled = false
+reconnect_max_retries = 3
+ssl_ca_cert = "/etc/ssl/staging-ca.pem"

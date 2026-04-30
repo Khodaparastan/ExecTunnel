@@ -1,0 +1,15 @@
+global:
+  log_level: info
+  reconnect_max_retries: 10
+  socks_host: "127.0.0.1"
+
+tunnels:
+  - name: prod-gateway
+    wss_url: "wss://k8s.prod.example.com/api/v1/namespaces/prod/pods/gateway/exec"
+    socks_port: 1080
+    dns_upstream: "10.96.0.10"
+
+  - name: staging-db
+    wss_url: "wss://k8s.staging.example.com/api/v1/namespaces/staging/pods/db/exec"
+    socks_port: 1081
+    enabled: false
