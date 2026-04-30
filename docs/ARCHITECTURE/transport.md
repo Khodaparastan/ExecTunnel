@@ -1027,7 +1027,8 @@ Note: _send_close_frame_once NEVER re-raises — teardown must always complete.
 | `udp.flow.closed_remote`                   | counter | —      | Flows closed by remote agent                   |
 | `udp.flow.close.connection_already_closed` | counter | —      | UDP_CLOSE skipped (WS already gone)            |
 | `udp.flow.datagram.accepted`               | counter | —      | Inbound datagrams enqueued                     |
-| `udp.flow.datagram.sent`                   | counter | —      | Outbound datagrams sent                        |
+| `udp.flow.datagram.submitted`              | counter | —      | Outbound datagrams submitted to ws_send        |
+| `udp.flow.datagram.enqueued_required`      | counter | —      | must_queue=True datagrams enqueued             |
 | `udp.flow.inbound_queue.drop`              | counter | —      | Inbound datagrams dropped                      |
 | `udp.flow.feed_after_close.drop`           | counter | —      | Feed calls after close (dropped)               |
 | `session.active.udp_flows`                 | gauge   | —      | Decremented on registry eviction in `_evict()` |
@@ -1098,7 +1099,7 @@ if Defaults.PIPE_READ_CHUNK_BYTES > MAX_DATA_CHUNK_BYTES:
         f"Defaults.PIPE_READ_CHUNK_BYTES ({Defaults.PIPE_READ_CHUNK_BYTES}) "
         f"exceeds the protocol maximum of {MAX_DATA_CHUNK_BYTES} bytes per "
         "DATA chunk. Adjust Defaults.PIPE_READ_CHUNK_BYTES or increase "
-        "MAX_FRAME_LEN in exectunnel.protocol.constants."
+        "MAX_TUNNEL_FRAME_CHARS in exectunnel.protocol.constants."
     )
 ```
 

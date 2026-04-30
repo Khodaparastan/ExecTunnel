@@ -173,9 +173,13 @@ def _redact_url_for_log(url: str) -> str:
 
     query = "<redacted>" if parsed.query else ""
     fragment = "<redacted>" if parsed.fragment else ""
-    return urllib.parse.urlunsplit(
-        (parsed.scheme, netloc, parsed.path, query, fragment)
-    )
+    return urllib.parse.urlunsplit((
+        parsed.scheme,
+        netloc,
+        parsed.path,
+        query,
+        fragment,
+    ))
 
 
 class AgentBootstrapper:

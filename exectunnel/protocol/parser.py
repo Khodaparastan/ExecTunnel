@@ -52,10 +52,15 @@ _INNER_MAX_SPLITS: Final[int] = 2
 _TCP_ID_PREFIX: Final[str] = "c"
 _UDP_ID_PREFIX: Final[str] = "u"
 _TCP_FRAME_TYPES: Final[frozenset[str]] = frozenset({
-    "CONN_OPEN", "CONN_ACK", "CONN_CLOSE", "DATA",
+    "CONN_OPEN",
+    "CONN_ACK",
+    "CONN_CLOSE",
+    "DATA",
 })
 _UDP_FRAME_TYPES: Final[frozenset[str]] = frozenset({
-    "UDP_OPEN", "UDP_DATA", "UDP_CLOSE",
+    "UDP_OPEN",
+    "UDP_DATA",
+    "UDP_CLOSE",
 })
 
 
