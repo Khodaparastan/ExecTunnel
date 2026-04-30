@@ -13,7 +13,8 @@ from exectunnel.proxy._wire import build_socks5_reply
 from exectunnel.proxy.config import Socks5ServerConfig
 from exectunnel.proxy.server import Socks5Server
 from exectunnel.proxy.tcp_relay import TCPRelay
-from tests.proxy.conftest import free_port
+
+from unit.proxy.conftest import free_port
 
 
 def _greeting(methods: list[int] | None = None) -> bytes:
