@@ -1,17 +1,10 @@
-"""ExecTunnel CLI package."""
+"""ExecTunnel CLI — public entry point."""
 
-from typing import TYPE_CHECKING, Any
+from ._app import app
 
-if TYPE_CHECKING:
-    from ._app import app as app
-
-
-def __getattr__(name: str) -> Any:
-    if name == "app":
-        from ._app import app  # noqa: PLC0415
-
-        return app
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+__all__ = ["app", "main"]
 
 
-__all__ = ["app"]
+def main() -> None:
+    """Setuptools entry point — delegates to the Typer app."""
+    app()
