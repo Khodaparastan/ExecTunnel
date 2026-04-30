@@ -15,14 +15,36 @@ from rich.text import Text
 
 from ._theme import Icons
 
-__all__ = ["BootstrapSpinner", "Phase", "PhaseState"]
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
 _SPINNER_FRAMES: tuple[str, ...] = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 _SPINNER_FPS: int = 10
 _FRAME_INTERVAL: float = 1.0 / _SPINNER_FPS
 
+# Ordered phase definitions: (internal_name, display_label)
+_DEFAULT_PHASES: tuple[tuple[str, str], ...] = (
+    ("stty", "Suppress terminal echo"),
+    ("upload", "Upload agent payload"),
+    ("decode", "Decode base64 on remote"),
+    ("syntax", "Syntax check agent"),
+    ("exec", "Execute agent"),
+    ("ready", "Wait for AGENT_READY"),
+)
+
+# Exported phase name constants — use these instead of raw strings.
+PHASE_NAMES: tuple[str, ...] = tuple(name for name, _ in _DEFAULT_PHASES)
+
+
+# ---------------------------------------------------------------------------
+# Phase state machine
+# ---------------------------------------------------------------------------
+
 
 class PhaseState(Enum):
+    """Lifecycle state of a single bootstrap phase."""
+
     PENDING = auto()
     RUNNING = auto()
     DONE = auto()
@@ -36,12 +58,12 @@ class Phase:
 
     State transitions
     -----------------
-    PENDING → RUNNING (via start)
-    PENDING → DONE    (via done — for zero-duration phases)
-    PENDING → SKIPPED (via skip)
-    RUNNING → DONE    (via done)
-    RUNNING → FAILED  (via fail)
-    RUNNING → SKIPPED (via skip)
+    ``PENDING → RUNNING`` (via :meth:`start`)
+    ``PENDING → DONE``    (via :meth:`done` — zero-duration phases)
+    ``PENDING → SKIPPED`` (via :meth:`skip`)
+    ``RUNNING → DONE``    (via :meth:`done`)
+    ``RUNNING → FAILED``  (via :meth:`fail`)
+    ``RUNNING → SKIPPED`` (via :meth:`skip`)
 
     All other transitions are no-ops.
     """
@@ -52,8 +74,6 @@ class Phase:
     elapsed: float = 0.0
     detail: str = ""
 
-    # Private — excluded from __init__ and repr.
-    # Set to current time at construction; reset to now() in start().
     _start: float = field(
         default_factory=time.monotonic,
         init=False,
@@ -78,9 +98,8 @@ class Phase:
     def done(self, detail: str = "") -> None:
         """Transition to DONE from PENDING or RUNNING.
 
-        PENDING → DONE is allowed for phases that complete without a matching
-        start event (e.g. ``decode_done`` fires without ``decode_start``).
-        Elapsed is recorded as 0.0 in that case.
+        ``PENDING → DONE`` is allowed for phases that complete without a
+        matching start event.  Elapsed is recorded as ``0.0`` in that case.
         """
         if self.state in (PhaseState.PENDING, PhaseState.RUNNING):
             self.elapsed = (
@@ -108,15 +127,9 @@ class Phase:
             self.detail = detail
 
 
-# Ordered phase definitions: (internal_name, display_label)
-_DEFAULT_PHASES: tuple[tuple[str, str], ...] = (
-    ("stty", "Suppress terminal echo"),
-    ("upload", "Upload agent payload"),
-    ("decode", "Decode base64 on remote"),
-    ("syntax", "Syntax check agent"),
-    ("exec", "Execute agent"),
-    ("ready", "Wait for AGENT_READY"),
-)
+# ---------------------------------------------------------------------------
+# BootstrapSpinner
+# ---------------------------------------------------------------------------
 
 
 class BootstrapSpinner:
@@ -169,33 +182,25 @@ class BootstrapSpinner:
         return self
 
     async def __aexit__(self, *_: object) -> None:
-        # Cancel tick first to prevent update-after-stop races.
         if self._task is not None:
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
             self._task = None
 
-        # Ensure a clean final state before printing the summary.
         self._finalize_phases()
 
         if self._live is not None:
             self._live.stop()
             self._live = None
 
-        # Print a permanent (non-transient) summary so the result is visible.
+        # Print a permanent (non-transient) summary.
         self._console.print(self._render())
 
     # ── Background tick ───────────────────────────────────────────────────
 
     async def _tick(self) -> None:
-        """Advance the spinner frame at a fixed rate.
-
-        Uses a monotonic deadline instead of a naïve ``sleep(interval)``
-        to prevent cumulative drift over long bootstrap sequences.
-        Uses ``get_running_loop()`` (preferred over deprecated
-        ``get_event_loop()`` inside async contexts).
-        """
+        """Advance the spinner frame at a fixed rate using monotonic deadlines."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _FRAME_INTERVAL
         try:
@@ -213,40 +218,27 @@ class BootstrapSpinner:
 
     def start_phase(self, name: str) -> None:
         """Begin animation for *name*. No-op for unknown phase names."""
-        phase = self._phases.get(name)
-        if phase is not None:
+        if phase := self._phases.get(name):
             phase.start()
 
     def done_phase(self, name: str, detail: str = "") -> None:
-        phase = self._phases.get(name)
-        if phase is not None:
+        if phase := self._phases.get(name):
             phase.done(detail)
 
     def skip_phase(self, name: str, detail: str = "skipped") -> None:
-        phase = self._phases.get(name)
-        if phase is not None:
+        if phase := self._phases.get(name):
             phase.skip(detail)
 
     def fail_phase(self, name: str, detail: str = "") -> None:
-        phase = self._phases.get(name)
-        if phase is not None:
+        if phase := self._phases.get(name):
             phase.fail(detail)
 
     def fail_current(self, detail: str = "") -> None:
         """Fail the active phase; skip all phases that were never reached.
 
-        B2 fix: replaces the old pattern of calling ``fail_phase()`` for every
-        phase name, which incorrectly turned PENDING phases into FAILED (red ✗).
-
-        Logic
-        -----
-        * RUNNING phase  → FAILED  (the phase where the error occurred)
-        * PENDING phases → SKIPPED (never reached, shown as –)
-        * DONE / SKIPPED / FAILED  → no-op (already terminal)
-
-        If no phase is currently RUNNING (error before any phase started),
-        the first PENDING phase is marked FAILED so there is always one
-        visible error indicator.
+        * ``RUNNING``  → ``FAILED``
+        * ``PENDING``  → ``SKIPPED`` (or ``FAILED`` if no phase was running)
+        * Terminal states → no-op
         """
         failed_one = False
         for name in self._phase_order:
@@ -256,42 +248,30 @@ class BootstrapSpinner:
                 failed_one = True
             elif p.state is PhaseState.PENDING:
                 if not failed_one:
-                    # Mark the first unstarted phase as failed (error before
-                    # bootstrap could even begin).
                     p.fail(detail)
                     failed_one = True
                 else:
                     p.skip("not reached")
-            # DONE / SKIPPED / FAILED are terminal — no action.
 
     def finalize(self) -> None:
         """Mark all incomplete phases so the final summary is clean.
 
-        Call this explicitly when bootstrap is done and the dashboard is
-        about to take over.  Idempotent — safe to call multiple times.
+        Idempotent — safe to call multiple times.
         """
         self._finalize_phases()
 
     # ── Internal ──────────────────────────────────────────────────────────
 
     def _finalize_phases(self) -> None:
-        """Settle any phases that did not reach a terminal state.
-
-        * RUNNING  → DONE    (phase completed but we missed the done event)
-        * PENDING  → SKIPPED (phase was never started — not applicable here)
-        """
         if self._finished:
             return
         self._finished = True
-
         for name in self._phase_order:
             p = self._phases[name]
             if p.state is PhaseState.RUNNING:
-                # Completed without an explicit done event.
                 p.done("(completed)")
             elif p.state is PhaseState.PENDING:
                 p.skip()
-            # DONE / FAILED / SKIPPED phases are already terminal — no action.
 
     def _render(self) -> Table:
         """Build the phase-grid renderable for the current frame."""
