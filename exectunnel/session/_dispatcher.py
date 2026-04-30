@@ -926,8 +926,11 @@ class RequestDispatcher:
         # Enforce a per-session cap on concurrent UDP flows by evicting the
         # oldest flow (insertion order) when at the cap.
         if len(active_flows) >= UDP_ACTIVE_FLOWS_CAP:
-            oldest_key = next(iter(active_flows))
-            oldest_entry = active_flows.pop(oldest_key)
+            oldest_key, oldest_entry = min(
+                active_flows.items(),
+                key=lambda item: item[1].last_used_at,
+            )
+            active_flows.pop(oldest_key, None)
             metrics_inc("udp.flow.evicted_over_cap")
             logger.info(
                 "udp flows at cap=%d — evicting oldest %s:%d",

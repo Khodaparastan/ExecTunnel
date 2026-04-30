@@ -627,6 +627,7 @@ class TunnelSession:
             queue_put_timeout=self._tun.socks_queue_put_timeout,
             udp_relay_queue_capacity=self._tun.udp_relay_queue_cap,
             udp_drop_warn_interval=self._tun.udp_drop_warn_every,
+            udp_associate_enabled=self._tun.socks_udp_associate_enabled,
             udp_bind_host=self._tun.socks_udp_bind_host,
             udp_advertise_host=self._tun.socks_udp_advertise_host,
         )

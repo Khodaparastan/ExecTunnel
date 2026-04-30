@@ -206,7 +206,7 @@ class WsSender:
             try:
                 async with asyncio.timeout(STOP_GRACE_TIMEOUT_SECS):
                     await self._loop_task
-            except (TimeoutError, asyncio.CancelledError):
+            except TimeoutError:
                 self._loop_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._loop_task

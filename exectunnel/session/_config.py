@@ -234,6 +234,7 @@ class TunnelConfig:
     socks_port: int = Defaults.SOCKS_DEFAULT_PORT
 
     socks_allow_non_loopback: bool = False
+    socks_udp_associate_enabled: bool = True
     socks_udp_bind_host: str = Defaults.SOCKS_DEFAULT_HOST
     socks_udp_advertise_host: str | None = None
 
