@@ -1,10 +1,9 @@
-# ExecTunnel — single-tunnel quick start
+# ExecTunnel
 #
 # Usage:
-#   cp .env.manager .env          # fill in your WSS_URL
-#   docker compose up              # starts tunnel on localhost:1080
+#   cp config.toml.example config.toml
+#   docker compose up
 #
-# For multi-tunnel (manager mode), see docker-compose.manager.yml.
 
 services:
   tunnel:
@@ -17,10 +16,8 @@ services:
     ports:
       - "0.0.0.0:${SOCKS_PORT:-1080}:1080"
     environment:
-      WSS_URL: "${WSS_URL:?Set WSS_URL in .env or shell}"
-      WSS_INSECURE: "${WSS_INSECURE:-true}"
       LOG_LEVEL: "${LOG_LEVEL:-debug}"
     # Bind on all interfaces so Docker port-mapping reaches the SOCKS5 server.
-    command: [ "tunnel", "--socks-host", "0.0.0.0" ]
+    command: [ "run", "--socks-host", "0.0.0.0" ]
     # To pass extra flags (e.g. DNS):
-    # command: ["tunnel", "--socks-host", "0.0.0.0", "--dns", "10.96.0.10"]
+    # command: ["run", "--socks-host", "0.0.0.0", "--dns", "10.96.0.10"]

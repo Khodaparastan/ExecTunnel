@@ -1,4 +1,3 @@
-# yaml-language-server: $schema=https://squidfunk.github.io/mkdocs-material/schema.json
 site_name: ExecTunnel
 site_description: SOCKS5 tunnel over Kubernetes exec/WebSocket channels
 site_url: "https://github.com/Khodaparastan/ExecTunnel"
@@ -19,6 +18,7 @@ theme:
 
 plugins:
   - search
+  - markdownmermaid
   - mkdocstrings:
       handlers:
         python:
@@ -45,11 +45,6 @@ nav:
   - Getting Started: getting-started.md
   - Configuration: configuration.md
   - Architecture: architecture.md
-  - Transport Architecture: transport/arch.md
-  - Protocol Architecture: protocol/arch.md
-  - Proxy Architecture: proxy/arch.md
-  - Session Architecture: session/arch.md
-  - Protocol API: protocol/api.md
   - Protocol: protocol.md
   - Production: production.md
   - Troubleshooting: troubleshooting.md

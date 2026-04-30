@@ -2,8 +2,8 @@
 name = "exectunnel"
 description = "SOCKS5 proxy tunnel over WebSocket into Kubernetes pods"
 readme = "README.md"
-license = "MIT"
 requires-python = ">=3.12"
+license = "MIT"
 authors = [{ name = "khodaparastan", email = "mohammad@khodaparastan.com" }]
 keywords = ["exec", "kubernetes", "proxy", "socks5", "tunnel", "websocket"]
 classifiers = [
@@ -20,17 +20,22 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
+    "aiohttp-socks (>=0.11.0,<0.12.0)",
+    "aiohttp (>=3.13.5,<4.0.0)",
     "colorama (>=0.4.6,<1.0.0)",
     "contextvars (>=2.4,<3.0)",
     "httpx (>=0.28.1,<0.29.0)",
+    "orjson (>=3.11.8,<4.0.0)",
+    "psutil (>=6.0.0,<8.0.0)",
+    "pydantic-settings (>=2.14.0,<3.0.0)",
+    "pydantic (>=2.13.3,<3.0.0)",
     "pyyaml (>=6.0.3,<7.0.0)",
     "rich (>=15.0.0,<16.0.0)",
     "structlog (>=25.5.0,<26.0.0)",
+    "tomli (>=2.4.1,<3.0.0)",
     "typer (>=0.24.2,<0.25.0)",
     "websockets (>=16.0)",
-    "aiohttp (>=3.13.5,<4.0.0)",
-    "aiohttp-socks (>=0.11.0,<0.12.0)",
-    "orjson (>=3.11.8,<4.0.0)",
+    "pytest (>=9.0.3,<10.0.0)",
 ]
 dynamic = ["version"]
 
@@ -42,8 +47,8 @@ Issues = "https://github.com/khodaparastan/exectunnel/issues"
 Repository = "https://github.com/khodaparastan/exectunnel"
 
 [project.scripts]
-exectunnel = "exectunnel.cli:app"
 et = "exectunnel.cli:app"
+exectunnel = "exectunnel.cli:app"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
@@ -56,15 +61,15 @@ version = "1.3.0"
 poetry-plugin-export = ">=1.8"
 
 [tool.poetry.group.dev.dependencies]
-mypy = "^1.19.1"
-pyrefly = "^0.58.0"
-pytest = "^9.0.2"
-pytest-asyncio = ">=0.24"
-ruff = "^0.15.6"
-ty = "^0.0.29"
 aiohttp = "^3.13.5"
 aiohttp-socks = "^0.11.0"
+mypy = "^1.19.1"
 orjson = "^3.11.8"
+pyrefly = "^0.62.0"
+pytest = "^9.0.2"
+pytest-asyncio = ">=0.24"
+ruff = "^0.15.12"
+ty = "^0.0.32"
 
 [tool.poetry.group.docs.dependencies]
 griffe = "^2.0.2"
@@ -89,7 +94,7 @@ preview = true
 fix = true
 show-fixes = true
 src = ["exectunnel"]
-exclude = [".venv", "tests", "venv"]
+exclude = [".venv", "venv", "scripts"]
 target-version = "py312"
 line-length = 88
 
@@ -149,6 +154,7 @@ ignore = [
     "N801",
     "TRY003",
     "TRY300",
+    "UP040",
 ]
 explicit-preview-rules = true
 extend-fixable = ["ALL"]

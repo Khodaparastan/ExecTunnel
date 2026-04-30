@@ -95,6 +95,10 @@ typecheck: ## Run mypy type checker
 .PHONY: check
 check: lint format-check typecheck ## Run all code quality checks
 
+.PHONY: run
+run:
+	$(PYTHON) -m exectunnel.cli run
+
 # ── Tests ─────────────────────────────────────────────────────────────────────
 .PHONY: test
 test: ## Run test suite
