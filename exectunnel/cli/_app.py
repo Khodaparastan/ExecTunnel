@@ -188,7 +188,9 @@ def _run(
     ] = None,
     socks_udp_bind_host: Annotated[
         str | None,
-        typer.Option("--udp-bind-host", help="SOCKS5 UDP relay bind host.", metavar="HOST"),
+        typer.Option(
+            "--udp-bind-host", help="SOCKS5 UDP relay bind host.", metavar="HOST"
+        ),
     ] = None,
     socks_udp_advertise_host: Annotated[
         str | None,
@@ -290,7 +292,9 @@ def _run_single(
     ] = None,
     socks_udp_bind_host: Annotated[
         str | None,
-        typer.Option("--udp-bind-host", help="SOCKS5 UDP relay bind host.", metavar="HOST"),
+        typer.Option(
+            "--udp-bind-host", help="SOCKS5 UDP relay bind host.", metavar="HOST"
+        ),
     ] = None,
     socks_udp_advertise_host: Annotated[
         str | None,

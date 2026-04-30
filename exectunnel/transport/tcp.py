@@ -783,8 +783,10 @@ class TcpConnection:
 
         if task is self._upstream_task:
             should_cancel_peer = not (
-                task_ended_cleanly and self._upstream_ended_cleanly
-                or task.cancelled() and self._preserve_downstream_on_upstream_cancel
+                task_ended_cleanly
+                and self._upstream_ended_cleanly
+                or task.cancelled()
+                and self._preserve_downstream_on_upstream_cancel
             )
         else:
             should_cancel_peer = True

@@ -877,8 +877,6 @@ class _FrameWriter:
                 except queue.Empty:
                     item = None
 
-
-
             data_processed = 0
             while data_processed < CONFIG.writer_data_batch_size:
                 if self._out.is_dead:

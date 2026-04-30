@@ -62,10 +62,15 @@ _AGENT_READY_FRAME: Final[str] = READY_FRAME + "\n"
 _TCP_ID_PREFIX: Final[str] = "c"
 _UDP_ID_PREFIX: Final[str] = "u"
 _TCP_FRAME_TYPES: Final[frozenset[str]] = frozenset({
-    "CONN_OPEN", "CONN_ACK", "CONN_CLOSE", "DATA",
+    "CONN_OPEN",
+    "CONN_ACK",
+    "CONN_CLOSE",
+    "DATA",
 })
 _UDP_FRAME_TYPES: Final[frozenset[str]] = frozenset({
-    "UDP_OPEN", "UDP_DATA", "UDP_CLOSE",
+    "UDP_OPEN",
+    "UDP_DATA",
+    "UDP_CLOSE",
 })
 
 # ── Private validation helpers ────────────────────────────────────────────────
@@ -142,9 +147,6 @@ def _validate_id_namespace(value: str, frame_type: str) -> None:
                 "got": value,
             },
         )
-
-
-
 
 
 def _encode_frame(msg_type: str, conn_id: str | None, payload: str = "") -> str:
