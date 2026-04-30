@@ -6,22 +6,113 @@ the codebase.
 
 from __future__ import annotations
 
-from exectunnel.cli.utils import (
-    parse_bool_env as _parse_bool_env,
-)
-from exectunnel.cli.utils import (
-    parse_float_env as _parse_float_env,
-)
-from exectunnel.cli.utils import (
-    parse_int_env as _parse_int_env,
-)
+import logging
+import math
+import os
 
-__all__ = ["parse_bool_env", "parse_float_env", "parse_int_env"]
+logger = logging.getLogger(__name__)
 
 
 def parse_bool_env(name: str, default: bool = False) -> bool:
     """Read an env var as a boolean flag."""
     return _parse_bool_env(name, default)
+
+
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    token = value.strip().lower()
+    if token in {"1", "true", "yes", "on"}:
+        return True
+    if token in {"0", "false", "no", "off", ""}:
+        return False
+    logger.warning("Invalid boolean for %s=%r, using default %s", name, value, default)
+    return default
+
+
+def _parse_float_env(
+    name: str,
+    default: float,
+    *,
+    min_value: float | None = None,
+    max_value: float | None = None,
+) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        logger.warning(
+            "Invalid value for %s=%r, using default %.1f", name, value, default
+        )
+        return default
+    if not math.isfinite(parsed):
+        logger.warning(
+            "Invalid non-finite value for %s=%r, using default %.1f",
+            name,
+            value,
+            default,
+        )
+        return default
+    if min_value is not None and parsed < min_value:
+        logger.warning(
+            "Value for %s=%.3f below minimum %.3f, using default %.1f",
+            name,
+            parsed,
+            min_value,
+            default,
+        )
+        return default
+    if max_value is not None and parsed > max_value:
+        logger.warning(
+            "Value for %s=%.3f above maximum %.3f, using default %.1f",
+            name,
+            parsed,
+            max_value,
+            default,
+        )
+        return default
+    return parsed
+
+
+def _parse_int_env(
+    name: str,
+    default: int,
+    *,
+    min_value: int | None = None,
+    max_value: int | None = None,
+) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning(
+            "Invalid integer for %s=%r, using default %d", name, value, default
+        )
+        return default
+    if min_value is not None and parsed < min_value:
+        logger.warning(
+            "Value for %s=%d below minimum %d, using default %d",
+            name,
+            parsed,
+            min_value,
+            default,
+        )
+        return default
+    if max_value is not None and parsed > max_value:
+        logger.warning(
+            "Value for %s=%d above maximum %d, using default %d",
+            name,
+            parsed,
+            max_value,
+            default,
+        )
+        return default
+    return parsed
 
 
 def parse_int_env(
@@ -74,6 +165,8 @@ def _clamp_int(value: int, lo: int | None, hi: int | None) -> int:
 
 
 def _clamp_float(value: float, lo: float | None, hi: float | None) -> float:
+    if not math.isfinite(value):
+        return lo if lo is not None else 0.0
     if lo is not None and value < lo:
         return lo
     if hi is not None and value > hi:
