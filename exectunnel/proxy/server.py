@@ -345,6 +345,10 @@ class Socks5Server:
         if self._stopped:
             metrics_inc("socks5.handshakes.error", reason="server_stopped")
             metrics_inc("socks5.connections.rejected")
+            metrics_observe(
+                "socks5.handshake_duration_sec",
+                time.monotonic() - handshake_start,
+            )
             with contextlib.suppress(Exception):
                 await req.send_reply_error(Reply.GENERAL_FAILURE)
             return

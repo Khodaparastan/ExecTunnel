@@ -175,10 +175,10 @@ class TCPRelay:
         try:
             packet = build_socks5_reply(reply)
             self._consume_reply_slot()
-            with contextlib.suppress(OSError):
+            with contextlib.suppress(OSError, RuntimeError):
                 self.writer.write(packet)
             metrics_inc("socks5.replies.error", reply=reply.name, cmd=self.cmd.name)
         finally:
-            with contextlib.suppress(OSError):
+            with contextlib.suppress(OSError, RuntimeError):
                 await self.writer.drain()
             await self.close()
