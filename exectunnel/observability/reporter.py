@@ -173,17 +173,24 @@ async def run_metrics_reporter(
     # Main loop
     # ------------------------------------------------------------------
 
-    while not event.is_set():
-        try:
-            await asyncio.wait_for(event.wait(), timeout=interval_sec)
-            break  # stop_event was set
-        except TimeoutError:
-            await _emit_snapshot(final=False)
-        except asyncio.CancelledError:
-            break
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("metrics reporter failure: %s", exc, exc_info=True)
+    cancelled = False
+    try:
+        while not event.is_set():
+            try:
+                await asyncio.wait_for(event.wait(), timeout=interval_sec)
+                break  # stop_event was set
+            except TimeoutError:
+                await _emit_snapshot(final=False)
+            except asyncio.CancelledError:
+                cancelled = True
+                break
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("metrics reporter failure: %s", exc, exc_info=True)
+    finally:
+        # Always attempt a final flush, but never let exporter failure mask
+        # cancellation or shutdown.
+        with contextlib.suppress(Exception):
+            await _emit_snapshot(final=True)
 
-    # Always attempt a final flush.
-    with contextlib.suppress(Exception):
-        await _emit_snapshot(final=True)
+    if cancelled:
+        raise asyncio.CancelledError

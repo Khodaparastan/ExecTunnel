@@ -201,6 +201,10 @@ def build_exporters(
     # ------------------------------------------------------------------
 
     def _write_file(payload: dict[str, object]) -> None:
+        parent = os.path.dirname(os.path.abspath(file_path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
         # NOTE: There is an inherent TOCTOU race between getsize() and the
         # subsequent open().  This is acceptable as a best-effort safety
         # guard; exact enforcement would require advisory locking.

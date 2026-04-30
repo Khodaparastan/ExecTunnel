@@ -5,11 +5,14 @@ from .logging import (
     LevelName,
     LogEntry,
     LogRingBuffer,
+    attach_rich_logging,
     configure_logging,
     install_ring_buffer,
 )
 from .metrics import (
     METRICS,
+    MetricEvent,
+    MetricKind,
     MetricsRegistry,
     metrics_gauge_dec,
     metrics_gauge_inc,
@@ -31,6 +34,7 @@ from .tracing import (
     span,
     start_trace,
 )
+from .utils import parse_bool_env, parse_float_env, parse_int_env
 
 __all__ = [
     # exporters
@@ -41,10 +45,16 @@ __all__ = [
     "LevelName",
     "LogEntry",
     "LogRingBuffer",
+    "attach_rich_logging",
     "configure_logging",
     "install_ring_buffer",
+    "parse_bool_env",
+    "parse_float_env",
+    "parse_int_env",
     # metrics
     "METRICS",
+    "MetricEvent",
+    "MetricKind",
     "MetricsRegistry",
     "metrics_gauge_dec",
     "metrics_gauge_inc",
