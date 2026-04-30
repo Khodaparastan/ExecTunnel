@@ -36,7 +36,7 @@ from .constants import (
     READY_FRAME,
     VALID_MSG_TYPES,
 )
-from .ids import CONN_FLOW_ID_RE
+from .ids import CONN_FLOW_ID_RE, SESSION_CONN_ID
 from .types import ParsedFrame
 
 __all__ = ["is_ready_frame", "parse_frame"]
@@ -48,6 +48,40 @@ _log: Final[logging.Logger] = logging.getLogger(__name__)
 # ``msg_type``, ``conn_id``, ``payload`` — preserving any ``:`` inside
 # bracket-quoted IPv6 payloads (e.g. ``[2001:db8::1]:443``).
 _INNER_MAX_SPLITS: Final[int] = 2
+
+_TCP_ID_PREFIX: Final[str] = "c"
+_UDP_ID_PREFIX: Final[str] = "u"
+_TCP_FRAME_TYPES: Final[frozenset[str]] = frozenset({
+    "CONN_OPEN", "CONN_ACK", "CONN_CLOSE", "DATA",
+})
+_UDP_FRAME_TYPES: Final[frozenset[str]] = frozenset({
+    "UDP_OPEN", "UDP_DATA", "UDP_CLOSE",
+})
+
+
+def _validate_id_namespace(msg_type: str, conn_id: str, raw_hex: str) -> None:
+    """Validate TCP/UDP ID prefix semantics for a decoded frame."""
+    if conn_id == SESSION_CONN_ID and msg_type != "ERROR":
+        raise FrameDecodingError(
+            f"Tunnel frame {msg_type!r} uses the session-level sentinel "
+            f"conn_id {SESSION_CONN_ID!r}; this sentinel is only valid for "
+            "ERROR frames.",
+            details={"raw_bytes": raw_hex, "codec": "frame"},
+        )
+
+    if msg_type in _TCP_FRAME_TYPES and not conn_id.startswith(_TCP_ID_PREFIX):
+        raise FrameDecodingError(
+            f"Tunnel frame {msg_type!r} requires a TCP connection ID with "
+            f"prefix {_TCP_ID_PREFIX!r}, got {conn_id!r}.",
+            details={"raw_bytes": raw_hex, "codec": "frame"},
+        )
+
+    if msg_type in _UDP_FRAME_TYPES and not conn_id.startswith(_UDP_ID_PREFIX):
+        raise FrameDecodingError(
+            f"Tunnel frame {msg_type!r} requires a UDP flow ID with prefix "
+            f"{_UDP_ID_PREFIX!r}, got {conn_id!r}.",
+            details={"raw_bytes": raw_hex, "codec": "frame"},
+        )
 
 
 def _strip_proxy_suffix(line: str) -> tuple[str, bool]:
@@ -170,6 +204,8 @@ def parse_frame(line: str) -> ParsedFrame | None:
             "suspect proxy body corruption.",
             details={"raw_bytes": raw_hex, "codec": "frame"},
         )
+
+    _validate_id_namespace(msg_type, conn_id, raw_hex)
 
     if msg_type in PAYLOAD_REQUIRED_TYPES and not payload:
         raise FrameDecodingError(

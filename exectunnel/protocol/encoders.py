@@ -28,7 +28,7 @@ from .constants import (
     READY_FRAME,
     VALID_MSG_TYPES,
 )
-from .ids import CONN_FLOW_ID_RE
+from .ids import CONN_FLOW_ID_RE, SESSION_CONN_ID
 
 __all__ = [
     "encode_agent_ready_frame",
@@ -59,6 +59,14 @@ _PAYLOAD_INJECTION_GUARDS: Final[tuple[tuple[str, str], ...]] = (
 
 _AGENT_READY_FRAME: Final[str] = READY_FRAME + "\n"
 
+_TCP_ID_PREFIX: Final[str] = "c"
+_UDP_ID_PREFIX: Final[str] = "u"
+_TCP_FRAME_TYPES: Final[frozenset[str]] = frozenset({
+    "CONN_OPEN", "CONN_ACK", "CONN_CLOSE", "DATA",
+})
+_UDP_FRAME_TYPES: Final[frozenset[str]] = frozenset({
+    "UDP_OPEN", "UDP_DATA", "UDP_CLOSE",
+})
 
 # ── Private validation helpers ────────────────────────────────────────────────
 
@@ -88,6 +96,55 @@ def _validate_conn_id(value: str, frame_type: str) -> None:
                 "got": value,
             },
         )
+
+
+def _validate_id_namespace(value: str, frame_type: str) -> None:
+    """Validate TCP/UDP ID prefix semantics for a frame type.
+
+    Args:
+        value: The already shape-validated connection or flow ID.
+        frame_type: Frame type name used in the error message.
+
+    Raises:
+        ProtocolError: If a TCP frame carries a UDP flow ID, a UDP frame
+            carries a TCP connection ID, or the session-level sentinel is
+            used outside an ERROR frame.
+    """
+    if value == SESSION_CONN_ID and frame_type != "ERROR":
+        raise ProtocolError(
+            f"{frame_type} must not use the session-level sentinel conn_id "
+            f"{SESSION_CONN_ID!r}.",
+            details={
+                "frame_type": frame_type,
+                "expected": "non-sentinel TCP/UDP ID",
+                "got": value,
+            },
+        )
+
+    if frame_type in _TCP_FRAME_TYPES and not value.startswith(_TCP_ID_PREFIX):
+        raise ProtocolError(
+            f"{frame_type} requires a TCP connection ID with prefix "
+            f"{_TCP_ID_PREFIX!r}, got {value!r}.",
+            details={
+                "frame_type": frame_type,
+                "expected": "c[0-9a-f]{24}",
+                "got": value,
+            },
+        )
+
+    if frame_type in _UDP_FRAME_TYPES and not value.startswith(_UDP_ID_PREFIX):
+        raise ProtocolError(
+            f"{frame_type} requires a UDP flow ID with prefix "
+            f"{_UDP_ID_PREFIX!r}, got {value!r}.",
+            details={
+                "frame_type": frame_type,
+                "expected": "u[0-9a-f]{24}",
+                "got": value,
+            },
+        )
+
+
+
 
 
 def _encode_frame(msg_type: str, conn_id: str | None, payload: str = "") -> str:
@@ -150,6 +207,7 @@ def _encode_frame(msg_type: str, conn_id: str | None, payload: str = "") -> str:
                 details={"frame_type": msg_type, "expected": "[cu][0-9a-f]{24}"},
             )
         _validate_conn_id(conn_id, frame_type=msg_type)
+        _validate_id_namespace(conn_id, frame_type=msg_type)
 
     if msg_type in PAYLOAD_REQUIRED_TYPES and not payload:
         raise ProtocolError(
@@ -178,6 +236,8 @@ def _encode_frame(msg_type: str, conn_id: str | None, payload: str = "") -> str:
         content = f"{FRAME_PREFIX}{msg_type}:{conn_id}:{payload}{FRAME_SUFFIX}"
     elif conn_id:
         content = f"{FRAME_PREFIX}{msg_type}:{conn_id}{FRAME_SUFFIX}"
+    elif payload:
+        content = f"{FRAME_PREFIX}{msg_type}:{payload}{FRAME_SUFFIX}"
     else:
         content = f"{FRAME_PREFIX}{msg_type}{FRAME_SUFFIX}"
 
