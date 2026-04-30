@@ -95,6 +95,7 @@ class TcpConnection:
         "_conn_close_sent",
         "_upstream_ended_cleanly",
         "_downstream_ended_cleanly",
+        "_preserve_downstream_on_upstream_cancel",
         "_drop_count",
         "_bytes_upstream",
         "_bytes_downstream",
@@ -134,6 +135,7 @@ class TcpConnection:
         self._conn_close_sent = False
         self._upstream_ended_cleanly = False
         self._downstream_ended_cleanly = False
+        self._preserve_downstream_on_upstream_cancel = False
 
         self._drop_count = 0
         self._bytes_upstream = 0
@@ -293,6 +295,7 @@ class TcpConnection:
             self._schedule_cleanup()
             return
         if self._upstream_task is not None and not self._upstream_task.done():
+            self._preserve_downstream_on_upstream_cancel = True
             self._upstream_task.cancel()
 
     def abort_downstream(self) -> None:
@@ -536,8 +539,8 @@ class TcpConnection:
                     self._bytes_upstream += len(chunk)
                     metrics_inc(
                         "tcp.connection.upstream.bytes",
+                        value=len(chunk),
                         conn_id=self._id,
-                        bytes=len(chunk),
                     )
                 self._upstream_ended_cleanly = True
 
@@ -553,9 +556,10 @@ class TcpConnection:
                 elapsed = asyncio.get_running_loop().time() - start
                 metrics_observe("tcp.connection.upstream.duration_sec", elapsed)
                 metrics_observe(
-                    "tcp.connection.upstream.bytes", float(self._bytes_upstream)
+                    "tcp.connection.upstream.bytes_per_connection",
+                    float(self._bytes_upstream),
                 )
-                if not cancelled:
+                if not cancelled or self._preserve_downstream_on_upstream_cancel:
                     await self._send_close_frame_once()
 
     async def _downstream(self) -> None:
@@ -601,7 +605,8 @@ class TcpConnection:
                 elapsed = asyncio.get_running_loop().time() - start
                 metrics_observe("tcp.connection.downstream.duration_sec", elapsed)
                 metrics_observe(
-                    "tcp.connection.downstream.bytes", float(self._bytes_downstream)
+                    "tcp.connection.downstream.bytes_per_connection",
+                    float(self._bytes_downstream),
                 )
 
     async def _downstream_iteration(self, close_task: asyncio.Task[bool]) -> bool:
@@ -640,8 +645,8 @@ class TcpConnection:
             self._bytes_downstream += batch_bytes
             metrics_inc(
                 "tcp.connection.downstream.bytes",
+                value=batch_bytes,
                 conn_id=self._id,
-                bytes=batch_bytes,
             )
             return False
 
@@ -691,8 +696,8 @@ class TcpConnection:
             self._bytes_downstream += len(chunk)
             metrics_inc(
                 "tcp.connection.downstream.bytes",
+                value=len(chunk),
                 conn_id=self._id,
-                bytes=len(chunk),
             )
             return False
 
@@ -779,6 +784,7 @@ class TcpConnection:
         if task is self._upstream_task:
             should_cancel_peer = not (
                 task_ended_cleanly and self._upstream_ended_cleanly
+                or task.cancelled() and self._preserve_downstream_on_upstream_cancel
             )
         else:
             should_cancel_peer = True
