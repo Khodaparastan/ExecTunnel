@@ -48,6 +48,7 @@ _ARGC_FIXED_TARGET: Final = 3
 
 _ID_RE: Final = re.compile(r"^[cu][0-9a-f]{24}$")
 _B64URL_RE: Final = re.compile(r"^[A-Za-z0-9_-]*$")
+_SESSION_CONN_ID: Final = "c" + "0" * 24
 
 _FRAME_UNSAFE_RE: Final = re.compile(r"[:<>]", re.ASCII)
 _DOMAIN_RE: Final = re.compile(
@@ -242,7 +243,7 @@ class _AgentConfig:
     )
     max_udp_dgram_bytes: int = _env_int(
         "EXECTUNNEL_AGENT_MAX_UDP_DGRAM_BYTES",
-        4096,
+        65_507,
         minimum=1,
         maximum=65535,
     )
@@ -448,6 +449,14 @@ def _make_error_frame(conn_id: str, reason: str) -> str:
 
 def _is_valid_id(value: str) -> bool:
     return bool(_ID_RE.fullmatch(value))
+
+
+def _is_valid_tcp_id(value: str) -> bool:
+    return _is_valid_id(value) and value.startswith("c") and value != _SESSION_CONN_ID
+
+
+def _is_valid_udp_id(value: str) -> bool:
+    return _is_valid_id(value) and value.startswith("u")
 
 
 def _extract_frame(line: str) -> str | None:
@@ -859,14 +868,16 @@ class _FrameWriter:
                     saw_activity = True
 
                 ctrl_processed += 1
+                if ctrl_processed >= CONFIG.writer_ctrl_batch_size:
+                    item = None
+                    break
 
                 try:
                     item = self._ctrl.get_nowait()
                 except queue.Empty:
                     item = None
 
-            if item is not None:
-                self._ctrl.put(item)
+
 
             data_processed = 0
             while data_processed < CONFIG.writer_data_batch_size:
@@ -1105,12 +1116,7 @@ class TcpConnectionWorker:
         saturated = False
 
         with self._inbound_lock:
-            pending_bytes = self._inbound_bytes + len(data)
-
-            if (
-                len(self._inbound) >= CONFIG.max_tcp_inbound_chunks
-                or pending_bytes > CONFIG.max_tcp_inbound_bytes
-            ):
+            if self._final_closed or self._closed.is_set() or self._aborted.is_set():
                 _log(
                     "debug",
                     "conn %s late feed dropped (%d bytes)",
@@ -1119,7 +1125,14 @@ class TcpConnectionWorker:
                 )
                 return
 
-            if len(self._inbound) >= CONFIG.max_tcp_inbound_chunks:
+            pending_bytes = self._inbound_bytes + len(data)
+
+            if (
+                len(self._inbound) >= CONFIG.max_tcp_inbound_chunks
+                or pending_bytes > CONFIG.max_tcp_inbound_bytes
+            ):
+                if self._saturated:
+                    return
                 self._saturated = True
                 self._closed.set()
                 saturated = True
@@ -1728,7 +1741,7 @@ class _Dispatcher:
             return
 
         cid = parts[1]
-        if not _is_valid_id(cid):
+        if not _is_valid_tcp_id(cid):
             _log("debug", "CONN_OPEN invalid conn_id: %r", cid)
             return
 
@@ -1811,7 +1824,7 @@ class _Dispatcher:
             return
 
         cid = parts[1]
-        if not _is_valid_id(cid):
+        if not _is_valid_tcp_id(cid):
             return
 
         with self._conn_lock:
@@ -1833,7 +1846,7 @@ class _Dispatcher:
             return
 
         cid = parts[1]
-        if not _is_valid_id(cid):
+        if not _is_valid_tcp_id(cid):
             return
 
         with self._conn_lock:
@@ -1890,7 +1903,7 @@ class _Dispatcher:
             return
 
         fid = parts[1]
-        if not _is_valid_id(fid):
+        if not _is_valid_udp_id(fid):
             _log("debug", "UDP_OPEN invalid flow_id: %r", fid)
             return
 
@@ -1956,7 +1969,7 @@ class _Dispatcher:
             return
 
         fid = parts[1]
-        if not _is_valid_id(fid):
+        if not _is_valid_udp_id(fid):
             return
 
         with self._udp_lock:
@@ -1978,7 +1991,7 @@ class _Dispatcher:
             return
 
         fid = parts[1]
-        if not _is_valid_id(fid):
+        if not _is_valid_udp_id(fid):
             return
 
         with self._udp_lock:
