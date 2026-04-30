@@ -1,17 +1,12 @@
-"""Lightweight context-variable-based distributed tracing for exectunnel.
-
-Each asyncio Task inherits its own ``contextvars`` snapshot, so concurrent
-connections never share trace/span IDs.  Both synchronous and asynchronous
-span context managers are provided.
-"""
-
 from __future__ import annotations
 
 import contextvars
+import logging
 import secrets
 import time
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass
 
 from .metrics import metrics_inc, metrics_observe
 
@@ -23,6 +18,8 @@ __all__ = [
     "aspan",
     "start_trace",
 ]
+
+logger = logging.getLogger("exectunnel.tracing")
 
 _trace_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "exectunnel_trace_id",
@@ -68,62 +65,143 @@ def _new_span_id() -> str:
     return secrets.token_hex(8)
 
 
+def _normalize_trace_id(trace_id: str | None) -> str:
+    if trace_id is None:
+        return _new_trace_id()
+    if not isinstance(trace_id, str):
+        raise TypeError("trace_id must be a string or None")
+    normalized = trace_id.strip()
+    if not normalized:
+        raise ValueError("trace_id must not be empty")
+    return normalized
+
+
+def _ensure_trace_id() -> str:
+    trace_id = current_trace_id()
+    if trace_id is not None:
+        return trace_id
+    return start_trace()
+
+
+# ------------------------------------------------------------------
+# Safe observability helpers
+# ------------------------------------------------------------------
+
+
+def _safe_metrics_inc(metric: str, /, value: int = 1, **tags: object) -> None:
+    try:
+        metrics_inc(metric, value=value, **tags)
+    except Exception:
+        logger.debug(
+            "Failed to emit tracing counter metric %r",
+            metric,
+            exc_info=True,
+        )
+
+
+def _safe_metrics_observe(metric: str, /, value: float, **tags: object) -> None:
+    try:
+        metrics_observe(metric, value=value, **tags)
+    except Exception:
+        logger.debug(
+            "Failed to emit tracing histogram metric %r",
+            metric,
+            exc_info=True,
+        )
+
+
 # ------------------------------------------------------------------
 # Trace lifecycle
 # ------------------------------------------------------------------
 
 
 def start_trace(trace_id: str | None = None) -> str:
-    """Start a new trace in the current context.
-
-    Sets a fresh *trace_id* and clears span / parent-span in the current
-    ``contextvars`` context.  Returns the new trace_id.
-    """
-    trace = trace_id or _new_trace_id()
+    """Start a new trace in the current context."""
+    trace = _normalize_trace_id(trace_id)
     _trace_id_var.set(trace)
     _span_id_var.set(None)
     _parent_span_id_var.set(None)
+    _safe_metrics_inc("trace.started", provided=trace_id is not None)
     return trace
 
 
 # ------------------------------------------------------------------
-# Span helpers (shared logic)
+# Span helpers
 # ------------------------------------------------------------------
 
 
-def _enter_span(
-    name: str,
-) -> tuple[
-    str, str | None, contextvars.Token[str | None], contextvars.Token[str | None], float
-]:
-    """Push a new span onto the context-var stack and return bookkeeping state."""
-    parent_span = _span_id_var.get()
+@dataclass(slots=True)
+class _SpanState:
+    name: str
+    span_id: str
+    parent_span_id: str | None
+    span_token: contextvars.Token[str | None]
+    parent_token: contextvars.Token[str | None]
+    started_at: float
+
+
+def _validate_span_name(name: str) -> str:
+    if not isinstance(name, str):
+        raise TypeError("Span name must be a string")
+    normalized = name.strip()
+    if not normalized:
+        raise ValueError("Span name must not be empty")
+    return normalized
+
+
+def _enter_span(name: str) -> _SpanState:
+    span_name = _validate_span_name(name)
+    _ensure_trace_id()
+
+    parent_span_id = _span_id_var.get()
     span_id = _new_span_id()
+
     span_token = _span_id_var.set(span_id)
-    parent_token = _parent_span_id_var.set(parent_span)
-    start = time.perf_counter()
-    metrics_inc("trace.spans.started", name=name, parent=parent_span is not None)
-    return span_id, parent_span, span_token, parent_token, start
+    parent_token = _parent_span_id_var.set(parent_span_id)
+
+    state = _SpanState(
+        name=span_name,
+        span_id=span_id,
+        parent_span_id=parent_span_id,
+        span_token=span_token,
+        parent_token=parent_token,
+        started_at=time.perf_counter(),
+    )
+
+    _safe_metrics_inc(
+        "trace.spans.started",
+        name=span_name,
+        parent=parent_span_id is not None,
+    )
+    return state
 
 
 def _exit_span(
-    name: str,
+    state: _SpanState,
     *,
     ok: bool,
-    span_token: contextvars.Token[str | None],
-    parent_token: contextvars.Token[str | None],
-    start: float,
     tags: dict[str, object],
 ) -> None:
-    """Record span metrics and restore the context-var stack."""
-    if ok:
-        metrics_inc("trace.spans.ok", name=name)
-    else:
-        metrics_inc("trace.spans.error", name=name)
-    duration = time.perf_counter() - start
-    metrics_observe("trace.spans.duration_sec", duration, name=name, **tags)
-    _parent_span_id_var.reset(parent_token)
-    _span_id_var.reset(span_token)
+    duration = time.perf_counter() - state.started_at
+
+    metric_tags = dict(tags)
+    metric_tags["name"] = state.name
+    metric_tags["ok"] = ok
+
+    try:
+        if ok:
+            _safe_metrics_inc("trace.spans.ok", name=state.name)
+        else:
+            _safe_metrics_inc("trace.spans.error", name=state.name)
+
+        _safe_metrics_observe(
+            "trace.spans.duration_sec",
+            duration,
+            **metric_tags,
+        )
+    finally:
+        _parent_span_id_var.reset(state.parent_token)
+        _span_id_var.reset(state.span_token)
 
 
 # ------------------------------------------------------------------
@@ -133,21 +211,14 @@ def _exit_span(
 
 @contextmanager
 def span(name: str, **tags: object) -> Iterator[str]:
-    """Open a child span (synchronous context manager)."""
-    span_id, _parent, span_tok, parent_tok, start = _enter_span(name)
+    """Open a child span as a synchronous context manager."""
+    state = _enter_span(name)
     ok = False
     try:
-        yield span_id
+        yield state.span_id
         ok = True
     finally:
-        _exit_span(
-            name,
-            ok=ok,
-            span_token=span_tok,
-            parent_token=parent_tok,
-            start=start,
-            tags=tags,
-        )
+        _exit_span(state, ok=ok, tags=dict(tags))
 
 
 # ------------------------------------------------------------------
@@ -157,18 +228,11 @@ def span(name: str, **tags: object) -> Iterator[str]:
 
 @asynccontextmanager
 async def aspan(name: str, **tags: object) -> AsyncIterator[str]:
-    """Open a child span (asynchronous context manager)."""
-    span_id, _parent, span_tok, parent_tok, start = _enter_span(name)
+    """Open a child span as an asynchronous context manager."""
+    state = _enter_span(name)
     ok = False
     try:
-        yield span_id
+        yield state.span_id
         ok = True
     finally:
-        _exit_span(
-            name,
-            ok=ok,
-            span_token=span_tok,
-            parent_token=parent_tok,
-            start=start,
-            tags=tags,
-        )
+        _exit_span(state, ok=ok, tags=dict(tags))
