@@ -4,25 +4,29 @@ from __future__ import annotations
 
 from rich.theme import Theme
 
-__all__ = ["BANNER", "THEME", "Icons"]
-
 THEME = Theme({
+    # Brand & status
     "et.brand": "bold cyan",
     "et.ok": "bold green",
     "et.warn": "bold yellow",
     "et.error": "bold red",
     "et.muted": "dim white",
+    # Text roles
     "et.label": "bold white",
     "et.value": "cyan",
     "et.highlight": "bold magenta",
+    # Structural
     "et.border": "bright_black",
+    # Bootstrap phases
     "et.phase.done": "green",
     "et.phase.run": "yellow",
     "et.phase.fail": "red",
+    # Stat severity
     "et.stat.good": "bold green",
     "et.stat.warn": "bold yellow",
     "et.stat.bad": "bold red",
     "et.stat.idle": "dim white",
+    # Connection states
     "et.conn.open": "green",
     "et.conn.closed": "dim red",
     "et.conn.pend": "yellow",
@@ -32,7 +36,7 @@ THEME = Theme({
 class Icons:
     """Unicode glyphs used throughout the CLI.
 
-    This class is intentionally used as a namespace; do not instantiate it.
+    Intentionally used as a namespace — do not instantiate.
     """
 
     __slots__ = ()
@@ -59,8 +63,6 @@ class Icons:
     BYTES_DOWN = "▼"
     SEPARATOR = "─"
     BULLET = "•"
-
-    # Additional icons for manager dashboard
     FRAME = "▦"
     CONN = "⇌"
     UDP = "◇"
