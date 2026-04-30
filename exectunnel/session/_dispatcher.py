@@ -139,6 +139,7 @@ class _HostGateRegistry:
             self._entries[key] = entry
             self._prune_idle()
         entry.refs += 1
+        self._prune_idle()
         return entry
 
     def release_gate(self, key: str) -> None:

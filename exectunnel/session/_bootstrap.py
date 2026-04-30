@@ -79,6 +79,7 @@ import math
 import os
 import re
 import shlex
+import urllib.parse
 import uuid
 from typing import TYPE_CHECKING, Final
 
@@ -157,6 +158,24 @@ def _strip_ansi(text: str) -> str:
         The line with all ANSI escape sequences and ``\\r`` characters removed.
     """
     return _ANSI_ESCAPE_RE.sub("", text).replace("\r", "")
+
+
+def _redact_url_for_log(url: str) -> str:
+    """Return *url* with credentials, query, and fragment redacted for logs."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return "<invalid-url>"
+
+    netloc = parsed.netloc
+    if "@" in netloc:
+        netloc = "<redacted>@" + netloc.rsplit("@", 1)[1]
+
+    query = "<redacted>" if parsed.query else ""
+    fragment = "<redacted>" if parsed.fragment else ""
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, netloc, parsed.path, query, fragment)
+    )
 
 
 class AgentBootstrapper:
@@ -960,8 +979,11 @@ class AgentBootstrapper:
                 hint="Set a fetch URL or use bootstrap_delivery='upload'.",
             )
 
-        logger.info("bootstrap(%s/fetch): fetching agent from %s", label, url_value)
-
+        logger.info(
+            "bootstrap(%s/fetch): fetching agent from %s",
+            label,
+            _redact_url_for_log(url_value),
+        )
         tmp_path = f"{agent_path}.fetch.{uuid.uuid4().hex}.tmp"
         tmp_path_q = self._shq(tmp_path)
         agent_path_q = self._shq(agent_path)

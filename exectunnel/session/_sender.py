@@ -210,6 +210,11 @@ class WsSender:
                 self._loop_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._loop_task
+            except asyncio.CancelledError:
+                self._loop_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._loop_task
+                raise
 
     @property
     def task(self) -> asyncio.Task[None] | None:
