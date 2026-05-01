@@ -214,14 +214,10 @@ class _AgentConfig:
         maximum=1.0,
     )
 
-    writer_ctrl_batch_size: int = _env_int(
-        "EXECTUNNEL_AGENT_WRITER_CTRL_BATCH_SIZE",
-        256,
-        minimum=1,
-    )
-    writer_data_batch_size: int = _env_int(
-        "EXECTUNNEL_AGENT_WRITER_DATA_BATCH_SIZE",
-        64,
+
+    writer_ctrl_burst_ratio: int = _env_int(
+        "EXECTUNNEL_AGENT_WRITER_CTRL_BURST_RATIO",
+        8,
         minimum=1,
     )
     writer_ctrl_poll_secs: float = _env_float(
@@ -272,9 +268,9 @@ class _AgentConfig:
         0.01,
         minimum=0.001,
     )
-    half_close_deadline_secs: float = _env_float(
-        "EXECTUNNEL_AGENT_HALF_CLOSE_DEADLINE_SECS",
-        30.0,
+    half_close_idle_deadline_secs: float = _env_float(
+        "EXECTUNNEL_AGENT_HALF_CLOSE_IDLE_DEADLINE_SECS",
+        600.0,
         minimum=0.0,
     )
     send_writable_timeout_secs: float = _env_float(
@@ -736,7 +732,7 @@ class _FaultTolerantStdout:
         try:
             return self._inner.write(s)
         except (OSError, ValueError):
-            self._dead.set()
+            self.mark_dead()
             return 0
 
     def flush(self) -> None:
@@ -746,7 +742,7 @@ class _FaultTolerantStdout:
         try:
             self._inner.flush()
         except (OSError, ValueError):
-            self._dead.set()
+            self.mark_dead()
 
     @property
     def is_dead(self) -> bool:
@@ -754,6 +750,13 @@ class _FaultTolerantStdout:
 
     def mark_dead(self) -> None:
         self._dead.set()
+        try:
+            _log("error", "stdout dead; agent self-exiting (code 2)")
+        except Exception:  # noqa: BLE001
+            # _log itself routes through the dead writer in some
+            # paths — never let logging block the exit.
+            pass
+        os._exit(2)
 
 
 class _FrameWriter:
@@ -900,58 +903,60 @@ class _FrameWriter:
                 return
 
             saw_activity = False
+            burst_cap = CONFIG.writer_ctrl_burst_ratio
 
             try:
-                item = self._ctrl.get(timeout=CONFIG.writer_ctrl_poll_secs)
+                first_ctrl: object | None = self._ctrl.get(
+                    timeout=CONFIG.writer_ctrl_poll_secs
+                )
             except queue.Empty:
-                item = None
+                first_ctrl = None
 
-            ctrl_processed = 0
-            while item is not None and ctrl_processed < CONFIG.writer_ctrl_batch_size:
-                if item is self._STOP:
+            ctrl_drained = 0
+            ctrl_item = first_ctrl
+            while ctrl_item is not None and ctrl_drained < burst_cap:
+                if ctrl_item is self._STOP:
                     self._drain_remaining()
                     return
 
-                if isinstance(item, str):
-                    if not self._write_line(item):
+                if isinstance(ctrl_item, str):
+                    if not self._write_line(ctrl_item):
                         return
                     saw_activity = True
 
-                ctrl_processed += 1
-                if ctrl_processed >= CONFIG.writer_ctrl_batch_size:
-                    item = None
+                ctrl_drained += 1
+                if ctrl_drained >= burst_cap:
                     break
 
                 try:
-                    item = self._ctrl.get_nowait()
+                    ctrl_item = self._ctrl.get_nowait()
                 except queue.Empty:
-                    item = None
+                    ctrl_item = None
 
-            data_processed = 0
-            while data_processed < CONFIG.writer_data_batch_size:
-                if self._out.is_dead:
-                    return
-
+            # Drain at most one data frame per cycle so a steady ctrl
+            # stream cannot indefinitely block data progress.
+            if not self._out.is_dead:
                 try:
-                    d = self._data.get_nowait()
+                    data_item: object | None = self._data.get_nowait()
                 except queue.Empty:
-                    break
+                    data_item = None
 
-                if d is self._STOP:
+                if data_item is self._STOP:
                     self._ctrl.put(self._STOP)
-                    break
-
-                if isinstance(d, str):
-                    if not self._write_line(d):
+                elif isinstance(data_item, str):
+                    if not self._write_line(data_item):
                         return
                     saw_activity = True
-
-                data_processed += 1
 
             telemetry = self._pop_telemetry()
             if telemetry is not None and not self._out.is_dead:
                 if not self._write_line(telemetry):
                     return
+                saw_activity = True
+
+            # LIVENESS is the absolute last step of the cycle so any work
+            # done above naturally suppresses it through ``_last_tx_at``.
+            if not saw_activity and self._maybe_emit_liveness():
                 saw_activity = True
 
             if saw_activity:
@@ -1288,7 +1293,12 @@ class TcpConnectionWorker:
             self._close_pipe()
 
             if established:
-                _emit_ctrl(_make_frame("CONN_CLOSE", cid))
+                hard_abort = self._aborted.is_set() or self._saturated
+                close_frame = _make_frame("CONN_CLOSE", cid)
+                if hard_abort:
+                    _emit_ctrl(close_frame)
+                else:
+                    _emit_data(close_frame)
 
             self._invoke_on_close()
 
@@ -1298,7 +1308,7 @@ class TcpConnectionWorker:
 
     def _io_loop(self, sock: socket.socket, cid: str) -> None:
         local_shut = False
-        local_shut_deadline: float | None = None
+        last_recv_at = time.monotonic()
 
         while (
             not self._aborted.is_set()
@@ -1309,6 +1319,10 @@ class TcpConnectionWorker:
             if not _stdout_backpressure_active():
                 read_fds.append(sock)
 
+            # Idle wait at the top of the cycle: poll the ctrl queue
+            # blocking, since SimpleQueue is the only queue with a
+            # timeout-able get().  If a ctrl frame arrives we use it as
+            # the seed of the ctrl burst; if not we move on to data.
             try:
                 readable, _, errored = select.select(
                     read_fds,
@@ -1337,6 +1351,7 @@ class TcpConnectionWorker:
                 if chunk == b"":
                     remote_closed = True
                 elif chunk is not None:
+                    last_recv_at = time.monotonic()
                     _emit_data(_make_frame("DATA", cid, _b64encode(chunk)))
 
             if self._notify_r in readable:
@@ -1363,17 +1378,19 @@ class TcpConnectionWorker:
 
                 if not still_pending:
                     local_shut = True
-                    local_shut_deadline = (
-                        time.monotonic() + CONFIG.half_close_deadline_secs
-                    )
+                    # Reset the recv-idle baseline at the moment we
+                    # half-close so the recv-idle deadline measures
+                    # silence *after* shutdown(WR).
+                    last_recv_at = time.monotonic()
 
                     with contextlib.suppress(OSError):
                         sock.shutdown(socket.SHUT_WR)
 
             if (
                 local_shut
-                and local_shut_deadline is not None
-                and time.monotonic() >= local_shut_deadline
+                and CONFIG.half_close_idle_deadline_secs > 0
+                and time.monotonic() - last_recv_at
+                >= CONFIG.half_close_idle_deadline_secs
             ):
                 break
 
@@ -1579,7 +1596,7 @@ class UdpFlowWorker:
                 self._inbound_bytes = 0
 
             if not close_frame_emitted:
-                _emit_ctrl(_make_frame("UDP_CLOSE", fid))
+                _emit_data(_make_frame("UDP_CLOSE", fid))
 
             self._invoke_on_close()
 
