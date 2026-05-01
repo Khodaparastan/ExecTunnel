@@ -257,3 +257,53 @@ class Defaults:
 
     # Metrics reporting interval.
     METRICS_REPORT_INTERVAL_SECS: ClassVar[float] = 60.0
+
+    # Liveness
+
+    # Cadence at which the agent is expected to emit a LIVENESS frame when
+    # idle.
+    LIVENESS_INTERVAL_SECS: ClassVar[float] = 5.0
+
+    # Maximum permitted RX silence before the client triggers reconnect
+    RX_LIVENESS_TIMEOUT_SECS: ClassVar[float] = 15.0
+
+    # Wake interval of the RX-liveness watchdog task (half the cadence so the
+    # watchdog observes a stale ``last_rx_at`` within at most one cycle).
+    RX_LIVENESS_CHECK_INTERVAL_SECS: ClassVar[float] = 2.5
+
+
+
+
+    # ── Sender interleaving (architectural hardening pass — Finding 10) ───────
+
+    # Number of control frames the WebSocket sender drains per data frame in
+    # one scheduling cycle.  Replaces strict ctrl-over-data priority with
+    # weighted interleaving so a control-frame burst (e.g. CONN_OPEN storm,
+    # saturation ERROR+CONN_CLOSE pairs) cannot starve the data path.
+    # Within each queue FIFO ordering is preserved; only cross-queue ordering
+    # is relaxed.
+    WS_SEND_CTRL_BURST_RATIO: ClassVar[int] = 8
+
+    # ── Bootstrap upload tuning (deferred-brief polish wave — Finding 8) ──────
+
+    # Synchronous fence cadence during shell-upload of the agent binary.
+    # Combined with the larger ``BOOTSTRAP_CHUNK_SIZE_CHARS`` (4096) this
+    # yields ~64× fewer fence round-trips for a Go agent upload.
+    UPLOAD_FENCE_EVERY_CHUNKS: ClassVar[int] = 64
+
+    # ── UDP active-flow cap (deferred-brief polish wave — Finding 12) ─────────
+
+    # Per UDP_ASSOCIATE session, maximum number of simultaneously open UDP
+    # flows keyed by ``(dst_host, dst_port)``.  When exceeded the LRU flow
+    # is force-closed; eviction is logged at WARNING level and surfaced via
+    # the ``udp.flow.evicted_over_cap`` counter and the ``udp.flow.active``
+    # gauge.
+    UDP_ACTIVE_FLOWS_CAP: ClassVar[int] = 256
+
+    # ── Bootstrap stash deque (deferred-brief polish wave — Finding 19) ───────
+
+    # Maximum number of pre-AGENT_READY stdout lines retained for diagnostic
+    # error context.  Raised from 256 → 1024 to defend against pathological
+    # PS1 / fence-output volumes that could otherwise evict ``AGENT_READY``
+    # itself before the bootstrapper sees it.
+    BOOTSTRAP_MAX_STASH_LINES: ClassVar[int] = 1_024
