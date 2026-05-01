@@ -57,32 +57,6 @@ from ._sender import KeepaliveLoop, WsSender
 from ._state import PendingConnect
 from ._types import AgentStatsCallable
 
-
-class _AgentActivity:
-    """Tracks the timestamp of the most recent inbound frame from the agent.
-
-    Used by :class:`~exectunnel.session._dispatcher.RequestDispatcher` to
-    suppress forced reconnects driven by ACK timeouts when the agent is
-    still actively pushing data — that pattern is tunnel congestion, not
-    a wedged agent.
-    """
-
-    __slots__ = ("_last_rx_at",)
-
-    def __init__(self) -> None:
-        self._last_rx_at: float = 0.0
-
-    def mark_rx(self) -> None:
-        """Record that an inbound chunk has just been received."""
-        self._last_rx_at = asyncio.get_running_loop().time()
-
-    def recently_active(self, window_secs: float) -> bool:
-        """Return ``True`` if a frame was received within *window_secs*."""
-        if self._last_rx_at <= 0.0:
-            return False
-        return asyncio.get_running_loop().time() - self._last_rx_at <= window_secs
-
-
 if TYPE_CHECKING:
     from ._dns import DnsForwarder
 
@@ -158,7 +132,7 @@ class TunnelSession:
         "_sender",
         "_dispatcher",
         "_on_agent_stats",
-        "_agent_activity",
+        "_last_rx_at",
     )
 
     def __init__(self, session_cfg: SessionConfig, tun_cfg: TunnelConfig) -> None:
@@ -176,7 +150,13 @@ class TunnelSession:
 
         self._sender: WsSender | None = None
         self._dispatcher: RequestDispatcher | None = None
-        self._agent_activity: _AgentActivity = _AgentActivity()
+        # RX-liveness timestamp — refreshed on every inbound WebSocket chunk
+        # by the receiver via :meth:`_mark_agent_rx`.  Consumed by the RX
+        # liveness watchdog.
+        # Stored in monotonic-clock seconds; ``0.0`` means "no frame received
+        # yet on this session" — the watchdog initialises it to a real value
+        # at session start.
+        self._last_rx_at: float = 0.0
 
     def set_agent_stats_listener(self, callback: AgentStatsCallable | None) -> None:
         """Register or clear a listener for agent-emitted STATS snapshots.
@@ -441,6 +421,68 @@ class TunnelSession:
                 exc_info=True,
             )
 
+    def _mark_agent_rx(self) -> None:
+        """Refresh the RX-liveness timestamp on every inbound WebSocket chunk.
+
+        Wired into :class:`~exectunnel.session._receiver.FrameReceiver` via
+        the ``mark_agent_rx`` parameter; consumed by
+        :meth:`_rx_liveness_watchdog`.  Uses :func:`time.monotonic` so the
+        timestamp is unaffected by wall-clock changes.
+
+        Replaces the previous ``_AgentActivity`` indirection that fed the
+        dispatcher's removed ACK-health heuristic.
+        """
+        self._last_rx_at = time.monotonic()
+
+    async def _rx_liveness_watchdog(self) -> None:
+        """Reconnect if no inbound frame is observed for too long.
+
+        The watchdog backs the *third* reconnect-contract trigger
+        (``inbound_liveness_timeout``, see ``CC-3``).  Combined with the
+        agent's ``LIVENESS`` heartbeat it makes "WebSocket alive ⇒ tunnel alive" a
+        trustworthy invariant: the agent emits LIVENESS at most every
+        ``LIVENESS_INTERVAL_SECS`` of stdout-write idle time, so any
+        truly silent agent is detected within
+        ``RX_LIVENESS_TIMEOUT_SECS`` (default 15 s).
+
+        On detection the watchdog raises a
+        :class:`~exectunnel.exceptions.ConnectionClosedError` whose
+        ``close_reason`` is ``inbound_liveness_timeout`` so the
+        ``_run_tasks`` first-exception-wins ladder propagates it through
+        trigger #3 of the contract.
+        """
+        # Seed with the current monotonic clock so a freshly-started
+        # session is born "active" and the watchdog cannot fire during the
+        # bootstrap → first-frame window.
+        self._last_rx_at = time.monotonic()
+
+        check_interval = Defaults.RX_LIVENESS_CHECK_INTERVAL_SECS
+        timeout = Defaults.RX_LIVENESS_TIMEOUT_SECS
+
+        while True:
+            await asyncio.sleep(check_interval)
+            if self._ws_closed.is_set():
+                return
+            elapsed = time.monotonic() - self._last_rx_at
+            if elapsed >= timeout:
+                metrics_inc("session.rx_liveness.timeout")
+                logger.error(
+                    "RX-liveness watchdog: no inbound frame for %.1fs "
+                    "(threshold=%.1fs); forcing reconnect",
+                    elapsed,
+                    timeout,
+                )
+                raise ConnectionClosedError(
+                    "Inbound liveness watchdog timeout — agent has gone "
+                    "silent.",
+                    details={
+                        "close_code": Defaults.WS_CLOSE_CODE_UNHEALTHY,
+                        "close_reason": "inbound_liveness_timeout",
+                        "elapsed_secs": round(elapsed, 3),
+                        "timeout_secs": timeout,
+                    },
+                )
+
     async def _clear_session_state(self) -> None:
         """Abort all per-session state before a new session starts.
 
@@ -537,10 +579,13 @@ class TunnelSession:
                 bootstrapper = AgentBootstrapper(ws, self._cfg, self._tun)
                 await bootstrapper.run()
 
-            # Reset the activity tracker on every (re)connect so a stale
-            # timestamp from a previous session can never suppress an early
-            # health-reconnect on the new tunnel.
-            self._agent_activity = _AgentActivity()
+            # Reset the RX-liveness timestamp on every (re)connect so a
+            # stale value from a previous session can never falsely satisfy
+            # the watchdog on the new tunnel.  The watchdog itself seeds a
+            # fresh ``monotonic()`` once it starts (so a session is born
+            # "active" and the watchdog cannot fire during the bootstrap
+            # → first-frame window).
+            self._last_rx_at = 0.0
 
             self._sender = WsSender(ws, self._cfg, self._ws_closed)
             self._dispatcher = RequestDispatcher(
@@ -551,10 +596,6 @@ class TunnelSession:
                 pending_connects=self._pending_connects,
                 udp_registry=self._udp_registry,
                 pre_ack_buffer_cap_bytes=self._tun.pre_ack_buffer_cap_bytes,
-                request_reconnect=self._request_reconnect,
-                agent_recently_active=lambda: self._agent_activity.recently_active(
-                    Defaults.ACK_HEALTH_ACTIVITY_GRACE_SECS
-                ),
             )
 
             self._dispatcher.reset_ack_state()
@@ -615,7 +656,7 @@ class TunnelSession:
             # dispatcher for other muxed connections (head-of-line guard).
             ws_send=self._sender.send,
             on_agent_stats=self._on_agent_stats,
-            mark_agent_rx=self._agent_activity.mark_rx,
+            mark_agent_rx=self._mark_agent_rx,
         )
 
         socks_cfg = Socks5ServerConfig(
@@ -679,8 +720,17 @@ class TunnelSession:
                     keepalive_task = asyncio.create_task(
                         keepalive.run(), name="tun-keepalive"
                     )
+                    rx_watchdog_task = asyncio.create_task(
+                        self._rx_liveness_watchdog(), name="tun-rx-watchdog"
+                    )
 
-                    all_tasks = {recv_task, send_task, socks_task, keepalive_task}
+                    all_tasks = {
+                        recv_task,
+                        send_task,
+                        socks_task,
+                        keepalive_task,
+                        rx_watchdog_task,
+                    }
 
                     try:
                         async with aspan("session.serve"):
@@ -705,6 +755,16 @@ class TunnelSession:
                                         ):
                                             # Teardown noise. Keep waiting for recv/send,
                                             # which should report the primary close cause.
+                                            continue
+
+                                        if (
+                                            task is rx_watchdog_task
+                                            and self._ws_closed.is_set()
+                                        ):
+                                            # The watchdog returns cleanly once ``ws_closed``
+                                            # is set; that is teardown noise, not a primary
+                                            # cause.  Keep waiting for the recv/send task
+                                            # that actually reports the close.
                                             continue
 
                                         if (
