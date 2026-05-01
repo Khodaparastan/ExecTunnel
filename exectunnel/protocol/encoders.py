@@ -20,6 +20,7 @@ from .constants import (
     FRAME_PREFIX,
     FRAME_SUFFIX,
     KEEPALIVE_FRAME,
+    LIVENESS_FRAME,
     MAX_TUNNEL_FRAME_CHARS,
     NO_CONN_ID_TYPES,
     NO_CONN_ID_WITH_PAYLOAD_TYPES,
@@ -38,6 +39,7 @@ __all__ = [
     "encode_data_frame",
     "encode_error_frame",
     "encode_keepalive_frame",
+    "encode_liveness_frame",
     "encode_stats_frame",
     "encode_udp_close_frame",
     "encode_udp_data_frame",
@@ -280,6 +282,22 @@ def encode_keepalive_frame() -> str:
         Newline-terminated frame string.
     """
     return KEEPALIVE_FRAME
+
+
+def encode_liveness_frame() -> str:
+    """Encode a ``LIVENESS`` frame (agent→client periodic heartbeat).
+
+    Mirror of :func:`encode_keepalive_frame` for the reverse direction.
+    The agent emits at most one LIVENESS per ``LIVENESS_INTERVAL_SECS``
+    of stdout-write idle time so that the client's RX-liveness watchdog
+    never expires while the agent is alive.  Carries no conn_id and no
+    payload — the act of receiving any inbound frame (LIVENESS or
+    otherwise) is the entire signal.
+
+    Returns:
+        Newline-terminated frame string.
+    """
+    return LIVENESS_FRAME
 
 
 def encode_stats_frame(json_payload: bytes) -> str:

@@ -32,6 +32,7 @@ __all__ = [
     "FRAME_PREFIX",
     "FRAME_SUFFIX",
     "KEEPALIVE_FRAME",
+    "LIVENESS_FRAME",
     "MAX_DATA_PAYLOAD_BYTES",
     "MAX_TUNNEL_FRAME_CHARS",
     "MAX_UDP_DATA_PAYLOAD_BYTES",
@@ -133,6 +134,14 @@ Callers that want the wire form must use
 KEEPALIVE_FRAME: Final[str] = f"{FRAME_PREFIX}KEEPALIVE{FRAME_SUFFIX}\n"
 """Pre-computed, newline-terminated KEEPALIVE frame."""
 
+LIVENESS_FRAME: Final[str] = f"{FRAME_PREFIX}LIVENESS{FRAME_SUFFIX}\n"
+"""Pre-computed, newline-terminated LIVENESS frame.
+
+Emitted only by the agent (agent → client direction) at most every
+``LIVENESS_INTERVAL_SECS`` of stdout-write idle time.  Receiving any inbound
+frame — LIVENESS or otherwise — resets the client's RX-liveness watchdog.
+"""
+
 #: Re-export of :data:`exectunnel.protocol.ids.SESSION_CONN_ID` for convenience.
 SESSION_CONN_ID: Final[str] = _SESSION_CONN_ID
 
@@ -149,6 +158,9 @@ VALID_MSG_TYPES: Final[frozenset[str]] = frozenset({
     "UDP_CLOSE",
     "ERROR",
     "KEEPALIVE",
+    # Agent → client periodic liveness frame. Carries no conn_id and no
+    # payload. See exectunnel/protocol/encoders.py::encode_liveness_frame.
+    "LIVENESS",
     # Session-scoped observability snapshot emitted by the agent. Carries a
     # base64url-JSON payload but no conn_id. See exectunnel/bench/_schema.py.
     "STATS",
@@ -158,6 +170,7 @@ VALID_MSG_TYPES: Final[frozenset[str]] = frozenset({
 NO_CONN_ID_TYPES: Final[frozenset[str]] = frozenset({
     "AGENT_READY",
     "KEEPALIVE",
+    "LIVENESS",
 })
 """Frame types that carry neither a conn_id nor a payload."""
 
