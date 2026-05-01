@@ -1,53 +1,49 @@
-"""Shared constants, mocks, and stream builders for the transport test suite."""
+"""Backwards-compatible shim — delegates to :mod:`tests._helpers`.
+
+This module pre-dates the consolidated ``tests/_helpers/`` package; it
+is kept solely so existing relative imports under
+``tests.unit.transport`` continue to work.  New code should import
+from :mod:`tests._helpers` directly::
+
+    from tests._helpers import (
+        TCP_CONN_ID,
+        UDP_FLOW_ID,
+        MockWsSend,
+        make_stream_reader,
+        make_mock_writer,
+    )
+
+The ``make_reader(*chunks)`` variadic helper has no analogue in the
+new package because variadic positional bytes are awkward to type;
+prefer ``make_stream_reader([chunk1, chunk2, ...])`` instead.
+"""
 
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
 
-TCP_CONN_ID = "c" + "a" * 24
-UDP_FLOW_ID = "u" + "b" * 24
+from tests._helpers import (
+    TCP_CONN_ID,
+    UDP_FLOW_ID,
+    MockWsSend,
+    make_mock_writer,
+)
+from tests._helpers.streams import make_stream_reader
 
-
-class MockWsSend:
-    """Records every frame sent and supports per-call side-effect injection."""
-
-    def __init__(self) -> None:
-        self.frames: list[str] = []
-        self.side_effect: Exception | None = None
-
-    async def __call__(
-        self, frame: str, *, must_queue: bool = False, control: bool = False
-    ) -> None:
-        if self.side_effect is not None:
-            raise self.side_effect
-        self.frames.append(frame)
-
-    def frames_of_type(self, msg_type: str) -> list[str]:
-        """Return all recorded frames whose type field matches ``msg_type``."""
-        return [f for f in self.frames if f":{msg_type}:" in f]
-
-    def has_frame_type(self, msg_type: str) -> bool:
-        return bool(self.frames_of_type(msg_type))
+__all__ = [
+    "TCP_CONN_ID",
+    "UDP_FLOW_ID",
+    "MockWsSend",
+    "make_mock_writer",
+    "make_reader",
+    "make_stream_reader",
+]
 
 
 def make_reader(*chunks: bytes, eof: bool = True) -> asyncio.StreamReader:
-    """Return a ``StreamReader`` pre-loaded with *chunks* and an optional EOF."""
-    reader = asyncio.StreamReader()
-    for chunk in chunks:
-        reader.feed_data(chunk)
-    if eof:
-        reader.feed_eof()
-    return reader
+    """Variadic-chunks adapter around :func:`make_stream_reader`.
 
-
-def make_mock_writer() -> MagicMock:
-    """Return a ``MagicMock`` shaped like ``asyncio.StreamWriter``."""
-    writer = MagicMock(spec=asyncio.StreamWriter)
-    writer.write = MagicMock()
-    writer.drain = AsyncMock()
-    writer.can_write_eof = MagicMock(return_value=True)
-    writer.write_eof = MagicMock()
-    writer.close = MagicMock()
-    writer.wait_closed = AsyncMock()
-    return writer
+    Kept for back-compat with the older transport tests.  Equivalent to
+    ``make_stream_reader(list(chunks), eof=eof)``.
+    """
+    return make_stream_reader(list(chunks) if chunks else b"", eof=eof)

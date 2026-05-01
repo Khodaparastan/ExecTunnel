@@ -182,7 +182,17 @@ class TestFeed:
         conn.feed(b"hello")
         assert conn._inbound.qsize() == 1
 
-    def test_post_ack_queue_full_raises_and_increments_drop_count(self, make_tcp_conn):
+    async def test_post_ack_queue_full_raises_and_increments_drop_count(
+        self, make_tcp_conn
+    ):
+        """``feed()`` must reject post-ACK overflow and tear down cleanly.
+
+        The overflow path schedules ``_cleanup`` via ``asyncio.create_task``
+        — the test must therefore run under an event loop, and must drain
+        the resulting cleanup task before returning so it does not leak
+        as an unawaited-coroutine ``RuntimeWarning`` flushed during a
+        later test.
+        """
         from exectunnel.defaults import Defaults
 
         conn = make_tcp_conn()
@@ -193,6 +203,10 @@ class TestFeed:
             conn.feed(b"overflow")
         assert exc_info.value.error_code == "transport.inbound_queue_full"
         assert conn.drop_count == 1
+        # Drain the cleanup task scheduled by the overflow path so it
+        # does not leak as an unawaited-coroutine warning.
+        if conn._cleanup_task is not None:
+            await asyncio.wait_for(conn.closed_event.wait(), timeout=2.0)
 
 
 # ── feed_async() ──────────────────────────────────────────────────────────────
