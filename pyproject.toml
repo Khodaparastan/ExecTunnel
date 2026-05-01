@@ -63,11 +63,18 @@ poetry-plugin-export = ">=1.8"
 [tool.poetry.group.dev.dependencies]
 aiohttp = "^3.13.5"
 aiohttp-socks = "^0.11.0"
+coverage = { extras = ["toml"], version = "^7.6.0" }
+hypothesis = "^6.115.0"
 mypy = "^1.19.1"
 orjson = "^3.11.8"
 pyrefly = "^0.62.0"
 pytest = "^9.0.2"
 pytest-asyncio = ">=0.24"
+pytest-cov = "^7.0.0"
+pytest-mock = "^3.14.0"
+pytest-randomly = "^3.15.0"
+pytest-timeout = "^2.3.1"
+pytest-xdist = "^3.6.1"
 ruff = "^0.15.12"
 ty = "^0.0.32"
 
@@ -79,15 +86,93 @@ mkdocs-mermaid-plugin = "^0.1.1"
 mkdocstrings = { extras = ["python"], version = "^1.0.4" }
 
 [tool.pytest.ini_options]
+minversion = "9.0"
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 log_cli = true
 log_cli_level = "WARNING"
-markers = [
-    "integration: integration-style tests",
-    "agent: black-box payload agent subprocess tests",
-    "slow: slower or stress-oriented tests",
+xfail_strict = true
+# Default per-test timeout (seconds) consumed by ``pytest-timeout`` when
+# the plugin is installed.  Declared via ``addopts`` instead of the
+# top-level ``timeout`` key so a missing plugin does not fail
+# ``--strict-config``; pytest silently ignores ``--timeout=*`` when the
+# plugin is absent.  Integration / agent tiers override locally with
+# ``@pytest.mark.timeout`` when they need longer.
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--showlocals",
+    "--tb=short",
 ]
+filterwarnings = [
+    "error",
+    # Third-party deprecation noise we cannot fix here.
+    "ignore::DeprecationWarning:websockets.*",
+    "ignore::DeprecationWarning:aiohttp.*",
+    # ``asyncio.iscoroutinefunction`` removal warnings under py3.13 from
+    # mock/coroutine helpers in ``unittest.mock``; orthogonal to our code.
+    "ignore::DeprecationWarning:unittest.mock",
+    # pytest-asyncio's own pending-deprecation chatter on py3.13.
+    "ignore::PendingDeprecationWarning:pytest_asyncio.*",
+]
+markers = [
+    "unit: focused single-module unit tests (default tier).",
+    "integration: integration-style tests; spin up subprocesses or sockets.",
+    "agent: black-box payload-agent subprocess tests.",
+    "inmemory: end-to-end Session tests that stub the WebSocket transport.",
+    "property: Hypothesis-driven property tests.",
+    "slow: slower or stress-oriented tests; usually deselected from `make test`.",
+    "ci_only: tests only meant to run in CI (e.g. heavy fuzzing seeds).",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["exectunnel"]
+omit = [
+    "exectunnel/_version.py",
+    "exectunnel/__init__.py",
+    "exectunnel/c.py",
+    "exectunnel/payload/agent.py",
+    # `cli/`is user-facing typer apps with thin glue;
+    # exercised end-to-end in integration tier, not unit-tier.
+    "exectunnel/cli/__main__.py",
+    "exectunnel/cli/_display/*",
+]
+parallel = true
+data_file = ".coverage"
+concurrency = ["thread", "multiprocessing"]
+
+[tool.coverage.report]
+precision = 1
+show_missing = true
+skip_covered = false
+skip_empty = true
+exclude_also = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@(?:abc\\.)?abstractmethod",
+    "@overload",
+    "if __name__ == .__main__.:",
+    "if 0:",
+    "if False:",
+    # Defensive impossible-state branches kept for safety.
+    "raise AssertionError",
+]
+
+[tool.coverage.paths]
+source = [
+    "exectunnel",
+    "*/site-packages/exectunnel",
+]
+
+[tool.coverage.html]
+directory = "htmlcov"
+
+[tool.coverage.xml]
+output = "coverage.xml"
 
 [tool.ruff]
 preview = true

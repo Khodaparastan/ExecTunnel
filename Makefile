@@ -100,20 +100,61 @@ run:
 	$(PYTHON) -m exectunnel.cli run
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
+# Tier matrix:
+#   make test           — full collection (unit + integration + property).
+#   make test-unit      — unit-tier only; deselects integration/agent/slow/inmemory.
+#   make test-integration — integration tier (subprocess / socket-binding tests).
+#   make test-inmemory  — in-memory Session smoke suite (no real network IO).
+#   make test-property  — Hypothesis property tests only.
+#   make test-fast      — unit tier, stop on first failure (developer inner loop).
+#   make test-cov       — full collection with coverage report (term + HTML + XML).
+#   make test-parallel  — full collection across all CPU cores via pytest-xdist.
+#
+# All targets respect the strict-config / strict-markers / -W error
+# defaults declared in pyproject.toml.
+
 .PHONY: test
-test: ## Run test suite
+test: ## Run full test collection (unit + integration + property)
 	$(PYTEST) $(TEST_DIR) -v
 
+.PHONY: test-unit
+test-unit: ## Run unit tier only (deselects integration/agent/slow/inmemory)
+	$(PYTEST) $(TEST_DIR)/unit -q \
+		-m "not integration and not agent and not slow and not inmemory"
+
+.PHONY: test-integration
+test-integration: ## Run integration tier
+	$(PYTEST) $(TEST_DIR)/integration -v -m "integration"
+
+.PHONY: test-inmemory
+test-inmemory: ## Run in-memory Session smoke suite
+	$(PYTEST) $(TEST_DIR) -v -m "inmemory"
+
+.PHONY: test-property
+test-property: ## Run Hypothesis property tests
+	$(PYTEST) $(TEST_DIR) -v -m "property"
+
+.PHONY: test-fast
+test-fast: ## Unit tier, stop on first failure (developer inner loop)
+	$(PYTEST) $(TEST_DIR)/unit -x -q \
+		-m "not integration and not agent and not slow and not inmemory"
+
 .PHONY: test-cov
-test-cov: ## Run tests with coverage report
+test-cov: ## Run tests with coverage report (term + HTML + XML)
 	$(PYTEST) $(TEST_DIR) -v \
 		--cov=$(SRC_DIR) \
 		--cov-report=term-missing \
-		--cov-report=html:htmlcov
+		--cov-report=html:htmlcov \
+		--cov-report=xml:coverage.xml \
+		-m "not integration and not agent and not slow"
 
-.PHONY: test-fast
-test-fast: ## Run tests, stop on first failure
-	$(PYTEST) $(TEST_DIR) -x -q
+.PHONY: test-parallel
+test-parallel: ## Run full collection across all CPU cores (pytest-xdist)
+	$(PYTEST) $(TEST_DIR) -q -n auto
+
+.PHONY: test-debug
+test-debug: ## Run tests verbosely with full tracebacks (--tb=long --showlocals)
+	$(PYTEST) $(TEST_DIR) -vv --tb=long --showlocals -p no:randomly
 
 # ── Build & Publish ───────────────────────────────────────────────────────────
 .PHONY: build
