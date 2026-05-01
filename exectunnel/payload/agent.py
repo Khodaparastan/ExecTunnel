@@ -214,7 +214,6 @@ class _AgentConfig:
         maximum=1.0,
     )
 
-
     writer_ctrl_burst_ratio: int = _env_int(
         "EXECTUNNEL_AGENT_WRITER_CTRL_BURST_RATIO",
         8,

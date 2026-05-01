@@ -473,8 +473,7 @@ class TunnelSession:
                     timeout,
                 )
                 raise ConnectionClosedError(
-                    "Inbound liveness watchdog timeout — agent has gone "
-                    "silent.",
+                    "Inbound liveness watchdog timeout — agent has gone silent.",
                     details={
                         "close_code": Defaults.WS_CLOSE_CODE_UNHEALTHY,
                         "close_reason": "inbound_liveness_timeout",

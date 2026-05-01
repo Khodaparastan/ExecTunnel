@@ -274,8 +274,7 @@ class Socks5ServerConfig:
                 field="udp_advertise_host",
                 value=self.udp_advertise_host,
                 expected=(
-                    "explicit reachable IP address when udp_bind_host is "
-                    "non-loopback"
+                    "explicit reachable IP address when udp_bind_host is non-loopback"
                 ),
                 hint=(
                     "When binding UDP relays to a non-loopback address, "

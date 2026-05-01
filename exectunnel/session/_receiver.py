@@ -561,9 +561,7 @@ class FrameReceiver:
             extra={"conn_id": conn_id},
         )
         try:
-            await self._notify_agent_conn_closed(
-                conn_id, "client inbound saturated"
-            )
+            await self._notify_agent_conn_closed(conn_id, "client inbound saturated")
         except Exception as exc:  # noqa: BLE001
             logger.debug(
                 "conn %s: failed to emit saturation ERROR frame: %s",

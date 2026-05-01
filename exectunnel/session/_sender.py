@@ -174,7 +174,6 @@ class WsSender:
         # Counter for the weighted-interleaving scheduler
         self._ctrl_burst_drained: int = 0
 
-
         # Shared lazy-singleton sentinel task for ``ws_closed.wait()`` —
         # mirrors :meth:`RequestDispatcher._get_ws_closed_task`.  Created
         # on first use by :meth:`_get_ws_closed_task` so ``__init__`` can
@@ -619,9 +618,7 @@ class KeepaliveLoop:
                 except TimeoutError:
                     metrics_inc("session.keepalive.sent")
                     try:
-                        await self._sender.send(
-                            self._KEEPALIVE_FRAME, control=True
-                        )
+                        await self._sender.send(self._KEEPALIVE_FRAME, control=True)
                     except CtrlBackpressureError:
                         metrics_inc("session.keepalive.dropped_backpressure")
                         logger.debug(

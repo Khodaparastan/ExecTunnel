@@ -155,14 +155,14 @@ _STTY_RAW_CMD: Final[str] = (
 # introducer byte and leave the payload in the line.
 _ECMA48_ESCAPE_RE: Final[re.Pattern[str]] = re.compile(
     r"\x1b(?:"
-    r"\[[0-?]*[ -/]*[@-~]"               # CSI
-    r"|\][^\x07\x1b]*(?:\x07|\x1b\\)"    # OSC, terminated by BEL or ST
-    r"|P[^\x1b]*\x1b\\"                  # DCS
-    r"|X[^\x1b]*\x1b\\"                  # SOS
-    r"|\^[^\x1b]*\x1b\\"                 # PM
-    r"|_[^\x1b]*\x1b\\"                  # APC
-    r"|[()*+]."                          # G0/G1/G2/G3 character-set designator
-    r"|[@-Z\\-_]"                        # generic Fe/Fp 2-byte sequence
+    r"\[[0-?]*[ -/]*[@-~]"  # CSI
+    r"|\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC, terminated by BEL or ST
+    r"|P[^\x1b]*\x1b\\"  # DCS
+    r"|X[^\x1b]*\x1b\\"  # SOS
+    r"|\^[^\x1b]*\x1b\\"  # PM
+    r"|_[^\x1b]*\x1b\\"  # APC
+    r"|[()*+]."  # G0/G1/G2/G3 character-set designator
+    r"|[@-Z\\-_]"  # generic Fe/Fp 2-byte sequence
     r")"
 )
 
@@ -193,11 +193,7 @@ def _strip_ansi(text: str) -> str:
         The line with all ECMA-48 escape sequences, ``\\r`` characters,
         and ``\\ufeff`` (BOM) characters removed.
     """
-    return (
-        _ECMA48_ESCAPE_RE.sub("", text)
-        .replace("\r", "")
-        .replace("\ufeff", "")
-    )
+    return _ECMA48_ESCAPE_RE.sub("", text).replace("\r", "").replace("\ufeff", "")
 
 
 def _redact_url_for_log(url: str) -> str:

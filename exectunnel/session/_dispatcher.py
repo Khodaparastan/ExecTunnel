@@ -1084,8 +1084,7 @@ class RequestDispatcher:
         )
 
     def reset_ack_state(self) -> None:
-        """Reset per-stream ACK counters at session start / reconnect.
-        """
+        """Reset per-stream ACK counters at session start / reconnect."""
         self._ack_failure_count = 0
         self._ack_failure_suppressed = 0
 
