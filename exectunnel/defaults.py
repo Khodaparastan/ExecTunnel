@@ -147,11 +147,7 @@ class Defaults:
     BOOTSTRAP_DIAG_MAX_LINES: ClassVar[int] = 20
 
     # Base64 upload chunk size for shell delivery.
-    #
-    # 512 chars keeps each printf command small enough for busybox ash, raw PTY
-    # mode, and conservative exec proxies while cutting command count versus
-    # 200-char chunks.
-    BOOTSTRAP_CHUNK_SIZE_CHARS: ClassVar[int] = 512
+    BOOTSTRAP_CHUNK_SIZE_CHARS: ClassVar[int] = 4_096
 
     # Restricted-environment safe default.
     #

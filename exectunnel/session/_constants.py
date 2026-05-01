@@ -8,6 +8,8 @@ live here.  Import-only module: no classes, no functions, no side effects.
 import re
 from typing import Final
 
+from exectunnel.defaults import Defaults
+
 # ── Bootstrap: fence / marker protocol ───────────────────────────────────────
 
 FENCE_PREFIX: Final[str] = "EXECTUNNEL_FENCE"
@@ -40,8 +42,9 @@ MIN_FENCE_TIMEOUT_SECS: Final[float] = 2.0
 
 # ── Bootstrap: buffering ──────────────────────────────────────────────────────
 
-MAX_STASH_LINES: Final[int] = 256
-"""Maximum lines buffered in the bootstrapper stash deque."""
+MAX_STASH_LINES: Final[int] = Defaults.BOOTSTRAP_MAX_STASH_LINES
+"""Maximum lines buffered in the bootstrapper stash deque.
+"""
 
 # ── Bootstrap: Python interpreter candidates ─────────────────────────────────
 
@@ -58,8 +61,9 @@ Includes ``python3.13`` first to match the py313+ deployment target.
 """
 MIN_REMOTE_PYTHON_VERSION: Final[tuple[int, int]] = (3, 11)
 """Minimum Python version required by the Python pod agent."""
-UPLOAD_FENCE_EVERY_CHUNKS: Final[int] = 8
-"""Fence every N upload chunks to avoid overrunning raw PTY input buffers."""
+UPLOAD_FENCE_EVERY_CHUNKS: Final[int] = Defaults.UPLOAD_FENCE_EVERY_CHUNKS
+"""Fence every N upload chunks to avoid overrunning raw PTY input buffers.
+"""
 
 # ── WebSocket decode ──────────────────────────────────────────────────────────
 
