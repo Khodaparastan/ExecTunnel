@@ -87,6 +87,22 @@ def _is_loopback_host(host: str) -> bool:
         return False
 
 
+def _resolves_to_unspecified(host: str) -> bool:
+    """Whether *host* parses as the IPv4 / IPv6 unspecified address.
+
+    Args:
+        host: Candidate IP literal or hostname.
+
+    Returns:
+        ``True`` when *host* is exactly ``0.0.0.0`` or ``::`` (or any
+        equivalent IPv6 form), ``False`` otherwise.
+    """
+    try:
+        return ipaddress.ip_address(host).is_unspecified
+    except ValueError:
+        return False
+
+
 @dataclass(frozen=True, slots=True)
 class Socks5ServerConfig:
     """Immutable configuration for :class:`~exectunnel.proxy.server.Socks5Server`.
@@ -248,6 +264,29 @@ class Socks5ServerConfig:
                 "authenticated load balancer."
             ),
         )
+
+        if not _is_loopback_host(self.udp_bind_host) and (
+            self.udp_advertise_host is None
+            or _resolves_to_unspecified(self.udp_advertise_host)
+        ):
+            _require(
+                False,
+                field="udp_advertise_host",
+                value=self.udp_advertise_host,
+                expected=(
+                    "explicit reachable IP address when udp_bind_host is "
+                    "non-loopback"
+                ),
+                hint=(
+                    "When binding UDP relays to a non-loopback address, "
+                    "set udp_advertise_host to the concrete IP that the "
+                    "SOCKS5 client should use to reach the relay.  Leaving "
+                    "it unset (or 0.0.0.0/::) opens a UDP binding race: "
+                    "RFC 1928 §6 lets clients signal `0.0.0.0` for an "
+                    "unknown UDP source, and any sender on the network "
+                    "could then win the relay's first-datagram bind."
+                ),
+            )
 
         effective_udp_advertise_host = self.effective_udp_advertise_host
         try:

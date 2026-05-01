@@ -75,8 +75,13 @@ WS_DECODE_ERRORS: Final[str] = "replace"
 HOST_SEMAPHORE_CAPACITY: Final[int] = 4_096
 """Maximum number of per-host semaphore entries in ``_HostGateRegistry``."""
 
-UDP_ACTIVE_FLOWS_CAP: Final[int] = 256
-"""Maximum simultaneous UDP flows per ``UDP_ASSOCIATE`` session."""
+UDP_ACTIVE_FLOWS_CAP: Final[int] = Defaults.UDP_ACTIVE_FLOWS_CAP
+"""Maximum simultaneous UDP flows per ``UDP_ASSOCIATE`` session.
+
+Now sourced from :class:`Defaults` so operators can tune via the
+``EXECTUNNEL_UDP_ACTIVE_FLOWS_CAP`` environment variable when the UDP
+fan-out exceeds the default 256
+"""
 
 PIPE_WRITER_CLOSE_TIMEOUT_SECS: Final[float] = 5.0
 """Seconds to wait for a ``StreamWriter.wait_closed()`` call in ``_pipe``."""

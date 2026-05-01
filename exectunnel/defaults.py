@@ -111,10 +111,7 @@ class Defaults:
 
     # Per-connection queue capacity for decoded DATA frames waiting to be written
     # to the local TCP socket.
-    #
-    # With 8 KiB chunks, 128 items is about 1 MiB per connection before local
-    # backpressure/teardown policy engages.
-    TCP_INBOUND_QUEUE_CAP: ClassVar[int] = 128
+    TCP_INBOUND_QUEUE_CAP: ClassVar[int] = 1_024
 
     # ── SOCKS5 handshake / listener ───────────────────────────────────────────
 
