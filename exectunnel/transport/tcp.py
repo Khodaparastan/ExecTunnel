@@ -33,6 +33,7 @@ from typing import Final
 from exectunnel.defaults import Defaults
 from exectunnel.exceptions import (
     ConnectionClosedError,
+    PreAckBufferOverflowError,
     TransportError,
     WebSocketSendTimeoutError,
 )
@@ -373,9 +374,11 @@ class TcpConnection:
             data: Raw bytes decoded from a ``DATA`` frame payload.
 
         Raises:
-            TransportError: ``error_code=`` ``"transport.pre_ack_buffer_overflow"``
-                if the buffer would overflow. Cleanup is scheduled before
-                the exception is raised.
+            PreAckBufferOverflowError: If the buffer would overflow.
+                Cleanup is scheduled before the exception is raised.
+                The exception is a :class:`TransportError` subclass with
+                ``error_code == "transport.pre_ack_buffer_overflow"`` for
+                backwards-compatible string-based dispatch
         """
         pending = self._pre_ack_buffer_bytes + len(data)
         if pending > self._pre_ack_buffer_cap_bytes:
@@ -389,12 +392,12 @@ class TcpConnection:
                 extra={"conn_id": self._id},
             )
             self._schedule_cleanup()
-            raise TransportError(
+            raise PreAckBufferOverflowError(
                 f"conn {self._id!r}: pre-ACK buffer full; connection closed.",
-                error_code="transport.pre_ack_buffer_overflow",
                 details={
                     "conn_id": self._id,
-                    "cap_bytes": self._pre_ack_buffer_cap_bytes,
+                    "buffer_cap": self._pre_ack_buffer_cap_bytes,
+                    "incoming_bytes": len(data),
                     "attempted_bytes": pending,
                 },
                 hint=(
@@ -646,7 +649,6 @@ class TcpConnection:
             metrics_inc(
                 "tcp.connection.downstream.bytes",
                 value=batch_bytes,
-                conn_id=self._id,
             )
             return False
 
@@ -697,7 +699,6 @@ class TcpConnection:
             metrics_inc(
                 "tcp.connection.downstream.bytes",
                 value=len(chunk),
-                conn_id=self._id,
             )
             return False
 

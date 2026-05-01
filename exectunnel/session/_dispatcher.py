@@ -53,7 +53,6 @@ from ._constants import (
 from ._lru import LruDict
 from ._routing import is_host_excluded
 from ._state import AckStatus, PendingConnect
-from ._types import AgentRecentlyActiveCallable, ReconnectCallable
 from ._udp_socket import make_udp_socket
 
 logger = logging.getLogger(__name__)
@@ -200,13 +199,6 @@ class RequestDispatcher:
         "_connect_failures_by_host",
         "_ack_failure_count",
         "_ack_failure_suppressed",
-        "_ack_timeout_window_start",
-        "_ack_timeout_window_count",
-        "_ack_agent_error_window_start",
-        "_ack_agent_error_window_count",
-        "_ack_reconnect_requested",
-        "_request_reconnect",
-        "_agent_recently_active",
         "_ws_closed_task",
     )
 
@@ -219,8 +211,6 @@ class RequestDispatcher:
         pending_connects: dict[str, PendingConnect],
         udp_registry: dict[str, UdpFlow],
         pre_ack_buffer_cap_bytes: int,
-        request_reconnect: ReconnectCallable | None = None,
-        agent_recently_active: AgentRecentlyActiveCallable | None = None,
     ) -> None:
         self._tun = tun_cfg
         self._ws_send = ws_send
@@ -249,13 +239,6 @@ class RequestDispatcher:
 
         self._ack_failure_count: int = 0
         self._ack_failure_suppressed: int = 0
-        self._ack_timeout_window_start: float | None = None
-        self._ack_timeout_window_count: int = 0
-        self._ack_agent_error_window_start: float | None = None
-        self._ack_agent_error_window_count: int = 0
-        self._ack_reconnect_requested: bool = False
-        self._request_reconnect = request_reconnect
-        self._agent_recently_active = agent_recently_active
 
         # Created lazily on first use by :meth:`_get_ws_closed_task` so that
         # ``__init__`` can be called outside a running event loop.
@@ -459,7 +442,6 @@ class RequestDispatcher:
                     )
                     metrics_inc(
                         "tunnel.conn_open",
-                        conn_id=conn_id,
                         host=host,
                         port=port,
                     )
@@ -500,7 +482,7 @@ class RequestDispatcher:
                     await req.send_reply_error(reply)
                 return
 
-            metrics_inc("tunnel.conn_ack.ok", conn_id=conn_id, host=host, port=port)
+            metrics_inc("tunnel.conn_ack.ok", host=host, port=port)
 
             try:
                 await req.send_reply_success()
@@ -571,7 +553,6 @@ class RequestDispatcher:
                 self._record_connect_failure(host, AckStatus.LIBRARY_ERROR, reply)
             metrics_inc(
                 "tunnel.conn.error",
-                conn_id=conn_id or "",
                 host=host,
                 port=port,
                 error=exc.error_code.replace(".", "_"),
@@ -619,7 +600,6 @@ class RequestDispatcher:
                 self._record_connect_failure(host, AckStatus.UNEXPECTED_ERROR, reply)
             metrics_inc(
                 "tunnel.conn.error",
-                conn_id=conn_id or "",
                 host=host,
                 port=port,
                 error="unexpected",
@@ -687,7 +667,6 @@ class RequestDispatcher:
         except TimeoutError:
             metrics_inc(
                 "tunnel.conn_ack.timeout",
-                conn_id=conn_id,
                 host=pending.host,
                 port=pending.port,
             )
@@ -1060,7 +1039,7 @@ class RequestDispatcher:
         host: str = "",
         port: int = 0,
     ) -> None:
-        """Record an ACK failure and trigger reconnect if the threshold is exceeded.
+        """Record an ACK failure as a **per-stream** event only.
 
         Args:
             conn_id: Connection ID for metrics tags.
@@ -1071,12 +1050,11 @@ class RequestDispatcher:
         # WS_CLOSED ACK failures are pure teardown noise — the WebSocket has
         # already been declared closed and any in-flight CONN_OPEN naturally
         # cannot ACK.  Suppress them at the source instead of logging each
-        # one and never let them feed the health-reconnect counters.
+        # one.
         if reason == AckStatus.WS_CLOSED:
             self._ack_failure_suppressed += 1
             metrics_inc(
                 "tunnel.conn_ack.failed_after_ws_closed",
-                conn_id=conn_id,
                 host=host,
                 port=port,
             )
@@ -1085,43 +1063,14 @@ class RequestDispatcher:
         self._ack_failure_count += 1
         metrics_inc(
             "tunnel.conn_ack.failed",
-            conn_id=conn_id,
             reason=reason.value,
             host=host,
             port=port,
         )
 
-        if reason == AckStatus.TIMEOUT:
-            now = asyncio.get_running_loop().time()
-            if (
-                self._ack_timeout_window_start is None
-                or now - self._ack_timeout_window_start
-                > self._tun.ack_timeout_window_secs
-            ):
-                self._ack_timeout_window_start = now
-                self._ack_timeout_window_count = 0
-            self._ack_timeout_window_count += 1
-
-        if reason == AckStatus.AGENT_ERROR:
-            now = asyncio.get_running_loop().time()
-            if (
-                self._ack_agent_error_window_start is None
-                or now - self._ack_agent_error_window_start
-                > self._tun.ack_timeout_window_secs
-            ):
-                self._ack_agent_error_window_start = now
-                self._ack_agent_error_window_count = 0
-            self._ack_agent_error_window_count += 1
-
-        should_log = (
-            self._ack_failure_count == 1
-            or self._ack_failure_count % self._tun.ack_timeout_warn_every == 0
-            or reason not in (AckStatus.TIMEOUT, AckStatus.AGENT_ERROR)
-        )
-        if not should_log:
-            self._ack_failure_suppressed += 1
-            return
-
+        # Log every TIMEOUT/AGENT_ERROR; bursts are deduplicated naturally
+        # because the per-stream caller only ever calls us once per stream.
+        # Non-TIMEOUT/AGENT_ERROR reasons are always logged at WARNING.
         suppressed = self._ack_failure_suppressed
         self._ack_failure_suppressed = 0
         extra_msg = f", suppressed={suppressed}" if suppressed else ""
@@ -1134,54 +1083,9 @@ class RequestDispatcher:
             extra_msg,
         )
 
-        # Only ACK timeouts can trigger forced reconnect.  AGENT_ERROR means
-        # the agent is alive enough to report errors per-connection — that
-        # is not a session-health signal and must never tear the tunnel down.
-        if reason != AckStatus.TIMEOUT:
-            return
-        if self._ack_reconnect_requested:
-            return
-
-        window_count = self._ack_timeout_window_count
-        if window_count < self._tun.ack_timeout_reconnect_threshold:
-            return
-
-        # If the agent has emitted any inbound frame within the configured
-        # grace window, the tunnel is still alive and what we are observing
-        # is congestion / stdout head-of-line blocking, not a wedged agent.
-        # Suppress the forced reconnect in that case.
-        if self._agent_recently_active is not None and self._agent_recently_active():
-            metrics_inc("tunnel.conn_ack.reconnect_suppressed_agent_active")
-            logger.warning(
-                "agent ACK timeout threshold reached (%d within %.0fs), but "
-                "agent is still sending frames; suppressing forced reconnect "
-                "and treating this as tunnel congestion",
-                window_count,
-                self._tun.ack_timeout_window_secs,
-            )
-            return
-
-        self._ack_reconnect_requested = True
-        metrics_inc("tunnel.conn_ack.reconnect_triggered")
-        logger.error(
-            "agent appears unhealthy: %d ACK timeouts within %.0fs and no "
-            "recent agent activity; forcing reconnect",
-            window_count,
-            self._tun.ack_timeout_window_secs,
-        )
-        if self._request_reconnect is not None:
-            asyncio.create_task(
-                self._request_reconnect(f"ack_health:{reason.value}"),
-                name="request-reconnect",
-            )
-
     def reset_ack_state(self) -> None:
-        """Reset all ACK failure tracking state after a successful bootstrap."""
-        self._ack_reconnect_requested = False
-        self._ack_timeout_window_start = None
-        self._ack_timeout_window_count = 0
-        self._ack_agent_error_window_start = None
-        self._ack_agent_error_window_count = 0
+        """Reset per-stream ACK counters at session start / reconnect.
+        """
         self._ack_failure_count = 0
         self._ack_failure_suppressed = 0
 
