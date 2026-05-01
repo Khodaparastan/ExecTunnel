@@ -256,9 +256,6 @@ class TunnelConfig:
     exclude: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = field(
         default_factory=lambda: tuple(get_default_exclusion_networks())
     )
-    ack_timeout_warn_every: int = Defaults.ACK_TIMEOUT_WARN_EVERY
-    ack_timeout_window_secs: float = Defaults.ACK_TIMEOUT_WINDOW_SECS
-    ack_timeout_reconnect_threshold: int = Defaults.ACK_TIMEOUT_RECONNECT_THRESHOLD
     connect_max_pending: int = Defaults.CONNECT_MAX_PENDING
     connect_max_pending_per_host: int = Defaults.CONNECT_MAX_PENDING_PER_HOST
     pre_ack_buffer_cap_bytes: int = Defaults.PRE_ACK_BUFFER_CAP_BYTES
