@@ -76,31 +76,6 @@ class Defaults:
 
     # ── TCP connection / ACK hardening ────────────────────────────────────────
 
-    # Warning cadence for ACK failures. Code should suppress WS_CLOSED storms
-    # separately; this value applies to real pre-close ACK failures.
-    ACK_TIMEOUT_WARN_EVERY: ClassVar[int] = 10
-
-    # Sliding window for timeout-burst detection.
-    #
-    # A shorter 30s window avoids carrying stale transient timeouts forward for
-    # two minutes. This pairs with threshold 20 below.
-    ACK_TIMEOUT_WINDOW_SECS: ClassVar[float] = 30.0
-
-    # Number of ACK timeout or agent-error events inside the sliding window
-    # before forcing reconnect.
-    #
-    # Five was too aggressive for browser/connect storms over exec/WebSocket.
-    # Twenty still detects a wedged agent quickly while avoiding false positives
-    # during momentary stdout/data head-of-line blocking.
-    ACK_TIMEOUT_RECONNECT_THRESHOLD: ClassVar[int] = 20
-
-    # Recent-activity grace window for ACK-timeout health reconnect.
-    #
-    # If the agent has sent any frame within this many seconds, do not force a
-    # session reconnect on accumulated ACK timeouts — the agent is still alive
-    # and what we are seeing is tunnel congestion, not a wedged agent.
-    ACK_HEALTH_ACTIVITY_GRACE_SECS: ClassVar[float] = 10.0
-
     # Global cap on simultaneous in-flight CONN_OPEN frames.
     #
     # Kubernetes exec/WebSocket is a single multiplexed pipe; 128+ pending opens
@@ -274,7 +249,7 @@ class Defaults:
 
 
 
-    # ── Sender interleaving (architectural hardening pass — Finding 10) ───────
+    # Sender interleaving
 
     # Number of control frames the WebSocket sender drains per data frame in
     # one scheduling cycle.  Replaces strict ctrl-over-data priority with
