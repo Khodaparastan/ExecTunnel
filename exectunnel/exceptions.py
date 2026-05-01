@@ -353,6 +353,44 @@ class ReconnectExhaustedError(TransportError):
     default_retryable = False
 
 
+class CtrlBackpressureError(TransportError):
+    """
+    The WebSocket sender's control queue is full and could not accept a new
+    frame.  This is a per-call backpressure signal — the session is **not**
+    being torn down.  Callers must decide whether to fail the per-stream
+    operation (e.g. reply ``HOST_UNREACHABLE`` to the SOCKS5 client) or
+    swallow the error (best-effort frames such as ``KEEPALIVE``).
+
+    Extra ``details`` keys (all optional)
+    ──────────────────────────────────────
+    ``control_queue_cap`` – configured capacity of the control queue.
+    ``caller``            – identifier of the caller (``connect``,
+                            ``saturation``, ``keepalive`` …) for metrics.
+    """
+
+    default_error_code = "transport.ctrl_backpressure"
+    default_retryable = False
+
+
+class PreAckBufferOverflowError(TransportError):
+    """
+    Inbound ``DATA`` frames arrived for a connection whose ``CONN_ACK`` is
+    still pending and the per-connection pre-ACK buffer would be exceeded.
+    The receiver translates this into a per-stream
+    ``AckStatus.PRE_ACK_OVERFLOW`` so the SOCKS5 client sees a clean
+    ``HOST_UNREACHABLE`` reply.
+
+    Extra ``details`` keys (all optional)
+    ──────────────────────────────────────
+    ``conn_id``         – the connection identifier.
+    ``buffer_cap``      – configured pre-ACK buffer capacity in bytes.
+    ``incoming_bytes``  – size of the chunk that triggered the overflow.
+    """
+
+    default_error_code = "transport.pre_ack_buffer_overflow"
+    default_retryable = False
+
+
 # ── Protocol ─────────────────────────────────────────────────────────────────
 
 

@@ -146,6 +146,7 @@ class WsSender:
         "_started",
         "_stopped",
         "_ctrl_burst_drained",
+        "_ws_closed_task",
     )
 
     def __init__(
@@ -194,6 +195,30 @@ class WsSender:
             },
         )
 
+    def _get_ws_closed_task(self) -> asyncio.Task[bool]:
+        """Lazily create the shared ``ws_closed.wait()`` sentinel task.
+
+        Mirrors :meth:`RequestDispatcher._get_ws_closed_task`.  Returning a
+        single long-lived task instead of one per backpressured ``send``
+        call halves the per-call task allocation on the slow path
+
+        Created on first use so :class:`WsSender` can be constructed
+        outside a running event loop.  Cancelled by :meth:`stop` after
+        the send loop has exited.
+
+        Returns:
+            A running :class:`asyncio.Task` that resolves when
+            ``ws_closed`` is set.
+        """
+        task = self._ws_closed_task
+        if task is None or task.done():
+            task = asyncio.get_running_loop().create_task(
+                self._ws_closed.wait(),
+                name="ws-closed-sentinel",
+            )
+            self._ws_closed_task = task
+        return task
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def start(self) -> None:
@@ -238,7 +263,18 @@ class WsSender:
                 self._loop_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._loop_task
+                self._cancel_ws_closed_task()
                 raise
+
+        # Cancel the shared ws_closed sentinel last — once the send loop
+        # has exited it has no remaining users.
+        self._cancel_ws_closed_task()
+
+    def _cancel_ws_closed_task(self) -> None:
+        """Cancel the lazy-singleton ``_ws_closed_task`` if it was created."""
+        task = self._ws_closed_task
+        if task is not None and not task.done():
+            task.cancel()
 
     @property
     def task(self) -> asyncio.Task[None] | None:
@@ -290,6 +326,7 @@ class WsSender:
             return
 
         if control:
+            msg_type = _extract_msg_type(frame)
             try:
                 self._ctrl_queue.put_nowait(frame)
             except asyncio.QueueFull as exc:
@@ -337,7 +374,7 @@ class WsSender:
 
             # Slow path — the queue is full.  Race put() against ws_closed
             # so a dying WebSocket does not wedge the caller indefinitely.
-            ws_wait = asyncio.create_task(self._ws_closed.wait(), name="ws-closed-wait")
+            ws_wait = self._get_ws_closed_task()
             put_task = asyncio.create_task(
                 self._data_queue.put(frame), name="data-queue-put"
             )
@@ -348,17 +385,11 @@ class WsSender:
                 )
             except asyncio.CancelledError:
                 put_task.cancel()
-                ws_wait.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await put_task
-                with contextlib.suppress(asyncio.CancelledError):
-                    await ws_wait
                 raise
 
             if put_task in done:
-                ws_wait.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await ws_wait
                 self._frame_ready.set()
                 self._emit_queue_gauges()
                 return
@@ -366,9 +397,6 @@ class WsSender:
             put_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await put_task
-            ws_wait.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await ws_wait
             metrics_inc("session.send.queue.race_closed")
             raise ConnectionClosedError(
                 "WebSocket closed while waiting to enqueue data frame.",

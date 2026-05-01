@@ -33,7 +33,9 @@ from websockets.exceptions import ConnectionClosed
 
 from exectunnel.exceptions import (
     ConnectionClosedError,
+    CtrlBackpressureError,
     FrameDecodingError,
+    PreAckBufferOverflowError,
     TransportError,
     UnexpectedFrameError,
 )
@@ -97,8 +99,9 @@ class FrameReceiver:
         post_ready_lines: Lines buffered during bootstrap for replay before live
                           WebSocket iteration begins.
         pre_ready_carry:  Partial frame fragment accumulated during bootstrap.
-        ws_send:          Optional sender used to emit ``ERROR`` frames on
-                          per-connection inbound saturation (head-of-line guard).
+        ws_send:          Sender used to emit ``ERROR``/``CONN_CLOSE`` frames
+                          on per-connection inbound saturation (head-of-line
+                          guard).
         on_agent_stats:   Optional listener invoked for each decoded ``STATS``
                           snapshot.  Must not block or raise.
     """
@@ -125,7 +128,7 @@ class FrameReceiver:
         udp_registry: dict[str, UdpFlow],
         post_ready_lines: list[str],
         pre_ready_carry: str,
-        ws_send: WsSendCallable | None = None,
+        ws_send: WsSendCallable,
         on_agent_stats: AgentStatsCallable | None = None,
         mark_agent_rx: MarkAgentRxCallable | None = None,
     ) -> None:
@@ -528,69 +531,48 @@ class FrameReceiver:
         # Non-blocking enqueue: a slow local consumer must not stall the
         # receive loop for other multiplexed connections.  On overflow we
         # tear down only this connection (ERROR + abort) and keep reading.
-        if self._ws_send is not None:
-            try:
-                accepted = handler.try_feed(data)
-            except TransportError as exc:
-                metrics_inc(
-                    "tunnel.inbound_queue.drop",
-                    error=exc.error_code.replace(".", "_"),
-                )
-                logger.debug(
-                    "conn %s: post-ACK try_feed() error: %s",
-                    conn_id,
-                    exc,
-                    extra={"conn_id": conn_id},
-                )
-                return
-            if accepted:
-                return
-            # Queue full → signal the agent to close its side and locally
-            # abort, so the slow consumer cannot stall the WS dispatcher.
-            metrics_inc(
-                "tunnel.inbound_queue.drop",
-                error="transport_inbound_queue_full",
-            )
-            metrics_inc("session.recv.hol_abort")
-            logger.warning(
-                "conn %s: inbound queue full — aborting connection to avoid "
-                "head-of-line blocking of other muxed connections",
-                conn_id,
-                extra={"conn_id": conn_id},
-            )
-            try:
-                await self._notify_agent_conn_closed(
-                    conn_id, "client inbound saturated"
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.debug(
-                    "conn %s: failed to emit saturation ERROR frame: %s",
-                    conn_id,
-                    exc,
-                    extra={"conn_id": conn_id},
-                )
-            handler.abort_upstream()
-            handler.on_remote_closed()
-            return
-
-        # Fallback (legacy path, no ws_send wired in): await feed_async —
-        # preserves previous behaviour for any construction site that has
-        # not been updated to pass ``ws_send``.
         try:
-            await handler.feed_async(data)
-        except ConnectionClosedError:
-            metrics_inc("session.frames.orphaned", frame_type="DATA")
+            accepted = handler.try_feed(data)
         except TransportError as exc:
             metrics_inc(
                 "tunnel.inbound_queue.drop",
                 error=exc.error_code.replace(".", "_"),
             )
             logger.debug(
-                "conn %s: post-ACK feed_async() dropped chunk: %s",
+                "conn %s: post-ACK try_feed() error: %s",
                 conn_id,
                 exc,
                 extra={"conn_id": conn_id},
             )
+            return
+        if accepted:
+            return
+        # Queue full → signal the agent to close its side and locally
+        # abort, so the slow consumer cannot stall the WS dispatcher.
+        metrics_inc(
+            "tunnel.inbound_queue.drop",
+            error="transport_inbound_queue_full",
+        )
+        metrics_inc("session.recv.hol_abort")
+        logger.warning(
+            "conn %s: inbound queue full — aborting connection to avoid "
+            "head-of-line blocking of other muxed connections",
+            conn_id,
+            extra={"conn_id": conn_id},
+        )
+        try:
+            await self._notify_agent_conn_closed(
+                conn_id, "client inbound saturated"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "conn %s: failed to emit saturation ERROR frame: %s",
+                conn_id,
+                exc,
+                extra={"conn_id": conn_id},
+            )
+        handler.abort_upstream()
+        handler.on_remote_closed()
 
     def _on_conn_close(self, conn_id: str) -> None:
         """React to a ``CONN_CLOSE`` frame from the agent.
