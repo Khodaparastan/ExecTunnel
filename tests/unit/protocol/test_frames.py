@@ -24,6 +24,7 @@ from exectunnel.protocol import (
     encode_error_frame,
     encode_host_port,
     encode_keepalive_frame,
+    encode_liveness_frame,
     encode_stats_frame,
     encode_udp_close_frame,
     encode_udp_data_frame,
@@ -72,6 +73,27 @@ class TestEncodeKeepaliveFrame:
         frame = encode_keepalive_frame()
         result = parse_frame(frame)
         assert result == ParsedFrame(msg_type="KEEPALIVE", conn_id=None, payload="")
+
+
+# ── encode_liveness_frame ────────────────────────────────────────────────────
+
+
+class TestEncodeLivenessFrame:
+    """encode_liveness_frame returns a stable pre-computed string."""
+
+    def test_is_newline_terminated(self):
+        assert encode_liveness_frame().endswith("\n")
+
+    def test_returns_same_object_on_repeated_calls(self):
+        assert encode_liveness_frame() is encode_liveness_frame()
+
+    def test_round_trips_through_parse_frame(self):
+        frame = encode_liveness_frame()
+        result = parse_frame(frame)
+        assert result == ParsedFrame(msg_type="LIVENESS", conn_id=None, payload="")
+
+    def test_distinct_from_keepalive(self):
+        assert encode_liveness_frame() != encode_keepalive_frame()
 
 
 # ── encode_stats_frame ────────────────────────────────────────────────────────
@@ -239,15 +261,31 @@ class TestEncodeUdpOpenFrame:
         result = parse_frame(frame)
         assert result.payload == "[::1]:53"
 
-    def test_c_prefix_id_accepted_at_wire_layer(self):
-        """The protocol layer accepts both c/u prefixes for any conn_id field.
+    def test_encoder_rejects_c_prefix_namespace_mismatch(self):
+        """Encoders enforce the TCP/UDP ID-namespace split (defence-in-depth).
 
-        Enforcing that UDP frames carry u-prefixed IDs is a session-layer
-        concern. CONN_FLOW_ID_RE intentionally matches both prefixes.
+        A ``c``-prefixed (TCP) ID must not pass through ``encode_udp_*``;
+        the encoder raises :class:`ProtocolError` with a helpful message
+        pointing at the expected ``u[0-9a-f]{24}`` shape. Pins the
+        policy enforced by
+        :func:`exectunnel.protocol.encoders._validate_id_namespace`.
         """
-        frame = encode_udp_open_frame(CONN_ID, "8.8.8.8", 53)
-        result = parse_frame(frame)
-        assert result.conn_id == CONN_ID
+        with pytest.raises(ProtocolError, match="UDP_OPEN requires a UDP flow ID"):
+            encode_udp_open_frame(CONN_ID, "8.8.8.8", 53)
+
+    def test_parser_also_rejects_c_prefix_on_udp_frame(self):
+        """The parser performs the same UDP-prefix check as the encoder.
+
+        Both ends of the wire enforce the namespace split: a malformed
+        frame that escapes a peer encoder will be rejected at the
+        receiver with a :class:`FrameDecodingError`. Pins the
+        defence-in-depth pair.
+        """
+        from exectunnel.exceptions import FrameDecodingError
+
+        frame = f"{FRAME_PREFIX}UDP_OPEN:{CONN_ID}:8.8.8.8:53{FRAME_SUFFIX}\n"
+        with pytest.raises(FrameDecodingError, match="UDP_OPEN"):
+            parse_frame(frame)
 
 
 # ── encode_udp_data_frame ─────────────────────────────────────────────────────
