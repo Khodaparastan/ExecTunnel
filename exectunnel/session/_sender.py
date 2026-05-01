@@ -4,17 +4,27 @@ Implements the ``WsSendCallable`` protocol expected by the transport layer.
 All outgoing frames are serialised through a single asyncio task (:meth:`WsSender._run`)
 that owns the WebSocket write path.
 
-Priority model
---------------
-Control frames (``control=True``) are enqueued into a bounded priority queue.
-They are never silently dropped: if the control queue overflows, the session is
-declared unhealthy and callers receive ``ConnectionClosedError``. Data frames
-use a bounded queue; when full they are either dropped silently or block the
-caller (``must_queue=True``).
+Queue model
+-----------
+Control frames (``control=True``) are enqueued into a bounded queue.  When the
+control queue is full the offending call raises
+:exc:`~exectunnel.exceptions.CtrlBackpressureError` so the caller can decide
+locally whether the failure is fatal to the originating per-stream operation
+(e.g. a SOCKS5 ``CONN_OPEN``) or merely best-effort (e.g. a saturation
+ERROR/KEEPALIVE).  This is per-stream backpressure — the session is **not**
+declared unhealthy on overflow.
 
-The :meth:`WsSender._run` loop drains the control queue before the data queue
-on every iteration, guaranteeing that ``CONN_CLOSE`` / ``UDP_CLOSE`` /
-``UDP_OPEN`` frames are delivered ahead of bulk data.
+Data frames use a bounded queue; when full they are either dropped silently
+or block the caller (``must_queue=True``).
+
+Weighted interleaving
+----------------------------------
+The :meth:`WsSender._run` loop interleaves control and data drains using a
+configurable burst ratio (``cfg.ctrl_burst_ratio``).  Each scheduling cycle
+drains up to *N* control frames followed by up to one data frame so a sustained
+control-frame burst (CONN_OPEN storm, saturation ERROR+CONN_CLOSE pairs) cannot
+starve the data path.  Within each queue FIFO ordering is preserved; only
+cross-queue ordering is relaxed.
 
 Dequeue strategy
 ----------------
@@ -135,6 +145,7 @@ class WsSender:
         "_send_drop_count",
         "_started",
         "_stopped",
+        "_ctrl_burst_drained",
     )
 
     def __init__(
@@ -159,6 +170,18 @@ class WsSender:
         self._send_drop_count: int = 0
         self._started: bool = False
         self._stopped: bool = False
+        # Counter for the weighted-interleaving scheduler
+        self._ctrl_burst_drained: int = 0
+
+
+        # Shared lazy-singleton sentinel task for ``ws_closed.wait()`` —
+        # mirrors :meth:`RequestDispatcher._get_ws_closed_task`.  Created
+        # on first use by :meth:`_get_ws_closed_task` so ``__init__`` can
+        # be called outside a running event loop, and cancelled by
+        # :meth:`stop`.  Replaces the previous per-call ``create_task``
+        # in :meth:`send`'s slow path (deferred-brief polish wave —
+        # Finding 13 of the architectural hardening pass).
+        self._ws_closed_task: asyncio.Task[bool] | None = None
 
     # -- Helper -------------------------------
 
@@ -374,25 +397,53 @@ class WsSender:
     # ── Send loop ─────────────────────────────────────────────────────────────
 
     def _try_dequeue(self) -> _SendQueueItem | None:
-        """Try to dequeue one item, preferring the control queue.
+        """Try to dequeue one item with weighted control/data interleaving.
+
+        Each scheduling cycle drains up to ``cfg.ctrl_burst_ratio`` control
+        frames followed by up to one data frame so a sustained control burst
+        cannot starve the data path.
 
         Returns:
-            The next item from the control queue if non-empty, then from the
-            data queue, or ``None`` if both queues are empty.
+            The next item to send, or ``None`` if both queues are empty.
         """
+        burst_cap = self._cfg.ctrl_burst_ratio
+
+        # Phase 1 — keep draining ctrl while inside the current burst budget.
+        if self._ctrl_burst_drained < burst_cap:
+            try:
+                item = self._ctrl_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            else:
+                self._ctrl_burst_drained += 1
+                return item
+
+        # Phase 2 — burst budget exhausted (or ctrl empty): take a data frame
+        # and reset the counter for the next burst.
         try:
-            return self._ctrl_queue.get_nowait()
+            item = self._data_queue.get_nowait()
         except asyncio.QueueEmpty:
             pass
+        else:
+            self._ctrl_burst_drained = 0
+            return item
+
+        # Phase 3 — data also empty.  If we got here because the burst was
+        # exhausted but data was empty, fall back to ctrl so we never stall
+        # while there is still work to do.
         try:
-            return self._data_queue.get_nowait()
+            item = self._ctrl_queue.get_nowait()
         except asyncio.QueueEmpty:
             return None
+        else:
+            self._ctrl_burst_drained = 0
+            return item
 
     async def _run(self) -> None:
         """Single writer to the WebSocket — serialises all outgoing frames.
 
-        Priority: control queue drained before data queue on every iteration.
+        Scheduling: weighted interleaving via :meth:`_try_dequeue` — up to
+        ``cfg.ctrl_burst_ratio`` control frames per data frame per cycle.
         Exits on the :data:`_QUEUE_STOP` sentinel or on WebSocket close.
 
         Uses an :class:`asyncio.Event` for idle-wait (standard

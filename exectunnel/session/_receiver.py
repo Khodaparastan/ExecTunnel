@@ -508,22 +508,21 @@ class FrameReceiver:
                 return
             try:
                 handler.feed(data)
+            except PreAckBufferOverflowError:
+                if not pending.ack_future.done():
+                    pending.ack_future.set_result(AckStatus.PRE_ACK_OVERFLOW)
+                metrics_inc("tunnel.pre_ack_buffer.overflow")
             except TransportError as exc:
-                if exc.error_code == "transport.pre_ack_buffer_overflow":
-                    if not pending.ack_future.done():
-                        pending.ack_future.set_result(AckStatus.PRE_ACK_OVERFLOW)
-                    metrics_inc("tunnel.pre_ack_buffer.overflow")
-                else:
-                    metrics_inc(
-                        "tunnel.inbound_queue.drop",
-                        error=exc.error_code.replace(".", "_"),
-                    )
-                    logger.debug(
-                        "conn %s: pre-ACK feed() dropped chunk: %s",
-                        conn_id,
-                        exc,
-                        extra={"conn_id": conn_id},
-                    )
+                metrics_inc(
+                    "tunnel.inbound_queue.drop",
+                    error=exc.error_code.replace(".", "_"),
+                )
+                logger.debug(
+                    "conn %s: pre-ACK feed() dropped chunk: %s",
+                    conn_id,
+                    exc,
+                    extra={"conn_id": conn_id},
+                )
             return
 
         # Non-blocking enqueue: a slow local consumer must not stall the
