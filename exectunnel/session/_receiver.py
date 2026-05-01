@@ -389,6 +389,14 @@ class FrameReceiver:
             self._on_stats(frame.payload)
             return
 
+        # LIVENESS is a zero-dispatch agent→client heartbeat The actual liveness
+        # signal is the ``mark_agent_rx`` callback fired earlier in
+        # :meth:`run` for every inbound chunk; this branch only records the
+        # observability counter and returns.
+        if msg_type == "LIVENESS":
+            metrics_inc("session.frames.liveness")
+            return
+
         if conn_id is None:
             logger.warning(
                 "recv: frame %r arrived with no conn_id — dropping", msg_type

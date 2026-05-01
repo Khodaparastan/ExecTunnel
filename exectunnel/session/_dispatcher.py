@@ -173,7 +173,15 @@ class RequestDispatcher:
         udp_registry:             Shared UDP flow registry.
         pre_ack_buffer_cap_bytes: Pre-ACK buffer cap forwarded to
                                   :class:`~exectunnel.transport.TcpConnection`.
-        request_reconnect:        Optional callback to force a session reconnect.
+
+    Note:
+        ACK failures are now per-stream only.  No per-stream condition — including ACK timeout
+        clusters or agent-error bursts — escalates to session-level
+        reconnect.  Reconnect is driven exclusively by the seven contract
+        triggers in :class:`~exectunnel.session.session.TunnelSession`
+        (real WS death, send timeout, RX-liveness timeout, session-scoped
+        ``ERROR`` frame, frame structural violation, post-bootstrap
+        unexpected frame, initial connect failure).
     """
 
     __slots__ = (

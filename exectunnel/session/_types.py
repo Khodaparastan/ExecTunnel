@@ -39,17 +39,17 @@ listener that aggregates snapshots into benchmark reports.
 type ReconnectCallable = Callable[[str], Awaitable[None]]
 """Signature of the optional callback used to request a session reconnect.
 The single argument is a short human-readable reason string.
-"""
 
-type AgentRecentlyActiveCallable = Callable[[], bool]
-"""Signature of the predicate used by the dispatcher to ask the session whether
-the remote agent has emitted any frame within the configured grace window.
-
-When the predicate returns ``True``, the dispatcher must suppress ACK-timeout
-based forced reconnects: the agent is alive and what is observed is tunnel
-congestion, not a wedged agent.
+Retained because the RX-liveness watchdog needs the same signature to surface
+``inbound_liveness_timeout`` to :meth:`TunnelSession._request_reconnect`.
+The dispatcher no longer uses it.
 """
 
 type MarkAgentRxCallable = Callable[[], None]
 """Signature of the callback fired by the receiver on each inbound WebSocket
-chunk to refresh the shared agent activity timestamp."""
+chunk to refresh the shared RX-liveness timestamp owned by
+:class:`~exectunnel.session.session.TunnelSession`.
+
+Replaces the previous activity-tracker indirection: the timestamp is now consumed by the
+RX-liveness watchdog, not by the dispatcher's removed ACK-health heuristic.
+"""
