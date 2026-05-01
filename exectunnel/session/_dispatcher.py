@@ -21,6 +21,7 @@ from typing import Final
 from exectunnel.defaults import Defaults
 from exectunnel.exceptions import (
     ConnectionClosedError,
+    CtrlBackpressureError,
     ExecTunnelError,
     TransportError,
     WebSocketSendTimeoutError,
@@ -522,7 +523,43 @@ class RequestDispatcher:
 
             handler.start()
             await handler.closed_event.wait()
-            metrics_inc("tunnel.conn.completed", conn_id=conn_id, host=host, port=port)
+            metrics_inc("tunnel.conn.completed", host=host, port=port)
+
+        except CtrlBackpressureError as exc:
+            # Per-stream ctrl-queue backpressure:
+            ack_status = AckStatus.LIBRARY_ERROR
+            reply = Reply.HOST_UNREACHABLE
+            metrics_inc(
+                "tunnel.connect.fail_by_host",
+                host=host,
+                reason="ctrl_backpressure",
+            )
+            metrics_inc(
+                "tunnel.conn.error",
+                host=host,
+                port=port,
+                error="ctrl_backpressure",
+            )
+            logger.warning(
+                "conn %s: tunnel CONNECT %s:%d rejected — control queue "
+                "full (cap=%s); replying HOST_UNREACHABLE (error_id=%s)",
+                conn_id,
+                host,
+                port,
+                exc.details.get("control_queue_cap"),
+                exc.error_id,
+                extra={
+                    "conn_id": conn_id,
+                    "host": host,
+                    "port": port,
+                    "error_code": exc.error_code,
+                    "error_id": exc.error_id,
+                },
+            )
+            if conn_id is not None and handler is not None:
+                await self._teardown_failed_connection(conn_id, handler)
+            if not req.replied:
+                await req.send_reply_error(reply)
 
         except ExecTunnelError as exc:
             ack_status = AckStatus.LIBRARY_ERROR

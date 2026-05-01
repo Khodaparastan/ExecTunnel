@@ -147,10 +147,6 @@ class FrameReceiver:
         The Python agent does not consume inbound ERROR frames, so CONN_CLOSE is
         mandatory. ERROR is still sent first for future agents that understand it.
         """
-
-        if self._ws_send is None:
-            return
-
         frames = (
             encode_error_frame(conn_id, reason),
             encode_conn_close_frame(conn_id),
@@ -159,6 +155,27 @@ class FrameReceiver:
         for frame in frames:
             try:
                 await self._ws_send(frame, control=True)
+            except CtrlBackpressureError as exc:
+                # This is per-call backpressure
+                # the connection is already being torn down so we drop
+                # the notification frame and let the existing teardown
+                # path complete.  The peer will observe the close as a
+                # WS-level connection drop or, more likely, the next
+                # agent-initiated CONN_CLOSE flowing through.
+                metrics_inc(
+                    "session.notify_agent.dropped_backpressure",
+                    cap=str(exc.details.get("control_queue_cap", "unknown")),
+                )
+                logger.debug(
+                    "conn %s: dropping local-close notification frame: "
+                    "control queue full (cap=%s)",
+                    conn_id,
+                    exc.details.get("control_queue_cap"),
+                    extra={"conn_id": conn_id},
+                )
+                # No point trying the second frame if the first was
+                # rejected — give up on the whole notification.
+                return
             except Exception as exc:  # noqa: BLE001
                 logger.debug(
                     "conn %s: failed to emit local-close notification frame: %s",

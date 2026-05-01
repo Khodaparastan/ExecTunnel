@@ -38,6 +38,7 @@ from websockets.exceptions import ConnectionClosed
 from exectunnel.defaults import Defaults
 from exectunnel.exceptions import (
     ConnectionClosedError,
+    CtrlBackpressureError,
     WebSocketSendTimeoutError,
 )
 from exectunnel.observability import aspan, metrics_gauge_set, metrics_inc
@@ -269,18 +270,18 @@ class WsSender:
             try:
                 self._ctrl_queue.put_nowait(frame)
             except asyncio.QueueFull as exc:
-                metrics_inc("session.send.ctrl_queue_full")
-                self._ws_closed.set()
-                raise ConnectionClosedError(
-                    "WebSocket control queue is full — declaring session unhealthy.",
+                metrics_inc("session.send.ctrl_backpressure_drop", msg_type=msg_type)
+                raise CtrlBackpressureError(
+                    "WebSocket control queue is full.",
                     details={
-                        "close_code": 0,
-                        "close_reason": "control_queue_full",
                         "control_queue_cap": self._cfg.control_queue_cap,
+                        "msg_type": msg_type,
                     },
                     hint=(
-                        "The WebSocket is not draining control frames fast enough. "
-                        "Reconnect the tunnel and inspect proxy/WebSocket latency."
+                        "The WebSocket is not draining control frames fast "
+                        "enough.  This is per-stream backpressure — handle by "
+                        "failing the originating SOCKS5 request or dropping "
+                        "the frame, not by tearing down the session."
                     ),
                 ) from exc
 
@@ -520,7 +521,16 @@ class KeepaliveLoop:
         self._interval = interval
 
     async def run(self) -> None:
-        """Run the keepalive loop until the WebSocket closes."""
+        """Run the keepalive loop until the WebSocket closes.
+
+        ``KEEPALIVE`` is best-effort: if the control queue is full and the
+        sender raises :exc:`~exectunnel.exceptions.CtrlBackpressureError`
+        we log + meter the drop and keep looping.  Backpressure here is a
+        per-call signal only — never escalate it into a session-level reconnect.
+        A real WebSocket failure still propagates through the sender's other
+        error paths (``WebSocketSendTimeoutError``,
+        ``ConnectionClosedError``).
+        """
         async with aspan("session.keepalive_loop"):
             while True:
                 try:
@@ -529,4 +539,13 @@ class KeepaliveLoop:
                     return
                 except TimeoutError:
                     metrics_inc("session.keepalive.sent")
-                    await self._sender.send(self._KEEPALIVE_FRAME, control=True)
+                    try:
+                        await self._sender.send(
+                            self._KEEPALIVE_FRAME, control=True
+                        )
+                    except CtrlBackpressureError:
+                        metrics_inc("session.keepalive.dropped_backpressure")
+                        logger.debug(
+                            "keepalive: ctrl queue full — dropping KEEPALIVE "
+                            "frame; will retry on next interval"
+                        )

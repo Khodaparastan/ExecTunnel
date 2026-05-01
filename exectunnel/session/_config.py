@@ -84,9 +84,18 @@ class SessionConfig:
                                  frame send before raising
                                  :exc:`~exectunnel.exceptions.WebSocketSendTimeoutError`.
         send_queue_cap:          Capacity of the bounded outbound data frame queue.
-        control_queue_cap:       Capacity of the priority control frame queue.
-                                 On overflow, the session is considered unhealthy
-                                 and should reconnect.
+        control_queue_cap:       Capacity of the bounded control frame queue.
+                                 Overflow surfaces as a per-call
+                                 :exc:`~exectunnel.exceptions.CtrlBackpressureError`
+                                 (per-stream backpressure); the session is **not**
+                                 declared unhealthy.  Replaces the previous
+                                 fail-fast "control queue full ⇒ reconnect"
+                                 behaviour.
+        ctrl_burst_ratio:        Number of control frames the send loop drains
+                                 per data frame in one scheduling cycle.
+                                 Replaces strict ctrl-over-data priority with
+                                 weighted interleaving so a control-frame burst
+                                 cannot starve the data path.
     """
 
     # ── WebSocket connection ──────────────────────────────────────────────────
@@ -103,6 +112,7 @@ class SessionConfig:
     send_timeout: float = Defaults.WS_SEND_TIMEOUT_SECS
     send_queue_cap: int = Defaults.WS_SEND_QUEUE_CAP
     control_queue_cap: int = 16_384
+    ctrl_burst_ratio: int = Defaults.WS_SEND_CTRL_BURST_RATIO
 
     def __post_init__(self) -> None:
         _require(
@@ -142,6 +152,7 @@ class SessionConfig:
         for field_name, value in (
             ("send_queue_cap", self.send_queue_cap),
             ("control_queue_cap", self.control_queue_cap),
+            ("ctrl_burst_ratio", self.ctrl_burst_ratio),
         ):
             _require(
                 _is_int(value) and value >= 1,
