@@ -49,8 +49,9 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        python-version: [ "3.13" ]
+        python-version: [ "3.12", "3.13" ]
     steps:
       - uses: actions/checkout@v4
 
@@ -76,8 +77,56 @@ jobs:
       - name: Install dependencies
         run: poetry install --with dev --no-interaction
 
-      - name: Run tests
-        run: poetry run pytest tests -v
+      # ── Unit tier with coverage ──────────────────────────────────────────
+      # Excludes integration / agent / slow tiers so the matrix stays under a
+      # minute per Python version.  Property and in-memory tiers run as part
+      # of the unit collection because they live under tests/unit and
+      # tests/integration respectively.
+      - name: Run unit tests with coverage
+        run: |
+          poetry run pytest tests/unit -q \
+            -m "not integration and not agent and not slow" \
+            --cov=exectunnel \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            --cov-report=html:htmlcov
+
+      # ── In-memory wire-loop smoke suite ─────────────────────────────────
+      - name: Run in-memory smoke suite
+        run: poetry run pytest tests -q -m inmemory
+
+      # ── Hypothesis property tier ────────────────────────────────────────
+      - name: Run property tests
+        run: poetry run pytest tests -q -m property
+
+      # ── Upload coverage artifacts ───────────────────────────────────────
+      - name: Upload coverage XML
+        if: matrix.python-version == '3.13'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: warn
+
+      - name: Upload coverage HTML
+        if: matrix.python-version == '3.13'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: htmlcov/
+          if-no-files-found: warn
+
+      # Codecov upload — opt-in via repository secret.  The action itself
+      # is a no-op without a token on private repos, so it is safe to
+      # leave unconditional.
+      - name: Upload coverage to Codecov
+        if: matrix.python-version == '3.13'
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.xml
+          flags: unit
+          fail_ci_if_error: false
+        continue-on-error: true
 
   build:
     runs-on: ubuntu-latest
