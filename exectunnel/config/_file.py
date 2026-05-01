@@ -132,9 +132,6 @@ class _ResolvedBootstrap(TypedDict):
 class _ResolvedTransport(TypedDict):
     ready_timeout: float
     conn_ack_timeout: float
-    ack_timeout_warn_every: int
-    ack_timeout_window_secs: float
-    ack_timeout_reconnect_threshold: int
     connect_max_pending: int
     connect_max_pending_per_host: int
     pre_ack_buffer_cap_bytes: int
@@ -466,21 +463,6 @@ class TunnelFile(BaseModel):
                 g.conn_ack_timeout,
                 D.CONN_ACK_TIMEOUT_SECS,
             ),
-            ack_timeout_warn_every=_first_required(
-                entry.ack_timeout_warn_every,
-                g.ack_timeout_warn_every,
-                D.ACK_TIMEOUT_WARN_EVERY,
-            ),
-            ack_timeout_window_secs=_first_required(
-                entry.ack_timeout_window_secs,
-                g.ack_timeout_window_secs,
-                D.ACK_TIMEOUT_WINDOW_SECS,
-            ),
-            ack_timeout_reconnect_threshold=_first_required(
-                entry.ack_timeout_reconnect_threshold,
-                g.ack_timeout_reconnect_threshold,
-                D.ACK_TIMEOUT_RECONNECT_THRESHOLD,
-            ),
             connect_max_pending=_first_required(
                 cli.connect_max_pending,
                 entry.connect_max_pending,
@@ -702,11 +684,6 @@ class TunnelFile(BaseModel):
             ready_timeout=transport["ready_timeout"],
             conn_ack_timeout=transport["conn_ack_timeout"],
             exclude=exclude,
-            ack_timeout_warn_every=transport["ack_timeout_warn_every"],
-            ack_timeout_window_secs=transport["ack_timeout_window_secs"],
-            ack_timeout_reconnect_threshold=transport[
-                "ack_timeout_reconnect_threshold"
-            ],
             connect_max_pending=transport["connect_max_pending"],
             connect_max_pending_per_host=transport["connect_max_pending_per_host"],
             pre_ack_buffer_cap_bytes=transport["pre_ack_buffer_cap_bytes"],

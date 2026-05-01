@@ -147,18 +147,6 @@ class TunnelOverrideMixin(BaseModel):
         default=None,
         description="Seconds to wait for the agent to acknowledge a CONN_OPEN.",
     )
-    ack_timeout_warn_every: PosInt | None = Field(
-        default=None,
-        description="Log a warning every N ACK timeouts.",
-    )
-    ack_timeout_window_secs: PosFloat | None = Field(
-        default=None,
-        description="Rolling window in seconds for ACK timeout threshold counting.",
-    )
-    ack_timeout_reconnect_threshold: PosInt | None = Field(
-        default=None,
-        description="ACK timeouts within the window that triggers a forced reconnect.",
-    )
     connect_max_pending: PosInt | None = Field(
         default=None,
         description="Global cap on simultaneous in-flight CONN_OPEN frames.",

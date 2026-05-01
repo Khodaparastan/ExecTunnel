@@ -190,11 +190,6 @@ class TunnelConfig:
                                          acknowledge a ``CONN_OPEN`` per connection.
         exclude:                         CIDRs that bypass the tunnel and connect
                                          directly.  Defaults to RFC 1918 + loopback.
-        ack_timeout_warn_every:          Log a warning every N ACK timeouts.
-        ack_timeout_window_secs:         Rolling window (seconds) for ACK timeout
-                                         threshold counting.
-        ack_timeout_reconnect_threshold: Number of ACK timeouts within the window
-                                         that triggers a forced reconnect.
         connect_max_pending:             Global cap on simultaneous in-flight
                                          ``CONN_OPEN`` frames.
         connect_max_pending_per_host:    Per-host cap on simultaneous in-flight
