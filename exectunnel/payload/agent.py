@@ -38,6 +38,10 @@ _FRAME_PREFIX: Final = "<<<EXECTUNNEL:"
 _FRAME_SUFFIX: Final = ">>>"
 _AGENT_VERSION: Final = "2"
 
+# Agent → client periodic liveness sentinel.  Mirrors the wire constant in
+# ``exectunnel.protocol.constants.LIVENESS_FRAME``
+_LIVENESS_FRAME: Final = f"{_FRAME_PREFIX}LIVENESS{_FRAME_SUFFIX}"
+
 _AGENT_PATHS: Final = ("/tmp/exectunnel_agent.py", "/tmp/exectunnel_agent.b64")
 
 _MAX_TCP_UDP_PORT: Final = 65_535
@@ -227,6 +231,12 @@ class _AgentConfig:
     )
     writer_join_timeout_secs: float = _env_float(
         "EXECTUNNEL_AGENT_WRITER_JOIN_TIMEOUT_SECS",
+        5.0,
+        minimum=0.0,
+    )
+
+    liveness_interval_secs: float = _env_float(
+        "EXECTUNNEL_AGENT_LIVENESS_INTERVAL_SECS",
         5.0,
         minimum=0.0,
     )
@@ -759,6 +769,11 @@ class _FrameWriter:
         self._telemetry_lock = threading.Lock()
         self._latest_telemetry: str | None = None
 
+        # Track the last successful stdout write so the writer can decide
+        # whether a LIVENESS frame is needed.  Initialised to "now" so the
+        # first idle window is measured from agent start, not epoch.
+        self._last_tx_at: float = time.monotonic()
+
         self._stopping = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
@@ -842,7 +857,42 @@ class _FrameWriter:
             return False
 
         _record_tx_frame(line)
+        # Update the LIVENESS suppression marker on every successful write
+        # so any frame (DATA, CONN_ACK, ERROR, telemetry, …) is treated as
+        # liveness evidence in its own right.
+        self._last_tx_at = time.monotonic()
         return True
+
+    def _maybe_emit_liveness(self) -> bool:
+        """Emit a single LIVENESS frame if the cadence has elapsed and the
+        writer is otherwise idle.
+
+        Returns True iff a frame was actually written.
+
+        Smart-suppression rules:
+        * ``liveness_interval_secs == 0`` disables LIVENESS entirely.
+        * Both the ctrl and data queues must be empty — any pending frame
+          will refresh ``_last_tx_at`` itself when written.
+        * The configured idle window must have elapsed since the last
+          successful TX.
+        """
+        interval = CONFIG.liveness_interval_secs
+        if interval <= 0.0:
+            return False
+
+        if self._out.is_dead or self._stopping.is_set():
+            return False
+
+        # ``SimpleQueue`` exposes ``empty()``; ``Queue`` exposes ``qsize()``.
+        if not self._ctrl.empty():
+            return False
+        if not self._data.empty():
+            return False
+
+        if time.monotonic() - self._last_tx_at < interval:
+            return False
+
+        return self._write_line(_LIVENESS_FRAME)
 
     def _run(self) -> None:
         while True:
