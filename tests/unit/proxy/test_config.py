@@ -42,6 +42,7 @@ class TestSocks5ServerConfigCustomValues:
             port=9050,
             allow_non_loopback=True,
             udp_bind_host="10.0.0.1",
+            udp_advertise_host="10.0.0.1",
         )
         assert cfg.host == "10.0.0.1"
         assert cfg.port == 9050
@@ -160,6 +161,44 @@ class TestSocks5ServerConfigValidation:
                 udp_advertise_host="127.0.0.1",
             )
 
+    def test_non_loopback_udp_bind_without_explicit_advertise_raises(self):
+        with pytest.raises(ConfigurationError) as exc_info:
+            Socks5ServerConfig(
+                host="10.0.0.1",
+                allow_non_loopback=True,
+                udp_bind_host="10.0.0.1",
+                # udp_advertise_host left as None (the default)
+            )
+        # Must point the operator at the *advertise* field, not the bind
+        # field, and must mention the security concern in the hint.
+        msg = exc_info.value.args[0]
+        assert "udp_advertise_host" in msg
+        details = exc_info.value.details
+        assert details["field"] == "udp_advertise_host"
+        assert "binding race" in (exc_info.value.hint or "")
+
+    def test_non_loopback_udp_bind_with_unspecified_advertise_raises(self):
+        with pytest.raises(ConfigurationError) as exc_info:
+            Socks5ServerConfig(
+                host="10.0.0.1",
+                allow_non_loopback=True,
+                udp_bind_host="10.0.0.1",
+                udp_advertise_host="0.0.0.0",
+            )
+        details = exc_info.value.details
+        assert details["field"] == "udp_advertise_host"
+
+    def test_non_loopback_udp_bind_with_explicit_advertise_accepted(self):
+        # Sanity: setting an explicit reachable advertise host satisfies
+        # the new check and the rest of the validation block.
+        cfg = Socks5ServerConfig(
+            host="10.0.0.1",
+            allow_non_loopback=True,
+            udp_bind_host="10.0.0.1",
+            udp_advertise_host="10.0.0.1",
+        )
+        assert cfg.effective_udp_advertise_host == "10.0.0.1"
+
     def test_error_message_contains_field_name(self):
         with pytest.raises(ConfigurationError) as exc_info:
             Socks5ServerConfig(port=0)
@@ -179,6 +218,7 @@ class TestSocks5ServerConfigIsLoopback:
                 host="10.0.0.1",
                 allow_non_loopback=True,
                 udp_bind_host="10.0.0.1",
+                udp_advertise_host="10.0.0.1",
             ).is_loopback
             is False
         )
@@ -189,6 +229,7 @@ class TestSocks5ServerConfigIsLoopback:
                 host="172.16.0.1",
                 allow_non_loopback=True,
                 udp_bind_host="172.16.0.1",
+                udp_advertise_host="172.16.0.1",
             ).is_loopback
             is False
         )
@@ -202,6 +243,7 @@ class TestSocks5ServerConfigIsLoopback:
                 host="2001:db8::1",
                 allow_non_loopback=True,
                 udp_bind_host="2001:db8::1",
+                udp_advertise_host="2001:db8::1",
             ).is_loopback
             is False
         )

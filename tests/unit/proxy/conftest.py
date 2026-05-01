@@ -1,6 +1,11 @@
-"""Shared fixtures for the exectunnel.proxy test suite.
+"""Shared fixtures for the :mod:`exectunnel.proxy` test suite.
 
-Required pyproject.toml configuration::
+Most generic fixtures (``make_stream_reader``, ``free_port``,
+``mock_writer``-shaped factories) live in
+:mod:`tests._helpers`; this conftest only carries proxy-package-specific
+glue (the ``mock_observability`` autouse patch set).
+
+Required ``pyproject.toml`` configuration::
 
     [tool.pytest.ini_options]
     asyncio_mode = "auto"
@@ -8,25 +13,36 @@ Required pyproject.toml configuration::
 
 from __future__ import annotations
 
-import asyncio
-import socket
 from contextlib import asynccontextmanager
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
-import exectunnel.proxy.server
-import exectunnel.proxy.tcp_relay
-import exectunnel.proxy.udp_relay
 import pytest
+
+# Re-export commonly imported names so existing
+# ``from .conftest import make_stream_reader, free_port`` imports keep
+# working without per-test churn.
+from tests._helpers import (  # noqa: F401  -- intentional re-export
+    free_port,
+    make_mock_writer,
+    make_stream_reader,
+)
 
 
 @asynccontextmanager
 async def _noop_aspan(*args: object, **kwargs: object):
+    """Drop-in replacement for ``observability.aspan`` that does nothing."""
     yield None
 
 
 @pytest.fixture(autouse=True)
 def mock_observability():
-    """Replace every observability call in the proxy package with no-ops."""
+    """Replace every observability call in the proxy package with no-ops.
+
+    The proxy code paths exercised in this suite are pure-business-
+    logic; we don't want metric/trace side-effects bleeding into other
+    tests.  This is the single autouse patch list — keep it ordered
+    by sub-module to make additions obvious in diffs.
+    """
     with (
         patch("exectunnel.proxy.server.metrics_inc"),
         patch("exectunnel.proxy.server.metrics_gauge_inc"),
@@ -45,27 +61,5 @@ def mock_observability():
 
 @pytest.fixture
 def mock_writer() -> MagicMock:
-    """Mock ``asyncio.StreamWriter`` with all methods stubbed."""
-    writer = MagicMock(spec=asyncio.StreamWriter)
-    writer.write = MagicMock()
-    writer.drain = AsyncMock()
-    writer.close = MagicMock()
-    writer.wait_closed = AsyncMock()
-    writer.is_closing.return_value = False
-    return writer
-
-
-def make_stream_reader(data: bytes) -> asyncio.StreamReader:
-    """Return an ``asyncio.StreamReader`` pre-loaded with *data* and EOF."""
-    reader = asyncio.StreamReader()
-    reader.feed_data(data)
-    reader.feed_eof()
-    return reader
-
-
-def free_port() -> int:
-    """Return an available TCP port on ``127.0.0.1``."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        return s.getsockname()[1]
+    """Return a fresh :func:`tests._helpers.make_mock_writer`."""
+    return make_mock_writer()

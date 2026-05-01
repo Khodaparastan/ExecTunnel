@@ -55,13 +55,19 @@ class TestTCPRelayProperties:
         req = _make_request()
         assert req.replied is False
 
-    def test_replied_true_after_success_reply(self):
+    async def test_replied_true_after_success_reply(self):
+        """``replied`` flips to ``True`` after a successful reply.
+
+        Originally written as a synchronous test that drove the
+        coroutine via ``asyncio.get_event_loop().run_until_complete``;
+        that pattern emits ``DeprecationWarning: There is no current
+        event loop`` on Python 3.12+, which the project's strict
+        ``filterwarnings = ["error"]`` upgrades to a hard failure.
+        Converted to ``async def`` so pytest-asyncio supplies the
+        running loop.
+        """
         req = _make_request()
-
-        async def _run():
-            await req.send_reply_success()
-
-        asyncio.get_event_loop().run_until_complete(_run())
+        await req.send_reply_success()
         assert req.replied is True
 
     def test_host_and_port_stored(self):

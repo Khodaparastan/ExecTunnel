@@ -16,7 +16,7 @@ from exectunnel.proxy._io import (
     write_and_drain_silent,
 )
 
-from unit.proxy.conftest import make_stream_reader
+from tests._helpers import make_stream_reader
 
 
 def _ipv4_addr_bytes(host: str = "1.2.3.4", port: int = 80) -> bytes:
