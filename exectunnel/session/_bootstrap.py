@@ -138,26 +138,66 @@ _STTY_RAW_CMD: Final[str] = (
     "stty cs8 -icanon min 1 time 0 -isig -xcase -inpck -opost -echo"
 )
 
-# Matches all ANSI/VT100 CSI sequences (ESC [ … ) and bare ESC + one char.
-_ANSI_ESCAPE_RE: Final[re.Pattern[str]] = re.compile(
-    r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])"
+# ECMA-48 / ISO 6429 escape-sequence matcher:
+
+#   * OSC  ``ESC ] <text> (BEL | ST)``                — colour palette / title
+#   * DCS  ``ESC P <text> ST``                        — terminal device control
+#   * SOS  ``ESC X <text> ST``                        — start of string
+#   * PM   ``ESC ^ <text> ST``                        — privacy message
+#   * APC  ``ESC _ <text> ST``                        — application program command
+#   * Gn   ``ESC ( | ) | * | + <one byte>``           — character-set designators
+#
+# where ``ST`` (string terminator) is ``ESC \``.
+#
+# The alternatives are ordered specific-first so the payload-carrying
+# introducers ``[ ] P X ^ _`` are matched before the generic Fe/Fp
+# fallback ``[@-Z\\-_]`` which would otherwise consume just the ESC +
+# introducer byte and leave the payload in the line.
+_ECMA48_ESCAPE_RE: Final[re.Pattern[str]] = re.compile(
+    r"\x1b(?:"
+    r"\[[0-?]*[ -/]*[@-~]"               # CSI
+    r"|\][^\x07\x1b]*(?:\x07|\x1b\\)"    # OSC, terminated by BEL or ST
+    r"|P[^\x1b]*\x1b\\"                  # DCS
+    r"|X[^\x1b]*\x1b\\"                  # SOS
+    r"|\^[^\x1b]*\x1b\\"                 # PM
+    r"|_[^\x1b]*\x1b\\"                  # APC
+    r"|[()*+]."                          # G0/G1/G2/G3 character-set designator
+    r"|[@-Z\\-_]"                        # generic Fe/Fp 2-byte sequence
+    r")"
 )
+
+# Backwards-compatible alias \u2014 some legacy importers still reference the
+# old name.  New code should use ``_ECMA48_ESCAPE_RE``.
+_ANSI_ESCAPE_RE: Final[re.Pattern[str]] = _ECMA48_ESCAPE_RE
 
 
 def _strip_ansi(text: str) -> str:
-    """Remove ANSI/VT100 escape sequences and bare carriage returns.
+    """Remove ECMA-48 escape sequences, bare carriage returns, and BOM.
 
     Applied to every received line before marker comparison so that terminal
-    decoration — bracketed-paste markers, readline cursor-control sequences,
-    colour codes — cannot prevent exact-string matching.
+    decoration \u2014 bracketed-paste markers, readline cursor-control sequences,
+    colour codes, OSC palette / title sequences, DCS device controls, kitty
+    / iTerm extensions, character-set designators, and an optional UTF-8
+    byte-order mark \u2014 cannot prevent exact-string matching against the
+    fence / ready markers.
+
+    The set of sequences recognised here is the full ECMA-48 introducer
+    space: CSI, OSC, DCS, SOS, PM, APC, Gn designators, and the generic
+    Fe/Fp two-byte forms.  See :data:`_ECMA48_ESCAPE_RE` for the full
+    grammar.
 
     Args:
         text: Raw line from the WebSocket receive buffer.
 
     Returns:
-        The line with all ANSI escape sequences and ``\\r`` characters removed.
+        The line with all ECMA-48 escape sequences, ``\\r`` characters,
+        and ``\\ufeff`` (BOM) characters removed.
     """
-    return _ANSI_ESCAPE_RE.sub("", text).replace("\r", "")
+    return (
+        _ECMA48_ESCAPE_RE.sub("", text)
+        .replace("\r", "")
+        .replace("\ufeff", "")
+    )
 
 
 def _redact_url_for_log(url: str) -> str:
