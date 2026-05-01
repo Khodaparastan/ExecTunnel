@@ -9,9 +9,8 @@ captured bytes directly without ``mock_calls`` introspection.
 from __future__ import annotations
 
 import asyncio
-from typing import Iterable
+from collections.abc import Iterable
 from unittest.mock import AsyncMock, MagicMock
-
 
 # ── StreamReader factories ────────────────────────────────────────────────────
 

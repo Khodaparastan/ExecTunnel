@@ -438,7 +438,11 @@ async def test_agent_invalid_cli_usage_exits_nonzero(
     rc = await asyncio.wait_for(proc.wait(), timeout=2.0)
 
     assert rc == 1
-    assert "usage: agent.py" in stderr_line
+    # The agent prints its banner using its installed entry-point name
+    # (``exectunnel_agent.py``); see ``exectunnel/payload/agent.py``'s
+    # ``_usage_and_exit`` helper. We assert on the stable ``usage:`` prefix
+    # plus the executable stem so a future ``argv[0]`` tweak surfaces here.
+    assert "usage: exectunnel_agent.py" in stderr_line
 
 
 async def test_agent_logs_stdin_eof_to_stderr(

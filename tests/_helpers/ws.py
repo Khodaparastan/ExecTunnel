@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 from typing import Final
 
-
 # ── Recording-only ws_send double ────────────────────────────────────────────
 
 
@@ -113,7 +112,7 @@ class QueueWs:
 
     # ── Async iterator (matches ``websockets`` client API) ──────────────────
 
-    def __aiter__(self) -> "QueueWs":
+    def __aiter__(self) -> QueueWs:
         """Return self so ``async for msg in ws:`` works.
 
         The :class:`exectunnel.session._receiver.FrameReceiver` consumes
