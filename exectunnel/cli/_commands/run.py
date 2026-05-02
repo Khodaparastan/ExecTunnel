@@ -648,20 +648,42 @@ async def _run_all(
     entries: list[TunnelEntry],
     cli_overrides: CLIOverrides,
     slots: dict[str, TunnelSlot],
+    *,
+    tunnel_file: TunnelFile | None = None,
+    remote_client: object | None = None,
+    dashboard: UnifiedDashboard | None = None,
 ) -> int:
     """Run all tunnels via the subprocess supervisor and return worst exit code.
 
     Each tunnel runs in its own ``exectunnel _worker`` subprocess. The parent
     ingests NDJSON IPC frames and drives the dashboard via parent-owned
     ``TunnelSlot`` snapshots — there is no in-process tunnel work here.
+
+    When a :class:`RemoteConfigClient` is provided, the supervisor is wired
+    with a :class:`ProviderHealthWatcher` (gating respawns on ``down``) and
+    with the auth-failure refresh pathway (refetching the config on a
+    ``EXIT_AUTH_FAILURE`` worker exit).
     """
-    from .._supervisor import Supervisor  # noqa: PLC0415
+    from .._remote_config import (  # noqa: PLC0415
+        ProviderHealthWatcher,
+    )
+    from .._supervisor import RestartPolicy, Supervisor  # noqa: PLC0415
+
+    health_watcher: ProviderHealthWatcher | None = None
+    if remote_client is not None:
+        health_watcher = ProviderHealthWatcher(remote_client)  # type: ignore[arg-type]
+        if dashboard is not None:
+            health_watcher.subscribe(dashboard.set_provider_health)
 
     supervisor = Supervisor(
         config_path=config_path,
         entries=entries,
         cli_overrides=cli_overrides,
         slots=slots,
+        restart_policy=RestartPolicy(),
+        remote_client=remote_client,  # type: ignore[arg-type]
+        health_watcher=health_watcher,
+        tunnel_file=tunnel_file,
     )
     result = await supervisor.run()
     return result.exit_code
@@ -729,18 +751,24 @@ async def _run_dashboard(
     console: Any,
     mode: DashboardMode,
     start_time: float,
-    runner: Callable[[], Awaitable[int]],
+    runner: Callable[[UnifiedDashboard], Awaitable[int]],
     *,
     show_logs: bool,
 ) -> int:
+    """Render a :class:`UnifiedDashboard` for the duration of ``runner``.
+
+    The runner receives the live dashboard instance so it can subscribe
+    parent-side observers (e.g. provider-health snapshots) without having
+    to reach back into module globals.
+    """
     async with UnifiedDashboard(
         slots,
         console,
         mode,
         show_logs=show_logs,
         start_time=start_time,
-    ):
-        return await runner()
+    ) as dashboard:
+        return await runner(dashboard)
 
 
 # ---------------------------------------------------------------------------
@@ -832,18 +860,26 @@ def run_command(
     _print_startup_banner(entries)
     dashboard_start = time.monotonic()
 
+    remote_client = app_ctx.remote_client
+
     async def _main() -> int:
+        async def _runner(dashboard: UnifiedDashboard) -> int:
+            return await _run_all(
+                config_path,
+                entries,
+                cli_overrides,
+                slots,
+                tunnel_file=tunnel_file,
+                remote_client=remote_client,
+                dashboard=dashboard,
+            )
+
         return await _run_dashboard(
             active_slots,
             console,
             mode,
             dashboard_start,
-            lambda: _run_all(
-                config_path,
-                entries,
-                cli_overrides,
-                slots,
-            ),
+            _runner,
             show_logs=show_logs,
         )
 
@@ -957,18 +993,21 @@ def run_single_command(
     dashboard_start = time.monotonic()
 
     async def _main() -> int:
-        return await _run_dashboard(
-            [slot],
-            console,
-            DashboardMode.SINGLE,
-            dashboard_start,
-            lambda: _run_single_in_process(
+        async def _runner(_dashboard: UnifiedDashboard) -> int:
+            return await _run_single_in_process(
                 tunnel_file,
                 entry,
                 cli_overrides,
                 slot,
                 show_logs=show_logs,
-            ),
+            )
+
+        return await _run_dashboard(
+            [slot],
+            console,
+            DashboardMode.SINGLE,
+            dashboard_start,
+            _runner,
             show_logs=show_logs,
         )
 
