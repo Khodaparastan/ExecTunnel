@@ -22,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 __all__ = [
     "IPC_PROTOCOL_VERSION",
+    "AuthFailureFrame",
     "ExitFrame",
     "Frame",
     "HealthFrame",
@@ -48,6 +49,8 @@ TunnelStatus: TypeAlias = Literal[
     "restarting",
     "stopped",
     "failed",
+    "auth_failed",
+    "gated",
 ]
 
 LogLevel: TypeAlias = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
@@ -89,14 +92,19 @@ class StatusFrame(_BaseFrame):
 
 
 class MetricFrame(_BaseFrame):
-    """Projection of one :class:`~exectunnel.observability.MetricEvent`."""
+    """Projection of one :class:`~exectunnel.observability.MetricEvent`.
+
+    The wire type for ``value`` is ``float`` for cross-language stability;
+    the parent recomputes ``MetricEvent.value`` as ``float(...)`` regardless,
+    so widening to a single numeric type is lossless on this hop.
+    """
 
     type: Literal["metric"] = "metric"
     name: str = Field(min_length=1)
     kind: MetricKindStr
-    value: int | float
+    value: float
     operation: str = "update"
-    current_value: int | float | None = None
+    current_value: float | None = None
     tags: dict[str, str] = Field(default_factory=dict)
 
 
@@ -125,7 +133,24 @@ class ExitFrame(_BaseFrame):
     code: int
 
 
-Frame: TypeAlias = StatusFrame | MetricFrame | HealthFrame | LogFrame | ExitFrame
+class AuthFailureFrame(_BaseFrame):
+    """Authentication / authorisation failure observed by the worker.
+
+    Emitted before :class:`ExitFrame` when the WSS handshake is rejected with
+    HTTP ``401`` or ``403``. The supervisor uses it for instant dashboard
+    feedback; the corresponding worker exit code is ``EXIT_AUTH_FAILURE = 4``,
+    which drives the restart policy and the optional remote-config refresh.
+    """
+
+    type: Literal["auth_failure"] = "auth_failure"
+    http_status: int = Field(ge=400, le=499)
+    wss_url: str = ""
+    message: str = ""
+
+
+Frame: TypeAlias = (
+    StatusFrame | MetricFrame | HealthFrame | LogFrame | ExitFrame | AuthFailureFrame
+)
 
 _FRAME_TYPES: Final[dict[str, type[_BaseFrame]]] = {
     "status": StatusFrame,
@@ -133,6 +158,7 @@ _FRAME_TYPES: Final[dict[str, type[_BaseFrame]]] = {
     "health": HealthFrame,
     "log": LogFrame,
     "exit": ExitFrame,
+    "auth_failure": AuthFailureFrame,
 }
 
 
