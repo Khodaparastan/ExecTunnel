@@ -1,4 +1,8 @@
-"""Display utilities — logging, live status panel, unified dashboard, spinner."""
+"""Display utilities — logging, unified dashboard, spinner.
+
+The legacy ``LivePanel`` / ``TunnelStatus`` / ``TunnelStatusRegistry`` API
+was removed; ``UnifiedDashboard`` is the single rendering surface.
+"""
 
 from ._dashboard import DashboardMode, TunnelSlot, UnifiedDashboard
 from ._formatting import (
@@ -12,7 +16,6 @@ from ._formatting import (
     truncate_url,
 )
 from ._logging import configure_logging, get_stderr_console
-from ._panel import LivePanel, TunnelStatus, TunnelStatusRegistry
 from ._spinner import PHASE_NAMES, BootstrapSpinner
 from ._theme import BANNER, THEME, Icons
 
@@ -21,9 +24,6 @@ __all__ = [
     "UnifiedDashboard",
     "DashboardMode",
     "TunnelSlot",
-    "LivePanel",
-    "TunnelStatus",
-    "TunnelStatusRegistry",
     # Spinner
     "BootstrapSpinner",
     "PHASE_NAMES",

@@ -33,7 +33,8 @@ from ._formatting import (
 from ._theme import Icons
 
 if TYPE_CHECKING:
-    from exectunnel.cli.metrics import HealthMonitor, TunnelHealth
+    from .._remote_config import ProviderHealth
+    from ..metrics import HealthMonitor, TunnelHealth
 
 __all__ = ["DashboardMode", "TunnelSlot", "UnifiedDashboard"]
 
@@ -71,6 +72,14 @@ _TUNNEL_STATUS_DISPLAY: Final[dict[str, tuple[str, str]]] = {
     "stopped": ("○", "et.conn.closed"),
     "failed": (Icons.CROSS, "et.stat.bad"),
     "disabled": ("–", "et.muted"),
+    "auth_failed": (Icons.CROSS, "et.stat.bad"),
+    "gated": ("⦻", "et.warn"),
+}
+
+_PROVIDER_STATE_STYLES: Final[dict[str, tuple[str, str]]] = {
+    "ok": ("●", "et.stat.good"),
+    "degraded": ("●", "et.warn"),
+    "down": ("●", "et.stat.bad"),
 }
 _TUNNEL_STATUS_DEFAULT: Final[tuple[str, str]] = ("?", "et.muted")
 
@@ -156,6 +165,7 @@ class UnifiedDashboard:
         "_start",
         "_live",
         "_task",
+        "_provider_health",
     )
 
     def __init__(
@@ -176,6 +186,7 @@ class UnifiedDashboard:
         self._start: float = start_time if start_time is not None else time.monotonic()
         self._live: Live | None = None
         self._task: asyncio.Task[None] | None = None
+        self._provider_health: ProviderHealth | None = None
 
     # ------------------------------------------------------------------
     # Async context manager
@@ -229,6 +240,51 @@ class UnifiedDashboard:
             if slot.name == name:
                 slot.monitor = monitor
                 return
+
+    def set_provider_health(self, snapshot: ProviderHealth | None) -> None:
+        """Publish a :class:`ProviderHealth` snapshot to the dashboard.
+
+        Subscribers (typically a :class:`ProviderHealthWatcher`) call this
+        synchronously from the asyncio loop. The next render pulls the
+        latest snapshot via the regular refresh tick — no live update is
+        forced here so we don't race the refresh task.
+        """
+        self._provider_health = snapshot
+
+    # ------------------------------------------------------------------
+    # Provider-health pill (single + multi headers)
+    # ------------------------------------------------------------------
+
+    def _render_provider_pill(self) -> Text | None:
+        """Return a one-line ``Gateway: ● state`` pill, or ``None`` if absent."""
+        ph = self._provider_health
+        if ph is None:
+            return None
+
+        state_value = ph.state.value
+        dot, style = _PROVIDER_STATE_STYLES.get(state_value, ("●", "et.muted"))
+
+        suffix = ""
+        if state_value != "ok":
+            # Surface the first non-ok probe alias for actionable detail.
+            for probe in ph.probes:
+                if probe.status.value != "ok":
+                    bits: list[str] = [probe.alias or probe.target]
+                    if probe.http_status is not None:
+                        bits.append(f"HTTP {probe.http_status}")
+                    elif probe.error:
+                        bits.append(probe.error)
+                    elif probe.latency_ms is not None:
+                        bits.append(f"{probe.latency_ms:.0f}ms")
+                    suffix = f" ({', '.join(bits)})"
+                    break
+
+        return Text.assemble(
+            Text("Gateway: ", style="et.muted"),
+            Text(dot, style=style),
+            Text(f" {state_value}", style=style),
+            Text(suffix, style="et.muted"),
+        )
 
     # ------------------------------------------------------------------
     # Internal refresh loop
@@ -330,6 +386,11 @@ class UnifiedDashboard:
             parts.append(Text(f"  {Icons.CLOCK} {uptime}", style="et.muted"))
 
         parts.append(Text(f"  {Icons.GLOBE} {url_short}", style="et.muted"))
+
+        pill = self._render_provider_pill()
+        if pill is not None:
+            parts.append(Text("  │  ", style="et.muted"))
+            parts.append(pill)
 
         return Panel(
             Align.left(Text.assemble(*parts)),
@@ -738,6 +799,12 @@ class UnifiedDashboard:
                 style="et.muted",
             ),
         ]
+
+        pill = self._render_provider_pill()
+        if pill is not None:
+            parts.append(Text("  │  ", style="et.muted"))
+            parts.append(pill)
+
         return Panel(
             Align.left(Text.assemble(*parts)),
             style="et.border",
@@ -1167,6 +1234,45 @@ class UnifiedDashboard:
                 f"{Icons.BOLT} Queue",
                 Text(f"{h.send_queue_depth}q {h.request_tasks}tasks", style="et.value"),
             )
+
+        # ── ProcessHealth (supervisor-only telemetry) ────────────────────
+        process = slot.process
+        if process is not None:
+            resources = getattr(process, "resources", None)
+            if resources is not None:
+                rss = getattr(resources, "rss_bytes", None)
+                if rss is not None:
+                    t.add_row(
+                        f"{Icons.PULSE} RSS",
+                        Text(fmt_bytes(int(rss)), style="et.value"),
+                    )
+                cpu = getattr(resources, "cpu_percent", None)
+                if cpu is not None:
+                    t.add_row(
+                        f"{Icons.PULSE} CPU",
+                        Text(f"{cpu:.1f}%", style="et.value"),
+                    )
+                threads = getattr(resources, "num_threads", None)
+                fds = getattr(resources, "num_fds", None)
+                if threads is not None or fds is not None:
+                    parts_str = []
+                    if threads is not None:
+                        parts_str.append(f"{threads}t")
+                    if fds is not None:
+                        parts_str.append(f"{fds}fd")
+                    t.add_row(
+                        f"{Icons.PULSE} Threads",
+                        Text(" / ".join(parts_str), style="et.muted"),
+                    )
+
+            supervision = getattr(process, "supervision", None)
+            if supervision is not None:
+                restart_count = getattr(supervision, "restart_count", 0) or 0
+                if restart_count:
+                    t.add_row(
+                        f"{Icons.RECONNECT} Restarts",
+                        Text(str(restart_count), style="et.warn"),
+                    )
 
         return Panel(
             t,
