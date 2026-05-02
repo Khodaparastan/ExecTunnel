@@ -11,10 +11,12 @@ The worker:
 
 * loads the tunnel config and resolves the named entry,
 * registers a metric listener that emits :class:`MetricFrame` lines on stdout,
-* runs the :class:`~exectunnel.session.TunnelSession`,
-* emits :class:`StatusFrame` lifecycle transitions and a final
+* runs the :class:`~exectunnel.session.TunnelSession` via
+  :class:`~exectunnel.cli._runner.SessionRunner`,
+* emits :class:`StatusFrame`, :class:`HealthFrame`, and (on auth failure)
+  :class:`AuthFailureFrame` lifecycle transitions, plus a final
   :class:`ExitFrame`,
-* exits with a meaningful return code.
+* exits with a meaningful return code (see :mod:`exectunnel.cli._exit_codes`).
 
 The worker is deliberately ignorant of every other tunnel: one process, one
 event loop, one session, one failure domain.
@@ -26,7 +28,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import signal
 import sys
 import threading
 from collections.abc import Callable, Iterator
@@ -34,40 +35,42 @@ from pathlib import Path
 from typing import Final
 
 from exectunnel.config import CLIOverrides, TunnelFile, load_config_file
-from exectunnel.exceptions import (
-    BootstrapError,
-    ExecTunnelError,
-    ReconnectExhaustedError,
-)
-from exectunnel.observability import (
-    MetricEvent,
-    register_metric_listener,
-    unregister_metric_listener,
-)
-from exectunnel.session import TunnelSession
+from exectunnel.observability import MetricEvent
 
+from .._exit_codes import EXIT_ERROR, EXIT_INTERRUPTED
+from ..runner import (
+    LifecycleEvent,
+    SessionRunner,
+)
+from ..runner import (
+    exception_exit_code as _runner_exception_exit_code,
+)
+from ..runner import (
+    log_session_exception as _runner_log_session_exception,
+)
 from .ipc import (
+    AuthFailureFrame,
     ExitFrame,
     Frame,
+    HealthFrame,
     LogFrame,
     MetricFrame,
     StatusFrame,
     encode_frame,
 )
 
-__all__ = ["run_worker"]
+__all__ = ["exception_exit_code", "log_session_exception", "run_worker"]
 
 logger = logging.getLogger("exectunnel.cli.worker")
 
-_EXIT_OK: Final[int] = 0
-_EXIT_ERROR: Final[int] = 1
-_EXIT_BOOTSTRAP: Final[int] = 2
-_EXIT_RECONNECT_EXHAUSTED: Final[int] = 3
-_EXIT_INTERRUPTED: Final[int] = 130
 
-_SHUTDOWN_SIGNALS: Final[tuple[signal.Signals, ...]] = tuple(
-    sig for sig in (signal.SIGINT, getattr(signal, "SIGTERM", None)) if sig is not None
-)
+# Re-exported for backward compatibility with the in-process command path
+# (``cli._commands.run`` imports both names from this module).
+exception_exit_code = _runner_exception_exit_code
+log_session_exception = _runner_log_session_exception
+
+
+_STDIN_READ_TIMEOUT_SECS: Final[float] = 30.0
 
 _VALID_LOG_LEVELS: Final[frozenset[str]] = frozenset({
     "DEBUG",
@@ -277,45 +280,88 @@ class _MetricForwarder:
 
 
 # ---------------------------------------------------------------------------
-# Exit-code mapping
+# Worker-side SessionObserver — drives lifecycle frames on the wire
 # ---------------------------------------------------------------------------
 
 
-def exception_exit_code(exc: BaseException) -> int:
-    """Map a session exception to the worker process exit code."""
-    if isinstance(exc, asyncio.CancelledError):
-        return _EXIT_INTERRUPTED
-    if isinstance(exc, BootstrapError):
-        return _EXIT_BOOTSTRAP
-    if isinstance(exc, ReconnectExhaustedError):
-        return _EXIT_RECONNECT_EXHAUSTED
-    return _EXIT_ERROR
+class _WorkerObserver:
+    """Translate :class:`SessionRunner` lifecycle into NDJSON frames.
 
+    Emits:
 
-def log_session_exception(name: str, exc: BaseException) -> None:
-    """Emit a structured log record for a session failure."""
-    if isinstance(exc, ExecTunnelError):
-        logger.error(
-            "[%s] tunnel error [%s]: %s (error_id=%s)",
-            name,
-            exc.error_code,
-            exc.message,
-            exc.error_id,
-        )
-        if exc.hint:
-            logger.info("[%s] hint: %s", name, exc.hint)
-        return
+    * :class:`StatusFrame` for every lifecycle transition so the parent's
+      slot status mirrors the worker's actual state without having to wait
+      for the next discriminating metric;
+    * :class:`HealthFrame` on ``running`` / ``bootstrap_ok`` / ``stopped`` /
+      ``failed`` / ``auth_failed`` so the parent can update connectedness
+      flags eagerly;
+    * :class:`AuthFailureFrame` on ``auth_failed`` carrying the HTTP status
+      and the exception message so the dashboard can render the failure
+      reason before the worker even exits.
+    """
 
-    if isinstance(exc, asyncio.CancelledError):
-        logger.debug("[%s] session cancelled", name)
-        return
+    __slots__ = ("_tunnel", "_metric_forwarder", "_wss_url")
 
-    logger.error(
-        "[%s] unexpected error: %s",
-        name,
-        exc,
-        exc_info=(type(exc), exc, exc.__traceback__),
-    )
+    def __init__(
+        self,
+        tunnel: str,
+        metric_forwarder: _MetricForwarder,
+        wss_url: str,
+    ) -> None:
+        self._tunnel = tunnel
+        self._metric_forwarder = metric_forwarder
+        self._wss_url = wss_url
+
+    # SessionObserver protocol
+    def metric_listener(self) -> Callable[[MetricEvent], None] | None:
+        return self._metric_forwarder.listener
+
+    async def on_lifecycle(self, event: LifecycleEvent) -> None:
+        kind = event.kind
+
+        if kind == "starting":
+            _emit(StatusFrame(tunnel=self._tunnel, status="starting"))
+            _emit(HealthFrame(tunnel=self._tunnel, connected=False))
+            return
+
+        if kind == "bootstrap_ok":
+            _emit(
+                HealthFrame(
+                    tunnel=self._tunnel,
+                    connected=True,
+                    socks_ok=True,
+                    bootstrap_ok=True,
+                )
+            )
+            return
+
+        if kind == "running":
+            _emit(StatusFrame(tunnel=self._tunnel, status="running"))
+            return
+
+        if kind == "stopped":
+            _emit(StatusFrame(tunnel=self._tunnel, status="stopped"))
+            _emit(HealthFrame(tunnel=self._tunnel, connected=False))
+            return
+
+        if kind == "failed":
+            _emit(StatusFrame(tunnel=self._tunnel, status="failed"))
+            _emit(HealthFrame(tunnel=self._tunnel, connected=False))
+            return
+
+        if kind == "auth_failed":
+            http_status = event.http_status if event.http_status is not None else 401
+            _emit(
+                AuthFailureFrame(
+                    tunnel=self._tunnel,
+                    http_status=http_status,
+                    wss_url=self._wss_url,
+                    message=event.message or "",
+                )
+            )
+            _emit(StatusFrame(tunnel=self._tunnel, status="auth_failed"))
+            _emit(HealthFrame(tunnel=self._tunnel, connected=False))
+            return
 
 
 # ---------------------------------------------------------------------------
@@ -323,8 +369,27 @@ def log_session_exception(name: str, exc: BaseException) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _read_overrides_from_stdin() -> CLIOverrides:
-    raw = sys.stdin.read()
+async def _read_overrides_from_stdin_async(
+    timeout: float = _STDIN_READ_TIMEOUT_SECS,
+) -> CLIOverrides:
+    """Read CLIOverrides JSON from stdin with a bounded timeout.
+
+    The parent supervisor writes the overrides immediately after spawn and
+    closes its end. If the parent crashes between spawn and write, a
+    blocking ``sys.stdin.read()`` would hang forever — we time out and
+    surface a worker-level failure instead.
+    """
+
+    def _read() -> str:
+        return sys.stdin.read()
+
+    try:
+        raw = await asyncio.wait_for(asyncio.to_thread(_read), timeout=timeout)
+    except TimeoutError as exc:
+        raise TimeoutError(
+            f"worker stdin overrides not received within {timeout:.1f}s"
+        ) from exc
+
     if not raw.strip():
         return CLIOverrides()
 
@@ -346,102 +411,77 @@ def _load_tunnel_file(config_path: Path) -> TunnelFile:
 
 async def _run_session(
     tunnel: str,
-    tunnel_file: TunnelFile,
-    cli_overrides: CLIOverrides,
+    config_path: Path,
 ) -> int:
-    """Run exactly one tunnel session inside the worker process."""
+    """Run exactly one tunnel session inside the worker process.
+
+    Reads :class:`CLIOverrides` from stdin (bounded), loads the config,
+    constructs a :class:`SessionRunner` with a :class:`_WorkerObserver`, and
+    drives it to completion.
+    """
+    loop = asyncio.get_running_loop()
+
+    # ── Read CLIOverrides with a bounded read so we never hang on a dead
+    # parent. The worker hasn't installed signal handlers yet, so SIGINT
+    # would still terminate us via the default handler.
+    try:
+        cli_overrides = await _read_overrides_from_stdin_async()
+    except TimeoutError as exc:
+        logger.error("worker stdin timeout: %s", exc)
+        _emit(StatusFrame(tunnel=tunnel, status="failed"))
+        return EXIT_ERROR
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.error("worker invalid stdin overrides payload: %s", exc)
+        _emit(StatusFrame(tunnel=tunnel, status="failed"))
+        return EXIT_ERROR
+
+    try:
+        tunnel_file = _load_tunnel_file(config_path)
+    except Exception as exc:
+        logger.error("worker failed to load config %s: %s", config_path, exc)
+        _emit(StatusFrame(tunnel=tunnel, status="failed"))
+        return EXIT_ERROR
+
     try:
         entry = tunnel_file.get_tunnel(tunnel)
     except KeyError as exc:
         logger.error("worker tunnel %r not found in config: %s", tunnel, exc)
         _emit(StatusFrame(tunnel=tunnel, status="failed"))
-        return _EXIT_ERROR
+        return EXIT_ERROR
 
-    _emit(StatusFrame(tunnel=tunnel, status="starting"))
-
+    # Resolve once (early) just to learn the WSS URL for AuthFailureFrame
+    # correlation. The runner re-resolves and surfaces the same error if the
+    # config is invalid; we tolerate failure here.
+    wss_url = ""
     try:
-        session_cfg, tun_cfg = tunnel_file.resolve(entry, cli_overrides)
-        session = TunnelSession(session_cfg, tun_cfg)
-    except Exception as exc:
-        logger.error("[%s] config/session setup failed: %s", tunnel, exc)
-        _emit(StatusFrame(tunnel=tunnel, status="failed"))
-        return _EXIT_ERROR
-
-    loop = asyncio.get_running_loop()
-    shutdown = asyncio.Event()
-
-    def _on_signal(sig: signal.Signals) -> None:
-        logger.info("[%s] received %s — shutting down", tunnel, sig.name)
-        shutdown.set()
-
-    installed: list[signal.Signals] = []
-    for sig in _SHUTDOWN_SIGNALS:
-        try:
-            loop.add_signal_handler(sig, _on_signal, sig)
-        except (NotImplementedError, RuntimeError, ValueError):
-            logger.debug("signal handler not supported for %s", sig.name)
-        else:
-            installed.append(sig)
+        session_cfg, _tun_cfg = tunnel_file.resolve(entry, cli_overrides)
+        wss_url = str(session_cfg.wss_url)
+    except Exception:
+        wss_url = str(entry.wss_url) if entry.wss_url else ""
 
     metric_forwarder = _MetricForwarder(tunnel, loop)
     metric_forwarder.start()
-    listener = metric_forwarder.listener
-    register_metric_listener(listener)
 
-    session_task = asyncio.create_task(session.run(), name=f"session-{tunnel}")
-    shutdown_task = asyncio.create_task(shutdown.wait(), name=f"shutdown-{tunnel}")
+    observer = _WorkerObserver(
+        tunnel=tunnel,
+        metric_forwarder=metric_forwarder,
+        wss_url=wss_url,
+    )
+
+    runner = SessionRunner(
+        name=tunnel,
+        tunnel_file=tunnel_file,
+        entry=entry,
+        cli_overrides=cli_overrides,
+        observers=[observer],
+        install_signals=True,
+    )
 
     try:
-        done, pending = await asyncio.wait(
-            {session_task, shutdown_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-
-        if shutdown_task in done and not session_task.done():
-            session_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await session_task
-
-            _emit(StatusFrame(tunnel=tunnel, status="stopped"))
-            return _EXIT_INTERRUPTED
-
-        if session_task in done:
-            if not shutdown_task.done():
-                shutdown_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await shutdown_task
-
-            if session_task.cancelled():
-                _emit(StatusFrame(tunnel=tunnel, status="stopped"))
-                return _EXIT_INTERRUPTED
-
-            exc = session_task.exception()
-            if exc is None:
-                _emit(StatusFrame(tunnel=tunnel, status="stopped"))
-                return _EXIT_OK
-
-            log_session_exception(tunnel, exc)
-            _emit(StatusFrame(tunnel=tunnel, status="failed"))
-            return exception_exit_code(exc)
-
-        for task in pending:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
-
-        _emit(StatusFrame(tunnel=tunnel, status="failed"))
-        return _EXIT_ERROR
-
+        return await runner.run()
     finally:
         with contextlib.suppress(Exception):
-            unregister_metric_listener(listener)
-
-        with contextlib.suppress(Exception):
             await metric_forwarder.stop()
-
-        for sig in installed:
-            with contextlib.suppress(Exception):
-                loop.remove_signal_handler(sig)
 
 
 # ---------------------------------------------------------------------------
@@ -456,24 +496,19 @@ def run_worker(*, config_path: Path, tunnel: str) -> int:
         config_path: Path to the tunnel config file.
         tunnel:      Name of the tunnel entry to run.
     """
-    code = _EXIT_ERROR
+    code = EXIT_ERROR
 
     with _install_log_bridge(tunnel):
         try:
-            cli_overrides = _read_overrides_from_stdin()
-            tunnel_file = _load_tunnel_file(config_path)
-            code = asyncio.run(_run_session(tunnel, tunnel_file, cli_overrides))
-        except (json.JSONDecodeError, ValueError) as exc:
-            logger.error("worker invalid stdin overrides payload: %s", exc)
-            _emit(StatusFrame(tunnel=tunnel, status="failed"))
-            code = _EXIT_ERROR
+            code = asyncio.run(_run_session(tunnel, config_path))
+        except KeyboardInterrupt:
+            code = EXIT_INTERRUPTED
         except Exception as exc:
-            logger.error("worker failed to load config %s: %s", config_path, exc)
+            logger.error("worker fatal error: %s", exc, exc_info=True)
             _emit(StatusFrame(tunnel=tunnel, status="failed"))
-            code = _EXIT_ERROR
+            code = EXIT_ERROR
 
-    # If config/load/session bootstrap failed before asyncio.run() even started,
-    # we still owe the parent a final exit frame. Emit it after the logging
-    # bridge scope so the frame is guaranteed to be last on stdout.
+    # Always emit a final ExitFrame so the parent has a deterministic signal,
+    # even if the session bootstrap failed before SessionRunner had a chance.
     _emit(ExitFrame(tunnel=tunnel, code=code))
     return code

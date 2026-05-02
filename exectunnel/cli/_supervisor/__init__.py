@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from .ipc import (
     IPC_PROTOCOL_VERSION,
+    AuthFailureFrame,
     ExitFrame,
     Frame,
     HealthFrame,
@@ -28,16 +29,18 @@ from .ipc import (
     decode_frame,
     encode_frame,
 )
-from .supervisor import Supervisor, SupervisorResult
+from .supervisor import RestartPolicy, Supervisor, SupervisorResult
 from .worker import run_worker
 
 __all__ = [
     "IPC_PROTOCOL_VERSION",
+    "AuthFailureFrame",
     "ExitFrame",
     "Frame",
     "HealthFrame",
     "LogFrame",
     "MetricFrame",
+    "RestartPolicy",
     "StatusFrame",
     "Supervisor",
     "SupervisorResult",
