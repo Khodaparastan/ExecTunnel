@@ -13,6 +13,7 @@ from ._context import (
     AppContext,
 )
 from ._display import configure_logging
+from ._remote_config import RemoteConfigSource
 
 __all__ = ["app"]
 
@@ -91,6 +92,50 @@ def _global_callback(
             metavar="PATH",
         ),
     ] = None,
+    remote_config_url: Annotated[
+        str | None,
+        typer.Option(
+            "--remote-config-url",
+            envvar="EXECTUNNEL_REMOTE_CONFIG_URL",
+            help=(
+                "Base URL of the identity / health API. When set, the CLI "
+                "fetches the tunnel config from "
+                "[bold]{base}/api/v1/configs/identities[/bold] and refreshes "
+                "it on auth failure."
+            ),
+            metavar="URL",
+        ),
+    ] = None,
+    remote_config_identity: Annotated[
+        str | None,
+        typer.Option(
+            "--remote-config-identity",
+            envvar="EXECTUNNEL_REMOTE_CONFIG_IDENTITY",
+            help="Identity / user id passed via the [bold]identity=[/bold] query.",
+            metavar="ID",
+        ),
+    ] = None,
+    remote_config_format: Annotated[
+        Literal["toml", "yaml"],
+        typer.Option(
+            "--remote-config-format",
+            envvar="EXECTUNNEL_REMOTE_CONFIG_FORMAT",
+            help="Remote config wire format: toml | yaml.",
+            metavar="FORMAT",
+        ),
+    ] = "toml",
+    remote_config_token: Annotated[
+        str | None,
+        typer.Option(
+            "--remote-config-token",
+            envvar="EXECTUNNEL_REMOTE_CONFIG_TOKEN",
+            help=(
+                "Bearer token sent to the identity / health API "
+                "(distinct from per-tunnel WSS auth headers)."
+            ),
+            metavar="TOKEN",
+        ),
+    ] = None,
 ) -> None:
     """ExecTunnel — SOCKS5 tunnel over Kubernetes exec/WebSocket channels."""
     _validate_choice(log_level, _VALID_LEVELS, param_hint="--log-level")
@@ -114,6 +159,26 @@ def _global_callback(
         )
         return
 
+    remote_source: RemoteConfigSource | None = None
+    if remote_config_url and remote_config_identity:
+        try:
+            remote_source = RemoteConfigSource(
+                base_url=remote_config_url,
+                identity=remote_config_identity,
+                fmt=remote_config_format,
+                token=remote_config_token,
+            )
+        except ValueError as exc:
+            raise typer.BadParameter(
+                f"Invalid --remote-config-* configuration: {exc}",
+                param_hint="--remote-config-url",
+            ) from exc
+    elif remote_config_url and not remote_config_identity:
+        raise typer.BadParameter(
+            "--remote-config-url requires --remote-config-identity",
+            param_hint="--remote-config-identity",
+        )
+
     app_ctx = AppContext.load(
         config_path=config,
         log_level=log_level,
@@ -122,6 +187,7 @@ def _global_callback(
         log_level_from_cli=log_level_from_cli,
         log_format_from_cli=log_format_from_cli,
         log_file_from_cli=log_file_from_cli,
+        remote_source=remote_source,
     )
 
     configure_logging(app_ctx.log_level, app_ctx.log_format, app_ctx.log_file)

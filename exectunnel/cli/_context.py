@@ -11,6 +11,11 @@ from typing import TYPE_CHECKING, Literal
 if TYPE_CHECKING:
     from exectunnel.config import TunnelFile
 
+    from ._remote_config import (
+        RemoteConfigClient,
+        RemoteConfigSource,
+    )
+
 __all__ = [
     "AppContext",
     "LogFormat",
@@ -103,6 +108,16 @@ class AppContext:
     log_format_from_cli: bool = False
     log_file_from_cli: bool = False
 
+    #: Optional remote-config client built from ``--remote-config-*`` flags.
+    #: Surfaced here so :func:`run_command` can pass it to :class:`Supervisor`
+    #: for the auth-failure refresh path. ``None`` when no remote source was
+    #: configured.
+    remote_client: RemoteConfigClient | None = None
+
+    #: Source descriptor that produced :attr:`remote_client`, if any.
+    #: ``None`` when no remote source was configured.
+    remote_source: RemoteConfigSource | None = None
+
     @classmethod
     def minimal(
         cls,
@@ -146,8 +161,22 @@ class AppContext:
         log_level_from_cli: bool = False,
         log_format_from_cli: bool = False,
         log_file_from_cli: bool = False,
+        remote_source: RemoteConfigSource | None = None,
     ) -> AppContext:
-        """Construct an :class:`AppContext`, loading config if present."""
+        """Construct an :class:`AppContext`, loading config if present.
+
+        Resolution order:
+
+        1. Explicit ``config_path`` argument (e.g. ``--config``).
+        2. Remote config source (when ``remote_source`` is provided): the
+           tunnel config is fetched from
+           ``{base}/api/v1/configs/identities`` and atomically written to
+           an identity-namespaced cache file under ``$XDG_CACHE_HOME``.
+        3. Default XDG search path (``~/.config/exectunnel/config.toml`` …).
+
+        The remote-source branch never replaces an explicit ``--config``;
+        operators always retain the override.
+        """
         from pydantic import ValidationError  # noqa: PLC0415
 
         from exectunnel.config import (  # noqa: PLC0415
@@ -156,17 +185,55 @@ class AppContext:
             load_config_file,
         )
 
-        resolved_path = (
-            _normalize_path(config_path)
-            if config_path is not None
-            else _find_default_config()
-        )
+        remote_client: RemoteConfigClient | None = None
+        remote_path: Path | None = None
+        remote_load_error: str | None = None
+
+        if remote_source is not None:
+            from ._remote_config import (  # noqa: PLC0415
+                RemoteConfigClient,
+                RemoteConfigError,
+                default_cache_path_for,
+                write_cache_atomically,
+            )
+
+            remote_client = RemoteConfigClient(remote_source)
+            try:
+                remote_path = _fetch_remote_config_to_cache(
+                    remote_client,
+                    default_cache_path_for=default_cache_path_for,
+                    write_cache_atomically=write_cache_atomically,
+                )
+            except RemoteConfigError as exc:
+                logger.warning(
+                    "Remote config fetch failed: %s — falling back to file/XDG",
+                    exc,
+                )
+                remote_load_error = (
+                    f"Remote config fetch failed (HTTP "
+                    f"{exc.status if exc.status is not None else 'n/a'}): {exc}"
+                )
+            except Exception as exc:  # noqa: BLE001 — defensive
+                logger.warning(
+                    "Remote config fetch raised unexpectedly: %s — falling back",
+                    exc,
+                )
+                remote_load_error = f"Remote config fetch error: {exc}"
+
+        resolved_path: Path | None
+        if config_path is not None:
+            resolved_path = _normalize_path(config_path)
+        elif remote_path is not None:
+            resolved_path = remote_path
+        else:
+            resolved_path = _find_default_config()
+
         normalized_log_file = (
             _normalize_path(log_file) if log_file is not None else None
         )
 
         tunnel_file: TunnelFile | None = None
-        config_load_error: str | None = None
+        config_load_error: str | None = remote_load_error
 
         if resolved_path is not None:
             try:
@@ -186,6 +253,9 @@ class AppContext:
                         resolved_path,
                         global_config.log_file,
                     )
+
+                # Successful parse — clear any earlier remote-fetch warning.
+                config_load_error = None
 
             except ConfigFileError as exc:
                 logger.debug("Config file error for %s: %s", resolved_path, exc)
@@ -212,4 +282,28 @@ class AppContext:
             log_level_from_cli=log_level_from_cli,
             log_format_from_cli=log_format_from_cli,
             log_file_from_cli=log_file_from_cli,
+            remote_client=remote_client,
+            remote_source=remote_source,
         )
+
+
+def _fetch_remote_config_to_cache(
+    client: RemoteConfigClient,
+    *,
+    default_cache_path_for: object,
+    write_cache_atomically: object,
+) -> Path:
+    """Synchronously fetch the remote config and write it to the cache file.
+
+    Runs the async fetch under a fresh ``asyncio.run`` since this is invoked
+    from Typer's synchronous global callback. Returns the cache path.
+
+    The two helpers are passed in by the caller to keep the import graph
+    flat — they live in :mod:`exectunnel.cli._remote_config`.
+    """
+    import asyncio  # noqa: PLC0415
+
+    body = asyncio.run(client.fetch_config())
+    cache_path: Path = default_cache_path_for(client.source)  # type: ignore[operator]
+    write_cache_atomically(cache_path, body)  # type: ignore[operator]
+    return cache_path
